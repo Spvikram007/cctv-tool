@@ -64,3 +64,4 @@ The `httpauth` package parses this challenge, calculates the response hash, and 
 
 - **Zero Secret Leakage**: HTTP requests containing `Authorization: Digest ...` have sensitive hashes stripped before logging to `AuditLogEntry`.
 - **Read-Back Verification**: After `PUT /ISAPI/System/network/interfaces/1/ipAddress`, the system immediately executes `GET` to read back the hardware state and verify that the target IP and subnet were applied by the camera OS.
+

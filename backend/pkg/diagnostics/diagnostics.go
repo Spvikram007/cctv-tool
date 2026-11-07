@@ -185,6 +185,129 @@ func ones(mask net.IPMask) int {
 	return o
 }
 
+// CapacityBandwidthCalculation provides comprehensive storage and throughput projection
+type CapacityBandwidthCalculation struct {
+	CameraCount             int     `json:"camera_count"`
+	Resolution              string  `json:"resolution"`
+	Codec                   string  `json:"codec"`
+	FPS                     int     `json:"fps"`
+	MainBitrateKbps         int     `json:"main_bitrate_kbps"`
+	SubBitrateKbps          int     `json:"sub_bitrate_kbps"`
+	DaysRequired            int     `json:"days_required"`
+	HoursPerDay             int     `json:"hours_per_day"`
+	SimultaneousViewers     int     `json:"simultaneous_viewers"`
+	AggregateCameraMbps     float64 `json:"aggregate_camera_mbps"`
+	ViewingBandwidthMbps    float64 `json:"viewing_bandwidth_mbps"`
+	TotalNetworkMbps        float64 `json:"total_network_mbps"`
+	RecommendedHeadroomMbps float64 `json:"recommended_headroom_mbps"`
+	RecommendedSwitchPort   string  `json:"recommended_switch_port"`
+	TotalStorageGB          float64 `json:"total_storage_gb"`
+	TotalStorageTB          float64 `json:"total_storage_tb"`
+	RecommendedHDDs         int     `json:"recommended_hdds"`
+	CalculationBasis        string  `json:"calculation_basis"`
+}
+
+// CalculateCapacityAndBandwidth combines camera count, codec, resolution, fps, viewers, and retention
+func CalculateCapacityAndBandwidth(cameras int, resolution, codec string, fps, mainKbps, subKbps, days, hours, viewers int) CapacityBandwidthCalculation {
+	if cameras <= 0 {
+		cameras = 8
+	}
+	if fps <= 0 {
+		fps = 25
+	}
+	if days <= 0 {
+		days = 30
+	}
+	if hours <= 0 {
+		hours = 24
+	}
+	if viewers < 0 {
+		viewers = 1
+	}
+
+	// Auto-estimate main bitrate if not supplied
+	if mainKbps <= 0 {
+		switch strings.ToUpper(resolution) {
+		case "8K":
+			mainKbps = 16384
+		case "4K":
+			mainKbps = 8192
+		case "4MP", "2K":
+			mainKbps = 4096
+		case "1080P":
+			mainKbps = 2048
+		case "720P":
+			mainKbps = 1024
+		default:
+			mainKbps = 2048
+		}
+
+		// Adjust by codec
+		switch strings.ToUpper(codec) {
+		case "H.265", "HEVC":
+			mainKbps = mainKbps * 60 / 100 // 40% saving
+		case "H.265+", "SMART_H265":
+			mainKbps = mainKbps * 40 / 100 // 60% saving with dynamic GOP
+		case "MJPEG":
+			mainKbps = mainKbps * 250 / 100 // 2.5x larger than H.264
+		}
+	}
+
+	if subKbps <= 0 {
+		subKbps = 512
+	}
+
+	// 1. Storage Calculation
+	bytesPerSec := float64(mainKbps*1000) / 8.0
+	secondsTotal := float64(days * hours * 3600)
+	totalBytes := bytesPerSec * secondsTotal * float64(cameras)
+	totalGB := totalBytes / (1024 * 1024 * 1024)
+	totalTB := totalGB / 1024.0
+
+	recommendedHDDs := int(math.Ceil(totalTB / 3.6)) // 3.6TB usable on standard 4TB surveillance disk
+	if recommendedHDDs < 1 {
+		recommendedHDDs = 1
+	}
+
+	// 2. Network Bandwidth Calculation
+	aggregateCameraMbps := float64(cameras*mainKbps) / 1000.0
+	// Viewers watch substreams by default on multi-grids
+	viewingMbps := float64(viewers*subKbps) / 1000.0
+	totalNetworkMbps := aggregateCameraMbps + viewingMbps
+
+	// 30% safety headroom for packet burstiness and multicast spikes
+	headroomMbps := totalNetworkMbps * 1.30
+
+	switchPort := "FastEthernet (100 Mbps)"
+	if headroomMbps > 80.0 {
+		switchPort = "GigabitEthernet (1000 Mbps)"
+	}
+	if headroomMbps > 800.0 {
+		switchPort = "10-Gigabit SFP+ (10 Gbps)"
+	}
+
+	return CapacityBandwidthCalculation{
+		CameraCount:             cameras,
+		Resolution:              resolution,
+		Codec:                   codec,
+		FPS:                     fps,
+		MainBitrateKbps:         mainKbps,
+		SubBitrateKbps:          subKbps,
+		DaysRequired:            days,
+		HoursPerDay:             hours,
+		SimultaneousViewers:     viewers,
+		AggregateCameraMbps:     math.Round(aggregateCameraMbps*100) / 100,
+		ViewingBandwidthMbps:    math.Round(viewingMbps*100) / 100,
+		TotalNetworkMbps:        math.Round(totalNetworkMbps*100) / 100,
+		RecommendedHeadroomMbps: math.Round(headroomMbps*100) / 100,
+		RecommendedSwitchPort:   switchPort,
+		TotalStorageGB:          math.Round(totalGB*100) / 100,
+		TotalStorageTB:          math.Round(totalTB*100) / 100,
+		RecommendedHDDs:         recommendedHDDs,
+		CalculationBasis:        "Standard Continuous H.264/H.265 Encoding Model with 30% Switch Headroom",
+	}
+}
+
 // CalculateHDD estimates storage for CCTV installations
 func CalculateHDD(cameras int, codec, resolution string, bitrateKbps, days, hoursPerDay int) HDDCalculation {
 	if bitrateKbps <= 0 {

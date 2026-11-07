@@ -102,3 +102,4 @@ Empirical live validation executed on Ethernet network `192.168.31.23/24`:
 | `192.168.31.106:80` | **CP PLUS CP-UNC-TA21PL3-V3** | 200 OK | -1.7 sec | Media: OK, PTZ: UNSUPPORTED, Imaging: OK, Events: OK |
 | `192.168.31.143:80` | **CP PLUS CP-UNR-4K4162-V2 NVR** | 200 OK | -0.9 sec | Media: OK, PTZ: OK, Imaging: OK, Events: OK |
 | `192.168.31.104:80` | **Vatilon H43 PTZ Camera** | 200 OK | -2.0 sec | Media: OK, PTZ: OK, Imaging: OK, Events: OK |
+

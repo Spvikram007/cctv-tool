@@ -60,3 +60,4 @@ Physical bench testing on `192.168.31.23/24` verified:
 - Reliable challenge-response Digest negotiation over `/cgi-bin/magicBox.cgi`.
 - Fixed turret (`DH-IPC-HDW1230T1`) and fixed bullet (`DH-IPC-HFW1249S1`) models correctly identified with `PTZ: UNSUPPORTED`.
 - Motorized varifocal bullet (`DH-IPC-HFW1230T1P-ZS-S4`) correctly identified with `PTZ: SUPPORTED` for motorized zoom and focus controls.
+

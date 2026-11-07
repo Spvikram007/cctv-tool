@@ -98,3 +98,4 @@ func TestDahuaGetCapabilities(t *testing.T) {
 		t.Errorf("expected AnalogFormat supported for XVR")
 	}
 }
+

@@ -61,3 +61,4 @@ CCTV Sentinel Universal parses model strings to automatically configure channel 
 
 - **Pure IP NVR Protection**: Calling `SetChannelAnalogMode` on a pure IP NVR like `CP-UNR-4K4162-V2` is explicitly blocked in software with `ErrUnsupportedOperation`, preventing technicians from attempting to send invalid coaxial commands to IP network channels.
 - **Dual-Stack Fallback**: If a technician changes a password or firmware disables CGI, the adapter automatically switches to ONVIF WS-Security without requiring reconfiguration.
+

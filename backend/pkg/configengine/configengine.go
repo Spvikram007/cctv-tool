@@ -79,8 +79,8 @@ type Engine struct {
 	store          *database.Store
 	logger         *audit.Logger
 	mu             sync.Mutex
-	stagedPreviews map[string]*StagedPreview    // previewToken or rollbackKey -> staged preview
-	rollbacks      map[string]json.RawMessage   // rollbackKey -> snapshot JSON
+	stagedPreviews map[string]*StagedPreview  // previewToken or rollbackKey -> staged preview
+	rollbacks      map[string]json.RawMessage // rollbackKey -> snapshot JSON
 }
 
 func NewEngine(registry *adapters.Registry, store *database.Store, logger *audit.Logger) *Engine {

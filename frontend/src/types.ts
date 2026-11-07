@@ -304,3 +304,85 @@ export interface BatchJob {
   logs: string[];
   created_at: string;
 }
+
+export interface StreamToken {
+  token: string;
+  device_id: string;
+  stream_type: 'main' | 'sub';
+  user: string;
+  created_at: string;
+  expires_at: string;
+  active_viewers: number;
+}
+
+export interface StreamStats {
+  status: 'CONNECTING' | 'LIVE' | 'RECONNECTING' | 'OFFLINE';
+  device_id: string;
+  stream_type: string;
+  fps: number;
+  bitrate_kbps: number;
+  frame_count: number;
+  bytes_received: number;
+  last_frame_time: string;
+  active_viewers: number;
+  error_message?: string;
+}
+
+export interface StreamDiagnosticReport {
+  device_id: string;
+  stream_uri: string;
+  rtsp_port: number;
+  tcp_connected: boolean;
+  connect_latency_ms: number;
+  options_methods: string[];
+  auth_required: boolean;
+  auth_realm?: string;
+  auth_method?: string;
+  sdp_received: boolean;
+  session_name?: string;
+  video_codec: string;
+  resolution: string;
+  clock_rate: number;
+  control_uri: string;
+  audio_codec?: string;
+  tcp_transport_supported: boolean;
+  time_to_first_frame_ms: number;
+  packets_received: number;
+  measured_bitrate_kbps: number;
+  packet_loss_status: string;
+  snapshot_working: boolean;
+  snapshot_latency_ms: number;
+  recommendations: string[];
+  run_at: string;
+}
+
+export interface SnapshotMetadata {
+  id: string;
+  device_id: string;
+  timestamp: string;
+  format: 'JPEG' | 'PNG';
+  size_bytes: number;
+  file_name: string;
+  url: string;
+}
+
+export interface CapacityBandwidthCalculation {
+  camera_count: number;
+  resolution: string;
+  codec: string;
+  fps: number;
+  main_bitrate_kbps: number;
+  sub_bitrate_kbps: number;
+  days_required: number;
+  hours_per_day: number;
+  simultaneous_viewers: number;
+  aggregate_camera_mbps: number;
+  viewing_bandwidth_mbps: number;
+  total_network_mbps: number;
+  recommended_headroom_mbps: number;
+  recommended_switch_port: string;
+  total_storage_gb: number;
+  total_storage_tb: number;
+  recommended_hdds: number;
+  calculation_basis: string;
+}

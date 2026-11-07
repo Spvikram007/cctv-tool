@@ -81,3 +81,4 @@ When a technician clicks **ROLLBACK** or invokes `POST /api/v1/devices/{id}/conf
 2. It re-applies the original configuration to the physical hardware.
 3. It performs a read-back check to confirm restoration.
 4. An immutable audit record is logged with zero secret exposure.
+

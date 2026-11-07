@@ -33,4 +33,13 @@ func TestCalculatorsAndDiagnostics(t *testing.T) {
 	if bw.TotalMainMbps != 65.54 && bw.TotalMainMbps != 65.536 && bw.TotalCombinedMbps <= 0 {
 		t.Errorf("Invalid Bandwidth calculation: %+v", bw)
 	}
+
+	// 4. Capacity & Bandwidth Combined (30% Headroom) test
+	cap := diagnostics.CalculateCapacityAndBandwidth(16, "4K", "H.265", 25, 0, 0, 30, 24, 4)
+	if cap.CameraCount != 16 || cap.Resolution != "4K" || cap.Codec != "H.265" {
+		t.Errorf("Unexpected cap fields: %+v", cap)
+	}
+	if cap.TotalStorageTB <= 0 || cap.TotalNetworkMbps <= 0 || cap.RecommendedHeadroomMbps <= cap.TotalNetworkMbps {
+		t.Errorf("Headroom or storage invalid: %+v", cap)
+	}
 }

@@ -111,3 +111,4 @@ func TestHikvisionGetCapabilities(t *testing.T) {
 		t.Errorf("expected AnalogFormat unsupported for IP camera")
 	}
 }
+

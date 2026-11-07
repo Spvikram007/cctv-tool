@@ -67,3 +67,4 @@ func TestCPPlusGetCapabilities(t *testing.T) {
 		t.Errorf("expected Recording supported for NVR")
 	}
 }
+

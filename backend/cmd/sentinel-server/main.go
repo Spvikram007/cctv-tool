@@ -21,6 +21,8 @@ import (
 	"cctv-sentinel/pkg/database"
 	"cctv-sentinel/pkg/discovery"
 	"cctv-sentinel/pkg/licensing"
+	"cctv-sentinel/pkg/media/snapshot"
+	"cctv-sentinel/pkg/media/streamhub"
 	"cctv-sentinel/pkg/models"
 	"cctv-sentinel/pkg/security"
 	"cctv-sentinel/pkg/simulator"
@@ -144,8 +146,12 @@ func main() {
 		log.Println("[SETUP] Seeded 3 verified hardware units into fleet inventory.")
 	}
 
-	// 5. REST API Server
-	apiServer := api.NewServer(store, registry, configEng, discoveryEng, licenseMgr, logger)
+	// 5. Media & Stream Engines
+	snapshotEng := snapshot.NewEngine(store, registry, "./data/snapshots")
+	streamHub := streamhub.NewHub(store, registry)
+
+	// 6. REST API Server
+	apiServer := api.NewServer(store, registry, configEng, discoveryEng, licenseMgr, logger, snapshotEng, streamHub)
 
 	serverPort := 8080
 	srv := &http.Server{

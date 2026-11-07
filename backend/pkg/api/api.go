@@ -16,6 +16,8 @@ import (
 	"cctv-sentinel/pkg/diagnostics"
 	"cctv-sentinel/pkg/discovery"
 	"cctv-sentinel/pkg/licensing"
+	"cctv-sentinel/pkg/media/snapshot"
+	"cctv-sentinel/pkg/media/streamhub"
 	"cctv-sentinel/pkg/models"
 )
 
@@ -26,6 +28,8 @@ type Server struct {
 	discoveryEng *discovery.Engine
 	licenseMgr   *licensing.Manager
 	logger       *audit.Logger
+	snapshotEng  *snapshot.Engine
+	streamHub    *streamhub.Hub
 	mux          *http.ServeMux
 	startTime    time.Time
 }
@@ -37,7 +41,15 @@ func NewServer(
 	discoveryEng *discovery.Engine,
 	licenseMgr *licensing.Manager,
 	logger *audit.Logger,
+	snapshotEng *snapshot.Engine,
+	streamHub *streamhub.Hub,
 ) *Server {
+	if snapshotEng == nil {
+		snapshotEng = snapshot.NewEngine(store, registry, "./data/snapshots")
+	}
+	if streamHub == nil {
+		streamHub = streamhub.NewHub(store, registry)
+	}
 	s := &Server{
 		store:        store,
 		registry:     registry,
@@ -45,6 +57,8 @@ func NewServer(
 		discoveryEng: discoveryEng,
 		licenseMgr:   licenseMgr,
 		logger:       logger,
+		snapshotEng:  snapshotEng,
+		streamHub:    streamHub,
 		mux:          http.NewServeMux(),
 		startTime:    time.Now().UTC(),
 	}
@@ -213,6 +227,9 @@ func (s *Server) registerRoutes() {
 	// 4. Device specific routes dispatcher: /api/v1/devices/
 	s.mux.HandleFunc("/api/v1/devices/", s.handleDeviceSubroutes)
 
+	// 4.1 Live Streaming Hub routes: /api/v1/streams/
+	s.mux.HandleFunc("/api/v1/streams/", s.handleStreamSubroutes)
+
 	// 5. Diagnostics
 	s.mux.HandleFunc("/api/v1/diagnostics/run", func(w http.ResponseWriter, r *http.Request) {
 		ip := r.URL.Query().Get("ip")
@@ -279,6 +296,8 @@ func (s *Server) registerRoutes() {
 		calc := diagnostics.CalculateBandwidth(cams, mainB, subB)
 		writeJSON(w, http.StatusOK, calc)
 	})
+
+	s.mux.HandleFunc("/api/v1/diagnostics/capacity", s.handleCapacityCalculator)
 
 	// 6. Licensing
 	s.mux.HandleFunc("/api/v1/licensing", func(w http.ResponseWriter, r *http.Request) {
@@ -643,15 +662,95 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "command": action.Command})
 
-	case "snapshot":
-		bytes, err := adapter.CaptureSnapshot(&dev)
-		if err != nil {
-			writeSimpleError(w, r, http.StatusInternalServerError, err.Error())
+	case "stream":
+		if len(parts) > 2 && parts[2] == "token" {
+			if r.Method != "POST" {
+				writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
+				return
+			}
+			var req struct {
+				StreamType string `json:"stream_type"`
+				User       string `json:"user"`
+				TTLSeconds int    `json:"ttl_seconds"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if req.StreamType == "" {
+				req.StreamType = "main"
+			}
+			ttl := 1 * time.Hour
+			if req.TTLSeconds > 0 {
+				ttl = time.Duration(req.TTLSeconds) * time.Second
+			}
+			user := req.User
+			if user == "" {
+				user = "Technician"
+			}
+			token, err := s.streamHub.GenerateToken(dev.ID, req.StreamType, user, ttl)
+			if err != nil {
+				writeSimpleError(w, r, http.StatusInternalServerError, err.Error())
+				return
+			}
+			s.logger.Log(user, dev.ID, dev.IP, "REQUEST_STREAM_TOKEN", "STREAM", "SUCCESS", fmt.Sprintf("Issued %s stream token", req.StreamType), "")
+			writeJSON(w, http.StatusOK, token)
 			return
 		}
-		w.Header().Set("Content-Type", "image/svg+xml")
+		writeSimpleError(w, r, http.StatusNotFound, "Unknown stream subresource")
+		return
+
+	case "diagnostics":
+		if len(parts) > 2 && parts[2] == "stream" {
+			streamURI, _ := adapter.GetStreamURI(&dev, 0)
+			report := diagnostics.RunStreamDiagnostics(&dev, streamURI, dev.Username, dev.Password)
+			writeJSON(w, http.StatusOK, report)
+			return
+		}
+		writeSimpleError(w, r, http.StatusNotFound, "Unknown diagnostics subresource")
+		return
+
+	case "snapshot":
+		if r.Method == "POST" {
+			meta, _, err := s.snapshotEng.CaptureSnapshot(dev.ID)
+			if err != nil {
+				writeSimpleError(w, r, http.StatusBadGateway, fmt.Sprintf("Snapshot capture failed: %v", err))
+				return
+			}
+			s.logger.Log("Technician", dev.ID, dev.IP, "CAPTURE_SNAPSHOT", "MEDIA", "SUCCESS", fmt.Sprintf("Captured snapshot: %s (%d bytes)", meta.FileName, meta.SizeBytes), "")
+			writeJSON(w, http.StatusOK, meta)
+			return
+		}
+		// Direct GET returns raw genuine JPEG/PNG frame
+		meta, imgBytes, err := s.snapshotEng.CaptureSnapshot(dev.ID)
+		if err != nil {
+			writeSimpleError(w, r, http.StatusBadGateway, fmt.Sprintf("Snapshot capture failed: %v", err))
+			return
+		}
+		cType := "image/jpeg"
+		if meta.Format == "PNG" {
+			cType = "image/png"
+		}
+		w.Header().Set("Content-Type", cType)
+		w.Header().Set("Content-Length", strconv.Itoa(len(imgBytes)))
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(bytes)
+		_, _ = w.Write(imgBytes)
+		return
+
+	case "snapshots":
+		if len(parts) > 2 {
+			fileName := parts[2]
+			imgBytes, cType, err := s.snapshotEng.GetSnapshotFile(dev.ID, fileName)
+			if err != nil {
+				writeSimpleError(w, r, http.StatusNotFound, "Snapshot file not found")
+				return
+			}
+			w.Header().Set("Content-Type", cType)
+			w.Header().Set("Content-Length", strconv.Itoa(len(imgBytes)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(imgBytes)
+			return
+		}
+		history := s.snapshotEng.ListSnapshots(dev.ID)
+		writeJSON(w, http.StatusOK, history)
+		return
 
 	case "channels":
 		if len(parts) > 2 && parts[2] == "analog-format" {
@@ -893,4 +992,63 @@ func (s *Server) handleDeviceServices(w http.ResponseWriter, r *http.Request, de
 		"protocols":        dev.Protocols,
 		"capabilities":     dev.Capabilities,
 	})
+}
+
+func (s *Server) handleStreamSubroutes(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/api/v1/streams/")
+	parts := strings.Split(path, "/")
+	if len(parts) >= 2 {
+		token := parts[0]
+		action := parts[1]
+		switch action {
+		case "mjpeg":
+			s.streamHub.ServeMJPEG(w, r, token)
+			return
+		case "stats":
+			stats, err := s.streamHub.GetTokenStats(token)
+			if err != nil {
+				writeSimpleError(w, r, http.StatusUnauthorized, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, stats)
+			return
+		}
+	}
+	writeSimpleError(w, r, http.StatusNotFound, "Stream endpoint not found")
+}
+
+func (s *Server) handleCapacityCalculator(w http.ResponseWriter, r *http.Request) {
+	cams, _ := strconv.Atoi(r.URL.Query().Get("cameras"))
+	if cams <= 0 {
+		cams = 8
+	}
+	res := r.URL.Query().Get("resolution")
+	if res == "" {
+		res = "1080P"
+	}
+	codec := r.URL.Query().Get("codec")
+	if codec == "" {
+		codec = "H.265"
+	}
+	fps, _ := strconv.Atoi(r.URL.Query().Get("fps"))
+	if fps <= 0 {
+		fps = 25
+	}
+	days, _ := strconv.Atoi(r.URL.Query().Get("days"))
+	if days <= 0 {
+		days = 30
+	}
+	hours, _ := strconv.Atoi(r.URL.Query().Get("hours"))
+	if hours <= 0 {
+		hours = 24
+	}
+	viewers, _ := strconv.Atoi(r.URL.Query().Get("viewers"))
+	if viewers <= 0 {
+		viewers = 2
+	}
+	mainKbps, _ := strconv.Atoi(r.URL.Query().Get("main_kbps"))
+	subKbps, _ := strconv.Atoi(r.URL.Query().Get("sub_kbps"))
+
+	calc := diagnostics.CalculateCapacityAndBandwidth(cams, res, codec, fps, mainKbps, subKbps, days, hours, viewers)
+	writeJSON(w, http.StatusOK, calc)
 }

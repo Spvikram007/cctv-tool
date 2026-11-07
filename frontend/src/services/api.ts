@@ -3,7 +3,9 @@ import {
   RecorderChannel, DiagnosticsReport, SubnetCalc, HDDCalc,
   BandwidthCalc, License, AuditLogEntry, ConfigPreview,
   CompatibilityEntry, BatchJob, NetworkInterface, DiscoveryJob,
-  DiscoveredDevice, DeviceCapabilities, AuthStatus, ConfigResult
+  DiscoveredDevice, DeviceCapabilities, AuthStatus, ConfigResult,
+  StreamToken, StreamStats, StreamDiagnosticReport, SnapshotMetadata,
+  CapacityBandwidthCalculation
 } from '../types';
 
 const BASE_URL = 'http://127.0.0.1:8080/api/v1';
@@ -89,6 +91,21 @@ export const api = {
   sendPTZ: (id: string, action: { command: string; pan?: number; tilt?: number; zoom?: number; speed?: number; preset_id?: number }) =>
     request<any>(`/devices/${id}/ptz`, { method: 'POST', body: JSON.stringify(action) }),
 
+  // Streaming & Live Feeds (Phase 4 Authenticated Stream Hub)
+  getStreamToken: (deviceId: string, streamType: 'main' | 'sub' = 'main', user = 'Technician', ttlSeconds = 3600) =>
+    request<StreamToken>(`/devices/${deviceId}/stream/token`, {
+      method: 'POST',
+      body: JSON.stringify({ stream_type: streamType, user, ttl_seconds: ttlSeconds })
+    }),
+  getStreamMJPEGUrl: (token: string) => `${BASE_URL}/streams/${token}/mjpeg`,
+  getStreamStats: (token: string) => request<StreamStats>(`/streams/${token}/stats`),
+  getStreamDiagnostics: (deviceId: string) => request<StreamDiagnosticReport>(`/devices/${deviceId}/diagnostics/stream`),
+
+  // Genuine Snapshot Engine
+  captureSnapshot: (deviceId: string) => request<SnapshotMetadata>(`/devices/${deviceId}/snapshot`, { method: 'POST' }),
+  getSnapshotHistory: (deviceId: string) => request<SnapshotMetadata[]>(`/devices/${deviceId}/snapshots`),
+  getSnapshotImageURL: (deviceId: string, fileName: string) => `${BASE_URL}/devices/${deviceId}/snapshots/${encodeURIComponent(fileName)}`,
+  getDirectSnapshotURL: (deviceId: string) => `${BASE_URL}/devices/${deviceId}/snapshot?t=${Date.now()}`,
   getSnapshotURL: (id: string) => `${BASE_URL}/devices/${id}/snapshot?t=${Date.now()}`,
 
   // Channels & Analog XVR
@@ -104,6 +121,29 @@ export const api = {
     request<HDDCalc>(`/diagnostics/hdd?cameras=${cameras}&resolution=${resolution}&codec=${codec}&days=${days}&hours=${hours}`),
   calcBandwidth: (cameras: number, mainKbps: number, subKbps: number) =>
     request<BandwidthCalc>(`/diagnostics/bandwidth?cameras=${cameras}&main_kbps=${mainKbps}&sub_kbps=${subKbps}`),
+  calcCapacity: (params: {
+    cameras?: number;
+    resolution?: string;
+    codec?: string;
+    fps?: number;
+    days?: number;
+    hours?: number;
+    viewers?: number;
+    main_kbps?: number;
+    sub_kbps?: number;
+  }) => {
+    const q = new URLSearchParams();
+    if (params.cameras) q.set('cameras', params.cameras.toString());
+    if (params.resolution) q.set('resolution', params.resolution);
+    if (params.codec) q.set('codec', params.codec);
+    if (params.fps) q.set('fps', params.fps.toString());
+    if (params.days) q.set('days', params.days.toString());
+    if (params.hours) q.set('hours', params.hours.toString());
+    if (params.viewers) q.set('viewers', params.viewers.toString());
+    if (params.main_kbps) q.set('main_kbps', params.main_kbps.toString());
+    if (params.sub_kbps) q.set('sub_kbps', params.sub_kbps.toString());
+    return request<CapacityBandwidthCalculation>(`/diagnostics/capacity?${q.toString()}`);
+  },
 
   // Licensing
   getLicensing: () => request<{ license: License; machine_hash: string }>('/licensing'),
