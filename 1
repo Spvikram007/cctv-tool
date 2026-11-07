@@ -1,0 +1,378 @@
+# MASTER DEVELOPMENT PROMPT
+## CCTV SENTINEL UNIVERSAL — Enterprise CCTV Technician Platform
+
+### 1. Role
+
+Act as a principal software architect, senior Go engineer, network protocol engineer, CCTV integration specialist, cybersecurity engineer and cross-platform application developer.
+
+Build a production-grade commercial software product named **CCTV SENTINEL UNIVERSAL**, owned by Tech Defence Solutions.
+
+This is not a CCTV viewer. It is a comprehensive universal CCTV discovery, configuration, maintenance, troubleshooting and management platform.
+
+### 2. Supported platforms
+
+Develop:
+- Windows desktop application.
+- Linux desktop application.
+- macOS desktop application.
+- Web administration portal.
+- Android technician application.
+- Local network agent.
+- Optional centralized cloud management service.
+
+Use Tauri 2, React and TypeScript for desktop; Go for the local agent and core backend; Kotlin for Android; PostgreSQL for central storage; SQLite for offline installations.
+
+### 3. Device compatibility
+
+Support these device categories:
+- IP cameras.
+- Analog cameras.
+- DVR.
+- XVR.
+- HVR.
+- NVR.
+- Hybrid recorders.
+- PTZ cameras.
+- PoE cameras.
+- Wi-Fi cameras.
+- 4G cameras.
+- OEM and rebranded cameras.
+
+Support TVI, CVI, AHD, CVBS and network camera technologies.
+
+Analog configuration must operate through compatible recorder APIs or supported UTC/RS-485 mechanisms.
+
+### 4. Protocol integrations
+
+Implement:
+- ONVIF WS-Discovery.
+- ONVIF Device Management.
+- ONVIF Media.
+- ONVIF PTZ.
+- ONVIF Events.
+- ONVIF recording interfaces where supported.
+- RTSP/RTP.
+- HTTP/HTTPS.
+- SSDP where appropriate.
+- ARP and network discovery.
+- DHCP and DNS diagnostics.
+- Vendor-specific CGI and SDK integrations.
+
+Build separate adapters for:
+- Hikvision ISAPI and HCNetSDK.
+- Dahua CGI and NetSDK.
+- CP PLUS model-specific APIs and SDKs.
+- Uniview.
+- Axis VAPIX.
+- Hanwha.
+- Tiandy.
+- TVT.
+- Other OEM manufacturers.
+
+Use official SDKs and APIs where available. Never invent unsupported protocol commands.
+
+### 5. Mandatory application modules
+
+Implement:
+1. Dashboard.
+2. Automatic network discovery.
+3. Device identification.
+4. IP and network configuration.
+5. Camera configuration.
+6. Image configuration.
+7. Video encoding configuration.
+8. DVR/NVR/XVR configuration.
+9. Analog camera management.
+10. PTZ management.
+11. Live view.
+12. Snapshot.
+13. Playback.
+14. Recording export.
+15. Motion detection.
+16. Alarm management.
+17. User management.
+18. Firmware management.
+19. Configuration backup and restore.
+20. Batch configuration.
+21. Network diagnostics.
+22. RTSP tester.
+23. ONVIF tester.
+24. IP/subnet calculator.
+25. HDD calculator.
+26. Bandwidth calculator.
+27. Site and customer management.
+28. Technician reports.
+29. Compatibility database.
+30. Plugin manager.
+31. Commercial licensing.
+32. Audit logs.
+
+### 6. Core engineering architecture
+
+Build a modular architecture with:
+- API gateway.
+- Identity and authorization.
+- Device orchestrator.
+- Discovery engine.
+- Capability detection engine.
+- Protocol adapter registry.
+- Configuration engine.
+- Video engine.
+- Event engine.
+- Maintenance engine.
+- Credential vault.
+- Job execution engine.
+- Reporting engine.
+- License management.
+
+Every vendor adapter must implement a common versioned contract.
+
+Use optional capability interfaces for PTZ, recording, firmware, storage, alarms and advanced vendor settings.
+
+A feature must only be exposed if the device actually supports it.
+
+### 7. Device discovery
+
+Implement:
+- ONVIF multicast discovery.
+- User-authorized subnet scanning.
+- HTTP and HTTPS probing.
+- RTSP service detection.
+- MAC address identification.
+- Device manufacturer identification.
+- Model and firmware detection.
+- Port detection.
+- Duplicate IP detection.
+- Device status.
+- Discovery history.
+
+Support manual IP entry and manual credentials.
+
+Never attempt password brute forcing or unauthorized network scanning.
+
+### 8. Configuration engine
+
+For every device:
+1. Authenticate.
+2. Read device information.
+3. Detect capabilities.
+4. Read current configuration.
+5. Validate proposed configuration.
+6. Display a preview.
+7. Obtain user confirmation.
+8. Apply changes.
+9. Read back settings.
+10. Report success or failure.
+11. Save audit logs.
+12. Support rollback where available.
+
+Support static IP, DHCP, DNS, gateway, NTP, resolution, FPS, bitrate, codec, image settings, motion, audio and supported security settings.
+
+### 9. Recorder engine
+
+Create a dedicated recorder abstraction.
+
+Support:
+- Channel discovery.
+- Analog and IP channel mapping.
+- TVI/CVI/AHD/CVBS identification.
+- Recording schedules.
+- Motion recording.
+- HDD status.
+- Storage configuration.
+- Playback.
+- Recording search.
+- Recording export.
+- Alarm inputs and outputs.
+- RS-485.
+- UTC controls where supported.
+
+### 10. Security
+
+Implement:
+- MFA.
+- RBAC.
+- Tenant isolation.
+- Encrypted credentials.
+- OS keychain.
+- Android Keystore.
+- TLS.
+- Secure API sessions.
+- Audit logs.
+- SDK process isolation.
+- Plugin signing.
+- Firmware compatibility verification.
+- Secure update system.
+- Rate limiting.
+- Network scan authorization.
+- Password and secret redaction.
+
+### 11. Database
+
+Create migrations and schemas for:
+- Tenants.
+- Users.
+- Roles.
+- Permissions.
+- Subscriptions.
+- Sites.
+- Agents.
+- Networks.
+- Devices.
+- Channels.
+- Credentials.
+- Protocols.
+- Capabilities.
+- Configuration profiles.
+- Streams.
+- Recordings.
+- Events.
+- Firmware packages.
+- Backups.
+- Configuration jobs.
+- Job logs.
+- Audit logs.
+- Adapter registry.
+- Compatibility matrix.
+
+Use PostgreSQL and SQLite.
+
+### 12. API development
+
+Create documented REST APIs under `/api/v1`.
+
+Implement:
+- Device APIs.
+- Discovery APIs.
+- Configuration APIs.
+- Network APIs.
+- Video APIs.
+- PTZ APIs.
+- Recorder APIs.
+- Playback APIs.
+- Event APIs.
+- Firmware APIs.
+- Backup APIs.
+- Batch job APIs.
+- License APIs.
+
+Use OpenAPI documentation, request validation, structured error responses and idempotency for configuration jobs.
+
+### 13. User interface
+
+Create a premium industrial-grade user interface.
+
+Use:
+- Professional dark and light themes.
+- Responsive layouts.
+- Device status indicators.
+- Manufacturer logos.
+- Device capability indicators.
+- Network topology.
+- Configuration forms.
+- Camera live-view grid.
+- Job progress.
+- Diagnostic panels.
+- Compatibility reports.
+
+Main navigation:
+Dashboard, Discovery, Devices, Network Scanner, Live View, Camera Configuration, Recorder Manager, Analog Manager, PTZ, Events, Playback, Firmware, Diagnostics, Batch Configuration, Templates, Sites, Reports, Compatibility, Plugins and Licensing.
+
+### 14. Commercial system
+
+Implement:
+- Free edition.
+- Technician Pro.
+- Dealer Enterprise.
+- License activation.
+- Trial.
+- Offline activation.
+- Subscription renewal.
+- Technician seats.
+- Device limits.
+- Dealer management.
+- GST invoicing.
+- Payment integration.
+- Software update entitlement.
+
+Do not make essential local network functionality dependent on cloud availability.
+
+### 15. Development rules
+
+- Use clean architecture and SOLID principles.
+- Maintain strict type safety.
+- Use context-aware cancellation.
+- Implement timeouts and retries safely.
+- Never log passwords.
+- Never hardcode device credentials.
+- Never expose unsupported controls.
+- Never invent vendor API responses.
+- Keep SDK binaries subject to their respective licenses.
+- Write unit tests for all adapters.
+- Write integration tests with actual CCTV hardware.
+- Maintain an accurate compatibility matrix.
+- Provide detailed error messages.
+- Document unsupported operations.
+- Use signed production installers.
+
+### 16. Development execution
+
+Develop in incremental, independently testable phases.
+
+Phase 1: Project foundation and device discovery.
+
+Phase 2: ONVIF and RTSP.
+
+Phase 3: Universal configuration engine.
+
+Phase 4: Hikvision, Dahua and CP PLUS integrations.
+
+Phase 5: DVR, NVR, XVR and analog support.
+
+Phase 6: Live view, playback and PTZ.
+
+Phase 7: Maintenance, events and diagnostics.
+
+Phase 8: Web and Android.
+
+Phase 9: Licensing and dealer management.
+
+Phase 10: Hardware compatibility testing and production release.
+
+### 17. Required deliverables
+
+Produce:
+- Complete source code.
+- Architecture documentation.
+- Database migrations.
+- REST API documentation.
+- Protocol adapter documentation.
+- Working Windows installer.
+- Linux package.
+- macOS package.
+- Web deployment.
+- Android APK.
+- Local agent installer.
+- Automated tests.
+- Hardware test reports.
+- Security documentation.
+- User manual.
+- Technician manual.
+- Developer manual.
+- Commercial licensing system.
+
+### 18. Acceptance requirement
+
+The product must be a genuinely functional CCTV technician platform.
+
+Do not create placeholder buttons, simulated device configuration, fake compatibility indicators or hardcoded success responses.
+
+A feature is complete only when it has been implemented, tested against supported hardware or a verified simulator, and documented.
+
+Begin with the repository architecture and a working Phase 1 implementation. Build, test and verify each phase before proceeding to the next.
+
+**Product identity: CCTV SENTINEL UNIVERSAL**
+
+**Owner: Tech Defence Solutions**
+
+**Tagline: ONE TOOL. EVERY CCTV. COMPLETE CONTROL.**

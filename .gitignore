@@ -1,0 +1,18 @@
+# CCTV Sentinel Universal .gitignore
+node_modules/
+dist/
+build/
+*.exe
+*.dll
+*.so
+*.dylib
+*.log
+.vscode/
+.idea/
+*.db
+*.sqlite
+coverage/
+tmp/
+.tools/
+sentinel-server.exe~
+sentinel_store.json
