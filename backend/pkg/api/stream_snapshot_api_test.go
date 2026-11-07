@@ -41,7 +41,7 @@ func TestStreamAndSnapshotAPIE2E(t *testing.T) {
 	snapEngine := snapshot.NewEngine(store, registry, tmpDir)
 	streamHub := streamhub.NewHub(store, registry)
 
-	server := NewServer(store, registry, cfgEngine, discEngine, licMgr, logger, snapEngine, streamHub)
+	server := NewServer(store, registry, cfgEngine, discEngine, licMgr, logger, snapEngine, streamHub, nil, nil, nil)
 	ts := httptest.NewServer(server.Handler())
 	defer ts.Close()
 

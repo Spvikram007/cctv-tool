@@ -30,7 +30,7 @@ func setupTestServer(t *testing.T) (*Server, http.Handler) {
 	configEng := configengine.NewEngine(registry, store, logger)
 	discoveryEng := discovery.NewEngine(registry)
 
-	server := NewServer(store, registry, configEng, discoveryEng, licenseMgr, logger, nil, nil)
+	server := NewServer(store, registry, configEng, discoveryEng, licenseMgr, logger, nil, nil, nil, nil, nil)
 	return server, server.Handler()
 }
 

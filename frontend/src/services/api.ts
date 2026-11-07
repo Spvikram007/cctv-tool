@@ -5,7 +5,10 @@ import {
   CompatibilityEntry, BatchJob, NetworkInterface, DiscoveryJob,
   DiscoveredDevice, DeviceCapabilities, AuthStatus, ConfigResult,
   StreamToken, StreamStats, StreamDiagnosticReport, SnapshotMetadata,
-  CapacityBandwidthCalculation
+  CapacityBandwidthCalculation, BatchAction, BatchPreview,
+  FirmwarePackage, UpdateEligibility, FirmwareUpdatePreview,
+  FirmwareUpdateJob, UserAccount, Session, AuditChainVerification,
+  VaultStatus
 } from '../types';
 
 const BASE_URL = 'http://127.0.0.1:8080/api/v1';
@@ -157,7 +160,38 @@ export const api = {
   getCompatibility: () => request<CompatibilityEntry[]>('/compatibility'),
   getTechnicianReport: () => request<any>('/reports/technician'),
 
-  // Batch
-  getBatchJobs: () => request<BatchJob[]>('/batch'),
+  // Batch Operations Engine (Phase 5)
+  getBatchJobs: () => request<BatchJob[]>('/batch/jobs'),
+  getBatchJob: (id: string) => request<BatchJob>(`/batch/jobs/${id}`),
   createBatchJob: (job: Partial<BatchJob>) => request<BatchJob>('/batch', { method: 'POST', body: JSON.stringify(job) }),
+  previewBatch: (action: BatchAction | string, targetIds: string[], payload?: any) =>
+    request<BatchPreview>('/batch/preview', { method: 'POST', body: JSON.stringify({ action, target_ids: targetIds, payload }) }),
+  executeBatch: (job: { name: string; action: BatchAction | string; target_ids: string[]; payload?: any; preview_token?: string; concurrency?: number; rate_limit?: number }) =>
+    request<BatchJob>('/batch/execute', { method: 'POST', body: JSON.stringify(job) }),
+  cancelBatchJob: (id: string) => request<any>(`/batch/jobs/${id}/cancel`, { method: 'POST' }),
+  compareBatchConfigs: (targetIds: string[], configType: 'NETWORK' | 'IMAGE' | 'GENERAL' = 'NETWORK') =>
+    request<{ count: number; config_type: string; devices: Record<string, any>; deviations: Record<string, any> }>('/batch/compare', { method: 'POST', body: JSON.stringify({ target_ids: targetIds, config_type: configType }) }),
+  exportBatchConfigs: (targetIds: string[]) =>
+    request<{ version: string; exported_at: string; device_count: number; configurations: any[] }>('/batch/export', { method: 'POST', body: JSON.stringify({ target_ids: targetIds }) }),
+  importBatchConfigs: (backupData: any) =>
+    request<{ total: number; restored: number; errors: string[] }>('/batch/import', { method: 'POST', body: JSON.stringify({ backup_data: backupData }) }),
+
+  // Firmware Management Framework (Phase 5)
+  getFirmwareInventory: () => request<FirmwarePackage[]>('/firmware/inventory'),
+  checkFirmwareCompatibility: (deviceId: string, firmwareId: string) =>
+    request<UpdateEligibility>(`/firmware/compatibility?device_id=${encodeURIComponent(deviceId)}&firmware_id=${encodeURIComponent(firmwareId)}`),
+  stageFirmwarePreview: (deviceId: string, firmwareId: string) =>
+    request<FirmwareUpdatePreview>('/firmware/stage', { method: 'POST', body: JSON.stringify({ device_id: deviceId, firmware_id: firmwareId }) }),
+  approveFirmwareUpdate: (previewToken: string, operatorConfirmation: boolean) =>
+    request<FirmwareUpdateJob>('/firmware/approve', { method: 'POST', body: JSON.stringify({ preview_token: previewToken, operator_confirmation: operatorConfirmation }) }),
+  getFirmwareJob: (id: string) => request<FirmwareUpdateJob>(`/firmware/jobs/${id}`),
+
+  // Security, RBAC & Audit Integrity (Phase 5)
+  login: (username: string, password: string) =>
+    request<Session>('/security/login', { method: 'POST', body: JSON.stringify({ username, password }) }),
+  getUsers: () => request<UserAccount[]>('/security/users'),
+  createUser: (user: { username: string; password: string; role: string; site_id?: string }) =>
+    request<UserAccount>('/security/users', { method: 'POST', body: JSON.stringify(user) }),
+  getVaultStatus: () => request<VaultStatus>('/security/vault'),
+  verifyAuditChain: () => request<AuditChainVerification>('/audit/verify'),
 };

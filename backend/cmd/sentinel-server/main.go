@@ -17,9 +17,11 @@ import (
 	"cctv-sentinel/pkg/adapters/onvif"
 	"cctv-sentinel/pkg/api"
 	"cctv-sentinel/pkg/audit"
+	"cctv-sentinel/pkg/batch"
 	"cctv-sentinel/pkg/configengine"
 	"cctv-sentinel/pkg/database"
 	"cctv-sentinel/pkg/discovery"
+	"cctv-sentinel/pkg/firmware"
 	"cctv-sentinel/pkg/licensing"
 	"cctv-sentinel/pkg/media/snapshot"
 	"cctv-sentinel/pkg/media/streamhub"
@@ -146,12 +148,15 @@ func main() {
 		log.Println("[SETUP] Seeded 3 verified hardware units into fleet inventory.")
 	}
 
-	// 5. Media & Stream Engines
+	// 5. Media, Batch, Firmware & Security Engines
 	snapshotEng := snapshot.NewEngine(store, registry, "./data/snapshots")
 	streamHub := streamhub.NewHub(store, registry)
+	batchEng := batch.NewEngine(registry, store, configEng, logger)
+	firmwareEng := firmware.NewEngine(store, registry, logger, "./data/firmware")
+	rbacMgr := security.NewRBACManager()
 
 	// 6. REST API Server
-	apiServer := api.NewServer(store, registry, configEng, discoveryEng, licenseMgr, logger, snapshotEng, streamHub)
+	apiServer := api.NewServer(store, registry, configEng, discoveryEng, licenseMgr, logger, snapshotEng, streamHub, batchEng, firmwareEng, rbacMgr)
 
 	serverPort := 8080
 	srv := &http.Server{

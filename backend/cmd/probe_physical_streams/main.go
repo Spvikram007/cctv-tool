@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -43,7 +44,7 @@ func main() {
 		fmt.Printf("--- Probing Physical Target: %s %s (%s:%d | RTSP: %d) ---\n", t.Manufacturer, t.Model, t.IP, t.HTTPPort, t.RTSPPort)
 
 		// 1. RTSP TCP Connection & Latency
-		addr := fmt.Sprintf("%s:%d", t.IP, t.RTSPPort)
+		addr := net.JoinHostPort(t.IP, strconv.Itoa(t.RTSPPort))
 		startConn := time.Now()
 		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 		if err != nil {

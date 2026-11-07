@@ -231,4 +231,9 @@ type AuditLogEntry struct {
 	Status    string    `json:"status"` // SUCCESS, FAILED, PREVIEW
 	Details   string    `json:"details"`
 	Diff      string    `json:"diff,omitempty"`
+	PrevHash  string    `json:"prev_hash,omitempty"`
+	EntryHash string    `json:"entry_hash,omitempty"`
+	Signature string    `json:"signature,omitempty"`
+	TenantID  string    `json:"tenant_id,omitempty"`
+	SiteID    string    `json:"site_id,omitempty"`
 }

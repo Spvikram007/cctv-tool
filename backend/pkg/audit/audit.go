@@ -11,28 +11,55 @@ import (
 	"cctv-sentinel/pkg/models"
 )
 
-var (
-	secretRegexes = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)(password|passwd|pwd|secret|token|auth)["']?\s*[:=]\s*["']?([^"',\s&]+)`),
-		regexp.MustCompile(`(?i)Authorization:\s*Basic\s+([A-Za-z0-9+/=]+)`),
-		regexp.MustCompile(`(?i)Authorization:\s*Digest\s+([^\r\n]+)`),
-		regexp.MustCompile(`(?i)rtsp://([^:]+):([^@]+)@`),
-	}
-)
+type secretReplacer struct {
+	re   *regexp.Regexp
+	repl string
+}
+
+var secretReplacers = []secretReplacer{
+	{
+		re:   regexp.MustCompile(`(?i)(password|passwd|pwd|secret)["']?\s*[:=]\s*["']?([^"',\s&]+)["']?`),
+		repl: `$1: [REDACTED]`,
+	},
+	{
+		re:   regexp.MustCompile(`(?i)(Authorization:\s*Basic\s+)[A-Za-z0-9+/=]+`),
+		repl: `${1}[REDACTED]`,
+	},
+	{
+		re:   regexp.MustCompile(`(?i)(Authorization:\s*Digest\s+)[^\r\n]+`),
+		repl: `${1}[REDACTED]`,
+	},
+	{
+		re:   regexp.MustCompile(`(?i)(Authorization:\s*Bearer\s+)[A-Za-z0-9\-_\.]+`),
+		repl: `${1}[REDACTED]`,
+	},
+	{
+		re:   regexp.MustCompile(`(?i)rtsp://([^:]+):([^@]+)@`),
+		repl: `rtsp://${1}:[REDACTED]@`,
+	},
+	{
+		re:   regexp.MustCompile(`(?i)(<(?:wsse:)?PasswordDigest[^>]*>)[^<]+(<\/(?:wsse:)?PasswordDigest>)`),
+		repl: `${1}[REDACTED]${2}`,
+	},
+	{
+		re:   regexp.MustCompile(`(?i)((?:api_key|token|auth_token)["']?\s*[:=]\s*["']?)[^"',\s&]+(["']?)`),
+		repl: `${1}[REDACTED]${2}`,
+	},
+}
 
 // RedactSecrets removes sensitive data like passwords or tokens from strings
 func RedactSecrets(input string) string {
 	res := input
-	for _, re := range secretRegexes {
-		res = re.ReplaceAllString(res, "$1: [REDACTED]")
+	for _, sr := range secretReplacers {
+		res = sr.re.ReplaceAllString(res, sr.repl)
 	}
 	return res
 }
 
-// Logger provides tamper-evident audit logging with secret redaction
+// Logger provides tamper-evident audit logging with cryptographic hash chaining & secret redaction
 type Logger struct {
-	mu      sync.RWMutex
-	entries []models.AuditLogEntry
+	mu       sync.RWMutex
+	entries  []models.AuditLogEntry
 	lastHash string
 }
 
@@ -43,7 +70,7 @@ func NewLogger() *Logger {
 	}
 }
 
-// Log records an audit entry, automatically redacting any credentials
+// Log records an audit entry with cryptographic hash chaining
 func (l *Logger) Log(user, deviceID, deviceIP, action, category, status, details, diff string) models.AuditLogEntry {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -52,11 +79,14 @@ func (l *Logger) Log(user, deviceID, deviceIP, action, category, status, details
 	cleanedDiff := RedactSecrets(diff)
 
 	now := time.Now().UTC()
+	prev := l.lastHash
+
 	hashInput := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%s",
-		l.lastHash, now.Format(time.RFC3339Nano), user, deviceID, action, status, cleanedDetails, cleanedDiff)
+		prev, now.Format(time.RFC3339Nano), user, deviceID, action, status, cleanedDetails, cleanedDiff)
 	h := sha256.Sum256([]byte(hashInput))
+	entryHash := hex.EncodeToString(h[:])
 	entryID := hex.EncodeToString(h[:16])
-	l.lastHash = hex.EncodeToString(h[:])
+	l.lastHash = entryHash
 
 	entry := models.AuditLogEntry{
 		ID:        entryID,
@@ -69,6 +99,8 @@ func (l *Logger) Log(user, deviceID, deviceIP, action, category, status, details
 		Status:    status,
 		Details:   cleanedDetails,
 		Diff:      cleanedDiff,
+		PrevHash:  prev,
+		EntryHash: entryHash,
 	}
 
 	l.entries = append(l.entries, entry)
@@ -82,4 +114,27 @@ func (l *Logger) GetEntries() []models.AuditLogEntry {
 	res := make([]models.AuditLogEntry, len(l.entries))
 	copy(res, l.entries)
 	return res
+}
+
+// VerifyChainIntegrity validates cryptographic continuity across the entire audit log trail
+func (l *Logger) VerifyChainIntegrity() (bool, int, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	expectedPrev := "GENESIS_SENTINEL_ROOT"
+	for idx, entry := range l.entries {
+		if entry.PrevHash != "" && entry.PrevHash != expectedPrev {
+			return false, idx, fmt.Errorf("tamper detected at index %d: expected prev hash %s, got %s", idx, expectedPrev, entry.PrevHash)
+		}
+		hashInput := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%s",
+			expectedPrev, entry.Timestamp.Format(time.RFC3339Nano), entry.User, entry.DeviceID, entry.Action, entry.Status, entry.Details, entry.Diff)
+		h := sha256.Sum256([]byte(hashInput))
+		calcHash := hex.EncodeToString(h[:])
+		if entry.EntryHash != "" && entry.EntryHash != calcHash {
+			return false, idx, fmt.Errorf("tamper detected at index %d: entry hash mismatch", idx)
+		}
+		expectedPrev = calcHash
+	}
+
+	return true, len(l.entries), nil
 }

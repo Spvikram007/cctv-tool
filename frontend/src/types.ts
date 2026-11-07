@@ -221,6 +221,172 @@ export interface AuditLogEntry {
   status: string;
   details: string;
   diff?: string;
+  prev_hash?: string;
+  entry_hash?: string;
+  signature?: string;
+  tenant_id?: string;
+  site_id?: string;
+}
+
+export type BatchAction =
+  | 'IDENTIFY'
+  | 'HEALTH_CHECK'
+  | 'INFO_RETRIEVAL'
+  | 'NETWORK_CONFIG'
+  | 'TIME_NTP_SYNC'
+  | 'VIDEO_CONFIG'
+  | 'IMAGE_CONFIG'
+  | 'USER_SECURITY'
+  | 'REBOOT'
+  | 'CONFIG_COMPARE'
+  | 'CONFIG_EXPORT_IMPORT';
+
+export interface DeviceBatchPreview {
+  device_id: string;
+  device_name: string;
+  ip: string;
+  model: string;
+  manufacturer: string;
+  capable: boolean;
+  missing_capabilities: string[];
+  diff: string;
+  status: string;
+  warnings: string[];
+}
+
+export interface BatchPreview {
+  preview_token: string;
+  action: BatchAction;
+  total_targets: number;
+  eligible_count: number;
+  ineligible_count: number;
+  previews: DeviceBatchPreview[];
+  reboot_required: boolean;
+  expires_at: string;
+  created_at: string;
+}
+
+export interface DeviceBatchResult {
+  device_id: string;
+  device_name: string;
+  ip: string;
+  status: 'PENDING' | 'IN_PROGRESS' | 'SUCCESS' | 'FAILED' | 'UNSUPPORTED' | 'SKIPPED' | 'CANCELLED';
+  error?: string;
+  details?: string;
+  duration_ms: number;
+  diff?: string;
+  timestamp: string;
+}
+
+export interface BatchJob {
+  id: string;
+  name: string;
+  action: BatchAction | string;
+  target_ids: string[];
+  payload?: any;
+  status: 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED' | string;
+  progress: number;
+  logs: string[];
+  created_at: string;
+  preview_token?: string;
+  concurrency?: number;
+  rate_limit?: number;
+  total?: number;
+  completed?: number;
+  succeeded?: number;
+  failed?: number;
+  skipped?: number;
+  results?: DeviceBatchResult[];
+  completed_at?: string;
+}
+
+export interface FirmwarePackage {
+  id: string;
+  model: string;
+  manufacturer: string;
+  hardware_revision: string;
+  version: string;
+  release_date: string;
+  region: string;
+  sha256_checksum: string;
+  file_size_bytes: number;
+  file_name: string;
+  download_url: string;
+  critical: boolean;
+  release_notes: string;
+}
+
+export interface UpdateEligibility {
+  eligible: boolean;
+  reason: string;
+  cross_flash_blocked: boolean;
+  model_mismatch: boolean;
+  hw_rev_mismatch: boolean;
+  region_mismatch: boolean;
+  current_version: string;
+  target_version: string;
+}
+
+export interface FirmwareUpdatePreview {
+  preview_token: string;
+  device_id: string;
+  device_name: string;
+  firmware_id: string;
+  model: string;
+  manufacturer: string;
+  current_firmware: string;
+  target_firmware: string;
+  sha256_checksum: string;
+  eligible: boolean;
+  ineligibility_reason: string;
+  estimated_reboot_sec: number;
+  expires_at: string;
+  created_at: string;
+}
+
+export interface FirmwareUpdateJob {
+  id: string;
+  device_id: string;
+  firmware_id: string;
+  status: 'PREPARING' | 'UPLOADING' | 'FLASHING' | 'REBOOTING' | 'VERIFYING' | 'SUCCESS' | 'FAILED';
+  progress_percent: number;
+  stage: string;
+  verified_new_firmware: string;
+  error?: string;
+  created_at: string;
+  completed_at?: string;
+}
+
+export interface UserAccount {
+  id: string;
+  username: string;
+  role: 'ADMIN' | 'TECHNICIAN' | 'VIEWER' | 'AUDITOR';
+  site_id?: string;
+  created_at: string;
+}
+
+export interface Session {
+  token: string;
+  user_id: string;
+  username: string;
+  role: 'ADMIN' | 'TECHNICIAN' | 'VIEWER' | 'AUDITOR';
+  expires_at: string;
+}
+
+export interface AuditChainVerification {
+  valid: boolean;
+  verified_count: number;
+  broken_at_id?: string;
+  error_reason?: string;
+  checked_at: string;
+}
+
+export interface VaultStatus {
+  sealed: boolean;
+  keys_loaded: boolean;
+  credential_count: number;
+  mode: string;
+  storage: string;
 }
 
 export interface ConfigPreview {
@@ -291,18 +457,6 @@ export interface CompatibilityEntry {
   tested_fw: string;
   notes: string;
   verified: boolean;
-}
-
-export interface BatchJob {
-  id: string;
-  name: string;
-  target_ids: string[];
-  action: string;
-  payload: any;
-  status: string;
-  progress: number;
-  logs: string[];
-  created_at: string;
 }
 
 export interface StreamToken {

@@ -12,7 +12,8 @@ import {
   Layers,
   Database,
   KeyRound,
-  FileText
+  FileText,
+  Cpu
 } from 'lucide-react';
 
 export type NavTab =
@@ -26,6 +27,7 @@ export type NavTab =
   | 'diagnostics'
   | 'calculators'
   | 'batch'
+  | 'firmware'
   | 'compatibility'
   | 'licensing'
   | 'audit';
@@ -48,6 +50,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ activeTab, setActiveTab, devic
     { id: 'diagnostics', label: 'Diagnostics & RTSP', icon: Wrench },
     { id: 'calculators', label: 'Calculators (HDD/BW)', icon: Calculator },
     { id: 'batch', label: 'Batch Configuration', icon: Layers },
+    { id: 'firmware', label: 'Firmware & Updates', icon: Cpu },
     { id: 'compatibility', label: 'Hardware Matrix', icon: Database },
     { id: 'licensing', label: 'Licensing & GST', icon: KeyRound },
     { id: 'audit', label: 'Audit & Reports', icon: FileText },

@@ -35,7 +35,7 @@ func setupTestAPIServer(t *testing.T) (*httptest.Server, *database.Store, *simul
 	discEngine := discovery.NewEngine(registry)
 	licMgr := licensing.NewManager()
 
-	apiServer := api.NewServer(store, registry, cfgEngine, discEngine, licMgr, logger, nil, nil)
+	apiServer := api.NewServer(store, registry, cfgEngine, discEngine, licMgr, logger, nil, nil, nil, nil, nil)
 	ts := httptest.NewServer(apiServer.Handler())
 
 	return ts, store, sim

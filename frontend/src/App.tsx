@@ -16,6 +16,7 @@ import { Licensing } from './pages/Licensing';
 import { Compatibility } from './pages/Compatibility';
 import { AuditLogs } from './pages/AuditLogs';
 import { BatchConfig } from './pages/BatchConfig';
+import { Firmware } from './pages/Firmware';
 
 export const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<NavTab>('dashboard');
@@ -141,6 +142,12 @@ export const App: React.FC = () => {
             <BatchConfig
               devices={devices}
               onRefresh={loadAllData}
+            />
+          )}
+
+          {activeTab === 'firmware' && (
+            <Firmware
+              devices={devices}
             />
           )}
 
