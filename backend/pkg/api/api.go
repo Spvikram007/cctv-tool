@@ -53,11 +53,12 @@ func NewServer(
 }
 
 func (s *Server) Handler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	corsHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Enable CORS for frontend desktop and web
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, X-Request-ID")
+		w.Header().Set("Access-Control-Expose-Headers", "X-Request-ID")
 
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusOK)
@@ -66,6 +67,7 @@ func (s *Server) Handler() http.Handler {
 
 		s.mux.ServeHTTP(w, r)
 	})
+	return RequestCorrelationMiddleware(corsHandler)
 }
 
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
@@ -74,11 +76,29 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	_ = json.NewEncoder(w).Encode(data)
 }
 
-func writeError(w http.ResponseWriter, status int, message string) {
-	writeJSON(w, status, map[string]interface{}{
-		"success": false,
-		"error":   message,
-	})
+func writeError(w http.ResponseWriter, r *http.Request, status int, code, message string) {
+	writeStructuredError(w, r, status, code, message)
+}
+
+func writeSimpleError(w http.ResponseWriter, r *http.Request, status int, message string) {
+	code := "API_ERROR"
+	switch status {
+	case http.StatusBadRequest:
+		code = "BAD_REQUEST"
+	case http.StatusNotFound:
+		code = "NOT_FOUND"
+	case http.StatusMethodNotAllowed:
+		code = "METHOD_NOT_ALLOWED"
+	case http.StatusUnauthorized:
+		code = "UNAUTHORIZED"
+	case http.StatusBadGateway:
+		code = "BAD_GATEWAY"
+	case http.StatusInternalServerError:
+		code = "INTERNAL_ERROR"
+	case http.StatusUnprocessableEntity:
+		code = "UNPROCESSABLE_ENTITY"
+	}
+	writeStructuredError(w, r, status, code, message)
 }
 
 func (s *Server) registerRoutes() {
@@ -90,6 +110,54 @@ func (s *Server) registerRoutes() {
 			return
 		}
 		fs.ServeHTTP(w, r)
+	})
+
+	// 0. Liveness & Readiness endpoints
+	s.mux.HandleFunc("/api/v1/healthz", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"status":     "UP",
+			"uptime_sec": int(time.Since(s.startTime).Seconds()),
+			"timestamp":  time.Now().UTC().Format(time.RFC3339),
+			"request_id": GetRequestID(r),
+		})
+	})
+
+	s.mux.HandleFunc("/api/v1/readyz", func(w http.ResponseWriter, r *http.Request) {
+		checks := make(map[string]string)
+		isReady := true
+
+		if s.store != nil {
+			checks["database"] = "READY"
+		} else {
+			checks["database"] = "UNAVAILABLE"
+			isReady = false
+		}
+
+		if s.registry != nil {
+			checks["adapters"] = "READY"
+		} else {
+			checks["adapters"] = "UNAVAILABLE"
+			isReady = false
+		}
+
+		if s.licenseMgr != nil {
+			checks["licensing"] = "READY"
+		} else {
+			checks["licensing"] = "UNAVAILABLE"
+			isReady = false
+		}
+
+		status := http.StatusOK
+		if !isReady {
+			status = http.StatusServiceUnavailable
+		}
+
+		writeJSON(w, status, map[string]interface{}{
+			"ready":      isReady,
+			"checks":     checks,
+			"timestamp":  time.Now().UTC().Format(time.RFC3339),
+			"request_id": GetRequestID(r),
+		})
 	})
 
 	// 1. System status
@@ -119,7 +187,7 @@ func (s *Server) registerRoutes() {
 		if r.Method == "POST" {
 			var dev models.Device
 			if err := json.NewDecoder(r.Body).Decode(&dev); err != nil {
-				writeError(w, http.StatusBadRequest, "Invalid device payload")
+				writeSimpleError(w, r, http.StatusBadRequest, "Invalid device payload")
 				return
 			}
 			if dev.ID == "" {
@@ -130,13 +198,13 @@ func (s *Server) registerRoutes() {
 			writeJSON(w, http.StatusCreated, dev)
 			return
 		}
-		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
 	})
 
 	// 3. Network Discovery
 	s.mux.HandleFunc("/api/v1/devices/discover", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
-			writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+			writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
 			return
 		}
 		var req struct {
@@ -197,7 +265,7 @@ func (s *Server) registerRoutes() {
 		}
 		calc, err := diagnostics.CalculateSubnet(cidr)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
+			writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, calc)
@@ -255,11 +323,11 @@ func (s *Server) registerRoutes() {
 			GST     string `json:"gst"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, http.StatusBadRequest, "Invalid activation request")
+			writeSimpleError(w, r, http.StatusBadRequest, "Invalid activation request")
 			return
 		}
 		if err := s.licenseMgr.ActivateLicense(req.Key, req.Company, req.GST); err != nil {
-			writeError(w, http.StatusUnprocessableEntity, err.Error())
+			writeSimpleError(w, r, http.StatusUnprocessableEntity, err.Error())
 			return
 		}
 		s.logger.Log("Technician", "SYSTEM", "127.0.0.1", "ACTIVATE_LICENSE", "LICENSE", "SUCCESS", fmt.Sprintf("Activated %s license for %s", req.Key, req.Company), "")
@@ -369,13 +437,13 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 
 	dev, ok := s.store.GetDevice(deviceID)
 	if !ok {
-		writeError(w, http.StatusNotFound, "Device not found")
+		writeSimpleError(w, r, http.StatusNotFound, "Device not found")
 		return
 	}
 
 	adapter, err := s.registry.ResolveForDevice(&dev)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
+		writeSimpleError(w, r, http.StatusBadGateway, err.Error())
 		return
 	}
 
@@ -399,7 +467,7 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			preview, err := s.configEngine.GeneratePreview(deviceID, configengine.ConfigTypeNetwork, body)
 			if err != nil {
-				writeError(w, http.StatusBadRequest, err.Error())
+				writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 				return
 			}
 			writeJSON(w, http.StatusOK, preview)
@@ -414,7 +482,7 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 			s.store.SetNetworkConfig(req.Config)
 			res, err := s.configEngine.ApplyConfirmed(deviceID, configengine.ConfigTypeNetwork, req.RollbackKey, "Technician")
 			if err != nil {
-				writeError(w, http.StatusInternalServerError, err.Error())
+				writeSimpleError(w, r, http.StatusInternalServerError, err.Error())
 				return
 			}
 			writeJSON(w, http.StatusOK, res)
@@ -422,7 +490,7 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 		}
 		cfg, err := adapter.GetNetworkConfig(&dev)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
+			writeSimpleError(w, r, http.StatusInternalServerError, err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, cfg)
@@ -433,7 +501,7 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			preview, err := s.configEngine.GeneratePreview(deviceID, configengine.ConfigTypeImage, body)
 			if err != nil {
-				writeError(w, http.StatusBadRequest, err.Error())
+				writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 				return
 			}
 			writeJSON(w, http.StatusOK, preview)
@@ -448,7 +516,7 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 			s.store.SetImageConfig(req.Config)
 			res, err := s.configEngine.ApplyConfirmed(deviceID, configengine.ConfigTypeImage, req.RollbackKey, "Technician")
 			if err != nil {
-				writeError(w, http.StatusInternalServerError, err.Error())
+				writeSimpleError(w, r, http.StatusInternalServerError, err.Error())
 				return
 			}
 			writeJSON(w, http.StatusOK, res)
@@ -456,7 +524,7 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 		}
 		cfg, err := adapter.GetImageConfig(&dev)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
+			writeSimpleError(w, r, http.StatusInternalServerError, err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, cfg)
@@ -464,7 +532,7 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 	case "encoding":
 		cfgs, err := adapter.GetVideoEncodingConfig(&dev)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
+			writeSimpleError(w, r, http.StatusInternalServerError, err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, cfgs)
@@ -474,7 +542,7 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&action)
 		action.DeviceID = dev.ID
 		if err := adapter.SendPTZ(&dev, action); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
+			writeSimpleError(w, r, http.StatusInternalServerError, err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "command": action.Command})
@@ -482,7 +550,7 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 	case "snapshot":
 		bytes, err := adapter.CaptureSnapshot(&dev)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
+			writeSimpleError(w, r, http.StatusInternalServerError, err.Error())
 			return
 		}
 		w.Header().Set("Content-Type", "image/svg+xml")
@@ -497,7 +565,7 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 			}
 			_ = json.NewDecoder(r.Body).Decode(&req)
 			if err := adapter.SetChannelAnalogMode(&dev, req.ChannelID, req.SignalFormat); err != nil {
-				writeError(w, http.StatusInternalServerError, err.Error())
+				writeSimpleError(w, r, http.StatusInternalServerError, err.Error())
 				return
 			}
 			s.logger.Log("Technician", dev.ID, dev.IP, "SET_ANALOG_FORMAT", "RECORDER", "SUCCESS", fmt.Sprintf("Channel %d format switched to %s", req.ChannelID, req.SignalFormat), "")
@@ -506,12 +574,12 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 		}
 		chans, err := adapter.GetRecorderChannels(&dev)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
+			writeSimpleError(w, r, http.StatusInternalServerError, err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, chans)
 
 	default:
-		writeError(w, http.StatusNotFound, "Unknown device subresource")
+		writeSimpleError(w, r, http.StatusNotFound, "Unknown device subresource")
 	}
 }

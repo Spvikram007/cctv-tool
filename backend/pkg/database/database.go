@@ -2,12 +2,17 @@ package database
 
 import (
 	"encoding/json"
+	"fmt"
+	"log"
 	"os"
 	"sync"
 	"time"
 
 	"cctv-sentinel/pkg/models"
+	"cctv-sentinel/pkg/security"
 )
+
+type modelsDevice = models.Device
 
 type Site struct {
 	ID        string    `json:"id"`
@@ -19,16 +24,16 @@ type Site struct {
 }
 
 type BatchJob struct {
-	ID           string                 `json:"id"`
-	Name         string                 `json:"name"`
-	TargetIDs    []string               `json:"target_ids"`
-	Action       string                 `json:"action"` // NETWORK_CONFIG, IMAGE_CONFIG, ENCODING_CONFIG, PASSWORD_CHANGE
-	Payload      map[string]interface{} `json:"payload"`
-	Status       string                 `json:"status"` // PENDING, RUNNING, COMPLETED, FAILED
-	Progress     int                    `json:"progress"` // 0-100%
-	Logs         []string               `json:"logs"`
-	CreatedAt    time.Time              `json:"created_at"`
-	CompletedAt  *time.Time             `json:"completed_at,omitempty"`
+	ID          string                 `json:"id"`
+	Name        string                 `json:"name"`
+	TargetIDs   []string               `json:"target_ids"`
+	Action      string                 `json:"action"` // NETWORK_CONFIG, IMAGE_CONFIG, ENCODING_CONFIG, PASSWORD_CHANGE
+	Payload     map[string]interface{} `json:"payload"`
+	Status      string                 `json:"status"` // PENDING, RUNNING, COMPLETED, FAILED
+	Progress    int                    `json:"progress"`
+	Logs        []string               `json:"logs"`
+	CreatedAt   time.Time              `json:"created_at"`
+	CompletedAt *time.Time             `json:"completed_at,omitempty"`
 }
 
 type CompatibilityEntry struct {
@@ -47,36 +52,60 @@ type CompatibilityEntry struct {
 type Manufacturer = models.Manufacturer
 
 type Store struct {
-	mu            sync.RWMutex
-	filePath      string
-	Devices       map[string]models.Device              `json:"devices"`
-	NetworkCfgs   map[string]models.NetworkConfig       `json:"network_configs"`
-	ImageCfgs     map[string]models.ImageConfig         `json:"image_configs"`
-	VideoCfgs     map[string][]models.VideoEncodingConfig `json:"video_configs"`
-	Channels      map[string][]models.RecorderChannel   `json:"channels"`
-	StorageDisks  map[string][]models.StorageDevice     `json:"storage_disks"`
-	Sites         map[string]Site                       `json:"sites"`
-	BatchJobs     map[string]BatchJob                   `json:"batch_jobs"`
-	Compatibility []CompatibilityEntry                  `json:"compatibility"`
+	mu                   sync.RWMutex
+	filePath             string
+	vault                *security.Vault
+	SchemaVersion        int                                     `json:"schema_version"`
+	Devices              map[string]models.Device                `json:"devices"`
+	EncryptedCredentials map[string]string                       `json:"encrypted_credentials"` // device_id -> AES-256-GCM ciphertext
+	NetworkCfgs          map[string]models.NetworkConfig         `json:"network_configs"`
+	ImageCfgs            map[string]models.ImageConfig           `json:"image_configs"`
+	VideoCfgs            map[string][]models.VideoEncodingConfig `json:"video_configs"`
+	Channels             map[string][]models.RecorderChannel     `json:"channels"`
+	StorageDisks         map[string][]models.StorageDevice       `json:"storage_disks"`
+	Sites                map[string]Site                         `json:"sites"`
+	BatchJobs            map[string]BatchJob                     `json:"batch_jobs"`
+	Compatibility        []CompatibilityEntry                    `json:"compatibility"`
 }
 
 func NewStore(filePath string) *Store {
+	return NewStoreWithVault(filePath, nil)
+}
+
+func NewStoreWithVault(filePath string, vault *security.Vault) *Store {
+	if vault == nil {
+		var keyDir string
+		if filePath != "" {
+			keyDir = "."
+		}
+		vault, _ = security.NewVault(keyDir)
+	}
+
 	s := &Store{
-		filePath:      filePath,
-		Devices:       make(map[string]models.Device),
-		NetworkCfgs:   make(map[string]models.NetworkConfig),
-		ImageCfgs:     make(map[string]models.ImageConfig),
-		VideoCfgs:     make(map[string][]models.VideoEncodingConfig),
-		Channels:      make(map[string][]models.RecorderChannel),
-		StorageDisks:  make(map[string][]models.StorageDevice),
-		Sites:         make(map[string]Site),
-		BatchJobs:     make(map[string]BatchJob),
-		Compatibility: make([]CompatibilityEntry, 0),
+		filePath:             filePath,
+		vault:                vault,
+		SchemaVersion:        1,
+		Devices:              make(map[string]models.Device),
+		EncryptedCredentials: make(map[string]string),
+		NetworkCfgs:          make(map[string]models.NetworkConfig),
+		ImageCfgs:            make(map[string]models.ImageConfig),
+		VideoCfgs:            make(map[string][]models.VideoEncodingConfig),
+		Channels:             make(map[string][]models.RecorderChannel),
+		StorageDisks:         make(map[string][]models.StorageDevice),
+		Sites:                make(map[string]Site),
+		BatchJobs:            make(map[string]BatchJob),
+		Compatibility:        make([]CompatibilityEntry, 0),
 	}
 
 	_ = s.load()
 	s.seedCompatibilityDatabase()
 	return s
+}
+
+func (s *Store) SetVault(vault *security.Vault) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.vault = vault
 }
 
 func (s *Store) seedCompatibilityDatabase() {
@@ -100,13 +129,47 @@ func (s *Store) load() error {
 	if s.filePath == "" {
 		return nil
 	}
+
 	data, err := os.ReadFile(s.filePath)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
 		return err
 	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return json.Unmarshal(data, s)
+
+	unmarshalErr := json.Unmarshal(data, s)
+	if unmarshalErr != nil {
+		// Corruption detected in primary file!
+		log.Printf("[DATABASE] Warning: Corrupted database detected at %s: %v", s.filePath, unmarshalErr)
+
+		// 1. Preserve corrupted copy for investigation (never delete user data)
+		corruptCopy := fmt.Sprintf("%s.corrupted.%d", s.filePath, time.Now().Unix())
+		_ = os.WriteFile(corruptCopy, data, 0644)
+		log.Printf("[DATABASE] Preserved forensic copy of corrupted database at %s", corruptCopy)
+
+		// 2. Recover from safe .bak file if available
+		bakFile := s.filePath + ".bak"
+		bakData, bakErr := os.ReadFile(bakFile)
+		if bakErr == nil {
+			if err := json.Unmarshal(bakData, s); err == nil {
+				log.Printf("[DATABASE] Successfully recovered database from backup: %s", bakFile)
+				// Restore valid backup as primary file
+				_ = os.WriteFile(s.filePath, bakData, 0644)
+				_ = s.RunMigrations()
+				return nil
+			}
+		}
+
+		return fmt.Errorf("database corrupted and no valid backup available: %w", unmarshalErr)
+	}
+
+	// Run schema migrations if needed
+	_ = s.RunMigrations()
+	return nil
 }
 
 func (s *Store) Save() error {
@@ -126,16 +189,48 @@ func (s *Store) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.filePath, data, 0644)
+
+	tmpFile := s.filePath + ".tmp"
+	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
+		return fmt.Errorf("failed to write temporary database file: %w", err)
+	}
+
+	// Update .bak before replacing primary file
+	bakFile := s.filePath + ".bak"
+	if _, err := os.Stat(s.filePath); err == nil {
+		if origData, err := os.ReadFile(s.filePath); err == nil && len(origData) > 0 {
+			_ = os.WriteFile(bakFile, origData, 0644)
+		}
+	}
+
+	// Atomic replace
+	_ = os.Remove(s.filePath)
+	if err := os.Rename(tmpFile, s.filePath); err != nil {
+		return fmt.Errorf("atomic database rename failed: %w", err)
+	}
+
+	return nil
 }
 
 // Device methods
 func (s *Store) UpsertDevice(dev models.Device) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	if dev.LastSeen.IsZero() {
 		dev.LastSeen = time.Now().UTC()
 	}
+
+	// Securely encrypt credentials into vault
+	if dev.Password != "" && s.vault != nil {
+		if enc, err := s.vault.Encrypt(dev.Password); err == nil {
+			s.EncryptedCredentials[dev.ID] = enc
+			dev.Password = enc
+		}
+	} else if existingEnc, ok := s.EncryptedCredentials[dev.ID]; ok {
+		dev.Password = existingEnc
+	}
+
 	s.Devices[dev.ID] = dev
 	_ = s.saveLocked()
 }
@@ -145,6 +240,22 @@ func (s *Store) GetDevice(id string) (models.Device, bool) {
 	defer s.mu.RUnlock()
 	dev, ok := s.Devices[id]
 	return dev, ok
+}
+
+// GetDeviceDecrypted returns device with password decrypted via vault for authorized protocol adapters
+func (s *Store) GetDeviceDecrypted(id string) (models.Device, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	dev, ok := s.Devices[id]
+	if !ok {
+		return dev, false
+	}
+	if encPass, has := s.EncryptedCredentials[id]; has && s.vault != nil {
+		if dec, err := s.vault.Decrypt(encPass); err == nil {
+			dev.Password = dec
+		}
+	}
+	return dev, true
 }
 
 func (s *Store) ListDevices() []models.Device {
@@ -161,6 +272,7 @@ func (s *Store) DeleteDevice(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.Devices, id)
+	delete(s.EncryptedCredentials, id)
 	delete(s.NetworkCfgs, id)
 	delete(s.ImageCfgs, id)
 	delete(s.VideoCfgs, id)

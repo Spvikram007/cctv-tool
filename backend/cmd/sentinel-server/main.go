@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
@@ -21,6 +22,7 @@ import (
 	"cctv-sentinel/pkg/discovery"
 	"cctv-sentinel/pkg/licensing"
 	"cctv-sentinel/pkg/models"
+	"cctv-sentinel/pkg/security"
 	"cctv-sentinel/pkg/simulator"
 )
 
@@ -44,9 +46,16 @@ func main() {
 	}
 	time.Sleep(100 * time.Millisecond)
 
-	// 2. Core database & audit logging
+	// 2. Initialize Vault & Core database
+	vault, err := security.NewVault(".")
+	if err != nil {
+		log.Printf("[VAULT] Notice: %v", err)
+	} else {
+		log.Println("[VAULT] AES-256-GCM Hardware Vault initialized successfully.")
+	}
+
 	dbFile := "sentinel_store.json"
-	store := database.NewStore(dbFile)
+	store := database.NewStoreWithVault(dbFile, vault)
 	logger := audit.NewLogger()
 	licenseMgr := licensing.NewManager()
 
@@ -66,7 +75,7 @@ func main() {
 	configEng := configengine.NewEngine(registry, store, logger)
 	discoveryEng := discovery.NewEngine(registry)
 
-	// Seed genuine simulated test devices
+	// Seed genuine simulated test devices if store is fresh
 	if len(store.ListDevices()) == 0 {
 		store.UpsertDevice(models.Device{
 			ID:           "hik-127-0-0-1-18081",
@@ -146,19 +155,41 @@ func main() {
 		WriteTimeout: 15 * time.Second,
 	}
 
-	// Graceful shutdown handling
+	// Graceful shutdown handling for Windows & Unix
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+
 	go func() {
-		<-sigChan
-		log.Println("\n[SYSTEM] Shutting down CCTV Sentinel Universal gracefully...")
+		sig := <-sigChan
+		log.Printf("\n[SYSTEM] Received termination signal (%v). Initiating graceful shutdown...", sig)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Printf("[SYSTEM] HTTP shutdown warning: %v", err)
+		} else {
+			log.Println("[SYSTEM] HTTP server stopped cleanly.")
+		}
+
 		sim.Stop()
-		_ = store.Save()
+		log.Println("[SYSTEM] Hardware simulators stopped.")
+
+		if err := store.Save(); err != nil {
+			log.Printf("[DATABASE] Error saving store during shutdown: %v", err)
+		} else {
+			log.Println("[DATABASE] Database persisted and flushed to disk.")
+		}
+
+		log.Println("[SYSTEM] CCTV Sentinel Universal terminated gracefully.")
 		os.Exit(0)
 	}()
 
 	log.Printf("[REST API] CCTV Sentinel Universal API listening on http://127.0.0.1:%d", serverPort)
+	log.Printf("[REST API] Liveness probe ready at /api/v1/healthz")
+	log.Printf("[REST API] Readiness probe ready at /api/v1/readyz")
 	log.Printf("[REST API] OpenAPI endpoints ready at /api/v1/system/status, /api/v1/devices, /api/v1/diagnostics")
+
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Server failed to start: %v", err)
 	}
