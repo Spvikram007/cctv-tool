@@ -224,6 +224,7 @@ export interface AuditLogEntry {
 }
 
 export interface ConfigPreview {
+  preview_token: string;
   device_id: string;
   device_name: string;
   config_type: string;
@@ -233,6 +234,50 @@ export interface ConfigPreview {
   valid: boolean;
   validation_errors: string[];
   rollback_key: string;
+  expires_at?: string;
+}
+
+export type CapabilityStatus = 'SUPPORTED' | 'UNSUPPORTED' | 'UNKNOWN';
+
+export interface DeviceCapabilities {
+  device_id: string;
+  device_management: CapabilityStatus;
+  media: CapabilityStatus;
+  media2: CapabilityStatus;
+  ptz: CapabilityStatus;
+  imaging: CapabilityStatus;
+  events: CapabilityStatus;
+  recording: CapabilityStatus;
+  analog_format: CapabilityStatus;
+  profiles?: string[];
+  details?: Record<string, string>;
+}
+
+export interface AuthStatus {
+  device_id: string;
+  authenticated: boolean;
+  username: string;
+  protocol: string;
+  auth_method: string;
+  clock_skew_sec: number;
+  firmware: string;
+  model: string;
+  last_checked: string;
+  error_message?: string;
+}
+
+export interface ConfigResult {
+  success: boolean;
+  device_id: string;
+  config_type: string;
+  message: string;
+  applied_at: string;
+  read_back_match: boolean;
+  read_back_diff?: string;
+  verified_read?: any;
+  audit_entry_id: string;
+  rollback_available: boolean;
+  rollback_key?: string;
 }
 
 export interface CompatibilityEntry {

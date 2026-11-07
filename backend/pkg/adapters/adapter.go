@@ -30,6 +30,8 @@ type ProtocolAdapter interface {
 	CaptureSnapshot(dev *models.Device) ([]byte, error)
 	GetRecorderChannels(dev *models.Device) ([]models.RecorderChannel, error)
 	SetChannelAnalogMode(dev *models.Device, channelID int, signalFormat string) error
+	Authenticate(dev *models.Device) (*models.AuthStatus, error)
+	GetCapabilities(dev *models.Device) (*models.DeviceCapabilities, error)
 }
 
 // Registry manages registered vendor protocol adapters

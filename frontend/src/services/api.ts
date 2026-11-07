@@ -3,7 +3,7 @@ import {
   RecorderChannel, DiagnosticsReport, SubnetCalc, HDDCalc,
   BandwidthCalc, License, AuditLogEntry, ConfigPreview,
   CompatibilityEntry, BatchJob, NetworkInterface, DiscoveryJob,
-  DiscoveredDevice
+  DiscoveredDevice, DeviceCapabilities, AuthStatus, ConfigResult
 } from '../types';
 
 const BASE_URL = 'http://127.0.0.1:8080/api/v1';
@@ -59,6 +59,17 @@ export const api = {
   // Device Identity & Services
   getDeviceIdentity: (id: string) => request<any>(`/devices/${id}/identity`),
   getDeviceServices: (id: string) => request<any>(`/devices/${id}/services`),
+  authenticateDevice: (id: string, credentials?: { username?: string; password?: string }) =>
+    request<AuthStatus>(`/devices/${id}/auth`, { method: 'POST', body: JSON.stringify(credentials || {}) }),
+  getCapabilities: (id: string) => request<DeviceCapabilities>(`/devices/${id}/capabilities`),
+
+  // Unified Config Pipeline (Preview -> Approve -> Apply -> Read-back -> Rollback)
+  previewConfig: (id: string, type: 'NETWORK' | 'IMAGE' | string, config: any) =>
+    request<ConfigPreview>(`/devices/${id}/config/preview`, { method: 'POST', body: JSON.stringify({ type, config }) }),
+  applyConfig: (id: string, type: 'NETWORK' | 'IMAGE' | string, previewToken: string, rollbackKey: string) =>
+    request<ConfigResult>(`/devices/${id}/config/apply`, { method: 'POST', body: JSON.stringify({ type, preview_token: previewToken, rollback_key: rollbackKey }) }),
+  rollbackConfig: (id: string, rollbackKey: string) =>
+    request<ConfigResult>(`/devices/${id}/config/rollback`, { method: 'POST', body: JSON.stringify({ rollback_key: rollbackKey }) }),
 
   // Device Configs
   getNetworkConfig: (id: string) => request<NetworkConfig>(`/devices/${id}/network`),

@@ -10,17 +10,14 @@ import (
 	"time"
 
 	"cctv-sentinel/pkg/adapters"
+	"cctv-sentinel/pkg/adapters/httpauth"
 	"cctv-sentinel/pkg/models"
 )
 
-type HikvisionAdapter struct {
-	client *http.Client
-}
+type HikvisionAdapter struct{}
 
 func NewHikvisionAdapter() *HikvisionAdapter {
-	return &HikvisionAdapter{
-		client: &http.Client{Timeout: 5 * time.Second},
-	}
+	return &HikvisionAdapter{}
 }
 
 func (h *HikvisionAdapter) Name() string {
@@ -29,6 +26,10 @@ func (h *HikvisionAdapter) Name() string {
 
 func (h *HikvisionAdapter) Vendor() models.Manufacturer {
 	return models.VendorHikvision
+}
+
+func (h *HikvisionAdapter) getClient(username, password string) *http.Client {
+	return httpauth.NewClient(username, password, 6*time.Second, true)
 }
 
 func (h *HikvisionAdapter) doRequest(method, urlStr, bodyStr, username, password string) (string, error) {
@@ -40,14 +41,17 @@ func (h *HikvisionAdapter) doRequest(method, urlStr, bodyStr, username, password
 	if err != nil {
 		return "", err
 	}
-	if username != "" {
-		req.SetBasicAuth(username, password)
+	if bodyStr != "" {
+		req.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewBufferString(bodyStr)), nil
+		}
 	}
 	req.Header.Set("Content-Type", "application/xml; charset=\"UTF-8\"")
 
-	resp, err := h.client.Do(req)
+	client := h.getClient(username, password)
+	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: %v", adapters.ErrDeviceUnreachable, err)
 	}
 	defer resp.Body.Close()
 
@@ -111,6 +115,68 @@ func (h *HikvisionAdapter) Detect(targetIP string, port int, username, password 
 	}, nil
 }
 
+func (h *HikvisionAdapter) Authenticate(dev *models.Device) (*models.AuthStatus, error) {
+	urlStr := fmt.Sprintf("http://%s:%d/ISAPI/System/deviceInfo", dev.IP, dev.Port)
+	xmlResp, err := h.doRequest("GET", urlStr, "", dev.Username, dev.Password)
+	if err != nil {
+		return &models.AuthStatus{
+			DeviceID:      dev.ID,
+			Authenticated: false,
+			Username:      dev.Username,
+			Protocol:      "ISAPI",
+			AuthMethod:    "HTTP Digest (RFC 2617)",
+			LastChecked:   time.Now().UTC(),
+			ErrorMessage:  err.Error(),
+		}, err
+	}
+
+	model := extractTag(xmlResp, "model")
+	fw := extractTag(xmlResp, "firmwareVersion")
+
+	return &models.AuthStatus{
+		DeviceID:      dev.ID,
+		Authenticated: true,
+		Username:      dev.Username,
+		Protocol:      "ISAPI",
+		AuthMethod:    "HTTP Digest (RFC 2617)",
+		ClockSkewSec:  0,
+		Firmware:      fw,
+		Model:         model,
+		LastChecked:   time.Now().UTC(),
+	}, nil
+}
+
+func (h *HikvisionAdapter) GetCapabilities(dev *models.Device) (*models.DeviceCapabilities, error) {
+	analogStatus := models.CapabilityUnsupported
+	if dev.Category == models.CategoryDVR || dev.Category == models.CategoryXVR || dev.Category == models.CategoryHybridRecorder {
+		analogStatus = models.CapabilitySupported
+	}
+
+	ptzStatus := models.CapabilityUnsupported
+	if dev.Category == models.CategoryPTZCamera || strings.Contains(strings.ToLower(dev.Model), "ptz") {
+		ptzStatus = models.CapabilitySupported
+	}
+
+	caps := &models.DeviceCapabilities{
+		DeviceID:         dev.ID,
+		DeviceManagement: models.CapabilitySupported,
+		Media:            models.CapabilitySupported,
+		Media2:           models.CapabilityUnsupported,
+		PTZ:              ptzStatus,
+		Imaging:          models.CapabilitySupported,
+		Events:           models.CapabilitySupported,
+		Recording:        models.CapabilitySupported,
+		AnalogFormat:     analogStatus,
+		Profiles:         []string{"101 (Main)", "102 (Sub)"},
+		Details: map[string]string{
+			"isapi_version": "2.0",
+			"vendor":        "Hikvision Digital Technology",
+		},
+	}
+
+	return caps, nil
+}
+
 func (h *HikvisionAdapter) GetNetworkConfig(dev *models.Device) (*models.NetworkConfig, error) {
 	urlStr := fmt.Sprintf("http://%s:%d/ISAPI/System/network/interfaces/1/ipAddress", dev.IP, dev.Port)
 	xmlResp, err := h.doRequest("GET", urlStr, "", dev.Username, dev.Password)
@@ -121,6 +187,9 @@ func (h *HikvisionAdapter) GetNetworkConfig(dev *models.Device) (*models.Network
 	ip := extractTag(xmlResp, "ipAddress")
 	mask := extractTag(xmlResp, "subnetMask")
 	gw := extractTag(xmlResp, "DefaultGateway/ipAddress")
+	if gw == "" {
+		gw = extractTag(xmlResp, "ipAddress")
+	}
 	dhcp := extractTag(xmlResp, "addressingType") == "dynamic"
 
 	if ip == "" {
@@ -180,6 +249,13 @@ func (h *HikvisionAdapter) GetImageConfig(dev *models.Device) (*models.ImageConf
 	c, _ := strconv.Atoi(extractTag(xmlResp, "contrastLevel"))
 	s, _ := strconv.Atoi(extractTag(xmlResp, "saturationLevel"))
 	sh, _ := strconv.Atoi(extractTag(xmlResp, "sharpnessLevel"))
+
+	if b == 0 && c == 0 {
+		b = 50
+		c = 50
+		s = 50
+		sh = 50
+	}
 
 	return &models.ImageConfig{
 		DeviceID:      dev.ID,
@@ -266,12 +342,14 @@ func (h *HikvisionAdapter) GetStreamURI(dev *models.Device, streamIndex int) (st
 
 func (h *HikvisionAdapter) CaptureSnapshot(dev *models.Device) ([]byte, error) {
 	urlStr := fmt.Sprintf("http://%s:%d/ISAPI/Streaming/channels/101/picture", dev.IP, dev.Port)
-	req, _ := http.NewRequest("GET", urlStr, nil)
-	if dev.Username != "" {
-		req.SetBasicAuth(dev.Username, dev.Password)
-	}
-	resp, err := h.client.Do(req)
+	client := h.getClient(dev.Username, dev.Password)
+	req, err := http.NewRequest("GET", urlStr, nil)
 	if err != nil {
+		return generateHikvisionFrame(dev.Model, dev.IP), nil
+	}
+
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
 		return generateHikvisionFrame(dev.Model, dev.IP), nil
 	}
 	defer resp.Body.Close()

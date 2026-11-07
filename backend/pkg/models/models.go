@@ -181,6 +181,44 @@ type License struct {
 	OfflineKey   string    `json:"offline_key,omitempty"`
 }
 
+// CapabilityStatus represents whether a device capability is confirmed supported, unsupported or unknown
+type CapabilityStatus string
+
+const (
+	CapabilitySupported   CapabilityStatus = "SUPPORTED"
+	CapabilityUnsupported CapabilityStatus = "UNSUPPORTED"
+	CapabilityUnknown     CapabilityStatus = "UNKNOWN"
+)
+
+// DeviceCapabilities holds the authenticated operation capability matrix for a device
+type DeviceCapabilities struct {
+	DeviceID         string            `json:"device_id"`
+	DeviceManagement CapabilityStatus  `json:"device_management"`
+	Media            CapabilityStatus  `json:"media"`
+	Media2           CapabilityStatus  `json:"media2"`
+	PTZ              CapabilityStatus  `json:"ptz"`
+	Imaging          CapabilityStatus  `json:"imaging"`
+	Events           CapabilityStatus  `json:"events"`
+	Recording        CapabilityStatus  `json:"recording"`
+	AnalogFormat     CapabilityStatus  `json:"analog_format"`
+	Profiles         []string          `json:"profiles,omitempty"`
+	Details          map[string]string `json:"details,omitempty"`
+}
+
+// AuthStatus records the live authentication verification result
+type AuthStatus struct {
+	DeviceID      string    `json:"device_id"`
+	Authenticated bool      `json:"authenticated"`
+	Username      string    `json:"username"`
+	Protocol      string    `json:"protocol"`
+	AuthMethod    string    `json:"auth_method"` // WS-Security, HTTP Digest, Basic
+	ClockSkewSec  int64     `json:"clock_skew_sec"`
+	Firmware      string    `json:"firmware"`
+	Model         string    `json:"model"`
+	LastChecked   time.Time `json:"last_checked"`
+	ErrorMessage  string    `json:"error_message,omitempty"`
+}
+
 // AuditLogEntry ensures immutable logging with zero secret leakage
 type AuditLogEntry struct {
 	ID        string    `json:"id"`

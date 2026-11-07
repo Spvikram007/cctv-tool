@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { Device, NetworkConfig, ImageConfig, VideoEncodingConfig, ConfigPreview } from '../types';
+import { Device, NetworkConfig, ImageConfig, VideoEncodingConfig, ConfigPreview, DeviceCapabilities, ConfigResult } from '../types';
 import { api } from '../services/api';
-import { Sliders, Network, Sun, CheckCircle, RotateCcw, AlertTriangle, RefreshCw } from 'lucide-react';
+import { Sliders, Network, Sun, CheckCircle, RotateCcw, AlertTriangle, ShieldCheck, Cpu } from 'lucide-react';
 
 interface ConfigurationProps {
   devices: Device[];
@@ -17,6 +17,7 @@ export const Configuration: React.FC<ConfigurationProps> = ({
   const currentDev = selectedDevice || devices[0];
   const [activeTab, setActiveTab] = useState<'network' | 'image' | 'video'>('network');
   const [loading, setLoading] = useState(false);
+  const [capabilities, setCapabilities] = useState<DeviceCapabilities | null>(null);
 
   // Staged states
   const [networkCfg, setNetworkCfg] = useState<NetworkConfig>({
@@ -46,20 +47,30 @@ export const Configuration: React.FC<ConfigurationProps> = ({
     backlight_comp: true,
   });
 
-  const [videoCfgs, setVideoCfgs] = useState<VideoEncodingConfig[]>([]);
-  console.debug('Loaded video configs:', videoCfgs.length);
+  const [, setVideoCfgs] = useState<VideoEncodingConfig[]>([]);
 
-  // 12-Step flow state
+  // 10-Step Safety Engine state
   const [previewModal, setPreviewModal] = useState<ConfigPreview | null>(null);
+  const [lastResult, setLastResult] = useState<ConfigResult | null>(null);
   const [lastRollbackKey, setLastRollbackKey] = useState<string>('');
-  const [applyMessage, setApplyMessage] = useState<string>('');
   const [isApplying, setIsApplying] = useState(false);
 
   useEffect(() => {
     if (currentDev) {
       loadDeviceConfigs(currentDev.id);
+      loadCapabilities(currentDev.id);
     }
   }, [currentDev?.id]);
+
+  const loadCapabilities = async (id: string) => {
+    try {
+      const caps = await api.getCapabilities(id);
+      setCapabilities(caps);
+    } catch (e) {
+      console.warn('Failed to fetch capabilities:', e);
+      setCapabilities(null);
+    }
+  };
 
   const loadDeviceConfigs = async (id: string) => {
     setLoading(true);
@@ -77,15 +88,15 @@ export const Configuration: React.FC<ConfigurationProps> = ({
     }
   };
 
-  // Step 5 & 6: Preview & Validation
+  // Steps 1 to 6: Generate Preview & Structural Diff with Staged Token
   const handleGeneratePreview = async () => {
     if (!currentDev) return;
     try {
       if (activeTab === 'network') {
-        const preview = await api.previewNetworkConfig(currentDev.id, networkCfg);
+        const preview = await api.previewConfig(currentDev.id, 'NETWORK', networkCfg);
         setPreviewModal(preview);
       } else if (activeTab === 'image') {
-        const preview = await api.previewImageConfig(currentDev.id, imageCfg);
+        const preview = await api.previewConfig(currentDev.id, 'IMAGE', imageCfg);
         setPreviewModal(preview);
       }
     } catch (err: any) {
@@ -93,21 +104,23 @@ export const Configuration: React.FC<ConfigurationProps> = ({
     }
   };
 
-  // Step 8, 9, 10, 11: Apply Confirmed Changes
+  // Steps 7 to 10: Explicit Approval -> Apply -> Read-back Verification -> Audit
   const handleConfirmApply = async () => {
     if (!currentDev || !previewModal) return;
     setIsApplying(true);
     try {
-      let res: any = null;
-      if (previewModal.config_type === 'NETWORK') {
-        res = await api.applyNetworkConfig(currentDev.id, previewModal.rollback_key, networkCfg);
-      } else {
-        res = await api.applyImageConfig(currentDev.id, previewModal.rollback_key, imageCfg);
+      const res = await api.applyConfig(
+        currentDev.id,
+        previewModal.config_type,
+        previewModal.preview_token,
+        previewModal.rollback_key
+      );
+      setLastResult(res);
+      if (res.rollback_key) {
+        setLastRollbackKey(res.rollback_key);
       }
-      setLastRollbackKey(previewModal.rollback_key);
-      setApplyMessage(res.message);
       setPreviewModal(null);
-      // Reload verified read-back
+      // Reload verified read-back from physical device
       await loadDeviceConfigs(currentDev.id);
     } catch (err: any) {
       alert(`Apply failed: ${err.message}`);
@@ -116,19 +129,16 @@ export const Configuration: React.FC<ConfigurationProps> = ({
     }
   };
 
-  // Step 12: Rollback
+  // Step 10: Rollback to previous configuration state
   const handleRollback = async () => {
     if (!currentDev || !lastRollbackKey) return;
-    if (confirm('Execute Step 12 rollback to previous configuration state?')) {
+    if (confirm('Execute Rollback to previous configuration snapshot?')) {
       try {
-        const res = await fetch(`http://127.0.0.1:8080/api/v1/devices/${currentDev.id}/network/apply`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ rollback_key: lastRollbackKey, config: networkCfg }),
-        });
-        const data = await res.json();
-        alert(data.message || 'Rollback executed');
+        const res = await api.rollbackConfig(currentDev.id, lastRollbackKey);
+        setLastResult(res);
+        setLastRollbackKey('');
         await loadDeviceConfigs(currentDev.id);
+        alert(res.message);
       } catch (err: any) {
         alert(`Rollback failed: ${err.message}`);
       }
@@ -143,6 +153,26 @@ export const Configuration: React.FC<ConfigurationProps> = ({
     );
   }
 
+  const renderCapBadge = (label: string, status?: string) => {
+    const isSupp = status === 'SUPPORTED';
+    const isUnsupp = status === 'UNSUPPORTED';
+    return (
+      <span
+        key={label}
+        className={`px-2 py-1 rounded text-[10px] font-mono font-bold flex items-center space-x-1 border ${
+          isSupp
+            ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
+            : isUnsupp
+            ? 'bg-slate-800 text-slate-500 border-slate-700 line-through'
+            : 'bg-amber-500/10 text-amber-400 border-amber-500/30'
+        }`}
+      >
+        <span>{label}</span>
+        <span className="text-[9px] opacity-75">{status || 'UNKNOWN'}</span>
+      </span>
+    );
+  };
+
   return (
     <div className="space-y-6">
       {/* Device Picker Bar */}
@@ -152,8 +182,8 @@ export const Configuration: React.FC<ConfigurationProps> = ({
             <Sliders className="w-5 h-5" />
           </div>
           <div>
-            <h2 className="text-sm font-bold text-slate-100 font-mono uppercase">UNIVERSAL 12-STEP CONFIGURATION ENGINE</h2>
-            <p className="text-[11px] text-slate-400 font-mono">Preview, validate, verify read-back, audit and rollback</p>
+            <h2 className="text-sm font-bold text-slate-100 font-mono uppercase">UNIVERSAL 10-STEP CONFIGURATION SAFETY ENGINE</h2>
+            <p className="text-[11px] text-slate-400 font-mono">Authenticate • Preview Diff • Explicit Approval • Read-Back Verify • Rollback</p>
           </div>
         </div>
 
@@ -176,20 +206,67 @@ export const Configuration: React.FC<ConfigurationProps> = ({
         </div>
       </div>
 
-      {applyMessage && (
-        <div className="p-3 bg-emerald-950/60 border border-emerald-800 text-emerald-300 rounded-xl text-xs font-mono flex items-center justify-between">
-          <div className="flex items-center space-x-2">
-            <CheckCircle className="w-4 h-4 text-emerald-400" />
-            <span>{applyMessage}</span>
+      {/* Device Capabilities Matrix Strip */}
+      <div className="p-3 bg-[#0d1117] border border-[#30363d] rounded-xl">
+        <div className="flex items-center justify-between mb-2">
+          <div className="flex items-center space-x-2 text-xs font-mono text-slate-300 font-bold">
+            <Cpu className="w-4 h-4 text-emerald-400" />
+            <span>AUTHENTICATED CAPABILITY MATRIX</span>
           </div>
-          {lastRollbackKey && (
-            <button
-              onClick={handleRollback}
-              className="px-2 py-1 bg-amber-600/20 hover:bg-amber-600/30 text-amber-300 border border-amber-600/40 rounded flex items-center space-x-1"
-            >
-              <RotateCcw className="w-3 h-3" />
-              <span>ROLLBACK (STEP 12)</span>
-            </button>
+          <span className="text-[10px] font-mono text-slate-400">
+            Protocols: {currentDev.protocols?.join(', ') || 'ONVIF'}
+          </span>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {renderCapBadge('DEVICE MGMT', capabilities?.device_management || 'SUPPORTED')}
+          {renderCapBadge('MEDIA STREAMING', capabilities?.media || 'SUPPORTED')}
+          {renderCapBadge('MEDIA2', capabilities?.media2 || 'UNSUPPORTED')}
+          {renderCapBadge('PTZ CONTROLS', capabilities?.ptz)}
+          {renderCapBadge('IMAGING SENSOR', capabilities?.imaging || 'SUPPORTED')}
+          {renderCapBadge('EVENT PULL', capabilities?.events)}
+          {renderCapBadge('RECORDING', capabilities?.recording)}
+          {renderCapBadge('ANALOG UTC', capabilities?.analog_format)}
+        </div>
+      </div>
+
+      {/* Read-Back Verification / Apply Result Notification */}
+      {lastResult && (
+        <div
+          className={`p-4 rounded-xl text-xs font-mono border ${
+            lastResult.read_back_match
+              ? 'bg-emerald-950/40 border-emerald-700/60 text-emerald-300'
+              : 'bg-amber-950/40 border-amber-700/60 text-amber-300'
+          }`}
+        >
+          <div className="flex items-center justify-between">
+            <div className="flex items-center space-x-2 font-bold">
+              {lastResult.read_back_match ? (
+                <>
+                  <ShieldCheck className="w-4 h-4 text-emerald-400" />
+                  <span>STEP 9 VERIFIED ON HARDWARE: MATCH</span>
+                </>
+              ) : (
+                <>
+                  <AlertTriangle className="w-4 h-4 text-amber-400" />
+                  <span>STEP 9 READ-BACK VERIFICATION: MISMATCH NOTED</span>
+                </>
+              )}
+            </div>
+            {lastRollbackKey && (
+              <button
+                onClick={handleRollback}
+                className="px-2.5 py-1 bg-amber-600/30 hover:bg-amber-600/50 text-amber-200 border border-amber-500/40 rounded flex items-center space-x-1.5 transition-colors font-bold"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                <span>EXECUTE ROLLBACK (STEP 10)</span>
+              </button>
+            )}
+          </div>
+          <p className="mt-1.5 text-[11px] text-slate-300">{lastResult.message}</p>
+          {lastResult.read_back_diff && (
+            <div className="mt-1 text-[10px] text-amber-200/90 font-mono">
+              Differences: {lastResult.read_back_diff}
+            </div>
           )}
         </div>
       )}
@@ -221,110 +298,95 @@ export const Configuration: React.FC<ConfigurationProps> = ({
         </button>
       </div>
 
-      {/* Tab Contents */}
-      {loading ? (
-        <div className="p-12 text-center text-slate-400 font-mono text-xs flex items-center justify-center space-x-2">
-          <RefreshCw className="w-4 h-4 animate-spin text-emerald-400" />
-          <span>Synchronizing settings from hardware adapter...</span>
-        </div>
-      ) : activeTab === 'network' ? (
-        <div className="p-6 rounded-xl bg-[#161b22] border border-[#30363d] space-y-6">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+      {/* Tab 1: Network Form */}
+      {activeTab === 'network' && (
+        <div className="p-6 bg-[#161b22] border border-[#30363d] rounded-xl space-y-6">
+          <div className="flex items-center justify-between border-b border-[#30363d] pb-4">
             <div>
-              <label className="block text-xs font-mono text-slate-400 mb-1">ADDRESSING MODE</label>
-              <div className="flex items-center space-x-4 mt-2">
-                <label className="flex items-center space-x-2 text-xs font-mono text-slate-300">
-                  <input
-                    type="radio"
-                    name="dhcp"
-                    checked={!networkCfg.dhcp}
-                    onChange={() => setNetworkCfg({ ...networkCfg, dhcp: false })}
-                    className="accent-emerald-500"
-                  />
-                  <span>STATIC IP (RECOMMENDED)</span>
-                </label>
-                <label className="flex items-center space-x-2 text-xs font-mono text-slate-300">
-                  <input
-                    type="radio"
-                    name="dhcp"
-                    checked={networkCfg.dhcp}
-                    onChange={() => setNetworkCfg({ ...networkCfg, dhcp: true })}
-                    className="accent-emerald-500"
-                  />
-                  <span>DHCP DYNAMIC</span>
-                </label>
-              </div>
+              <h3 className="text-sm font-bold text-slate-100 font-mono">IP ADDRESS & NETWORK INTERFACE</h3>
+              <p className="text-xs text-slate-400 font-mono">Configure static IPv4 or DHCP lease</p>
             </div>
+            <div className="flex items-center space-x-2">
+              <span className="text-xs font-mono text-slate-300">DHCP:</span>
+              <input
+                type="checkbox"
+                checked={networkCfg.dhcp}
+                onChange={(e) => setNetworkCfg({ ...networkCfg, dhcp: e.target.checked })}
+                className="rounded border-[#30363d] text-emerald-500 focus:ring-emerald-500 h-4 w-4 bg-[#0d1117]"
+              />
+            </div>
+          </div>
 
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs font-mono">
             <div>
-              <label className="block text-xs font-mono text-slate-400 mb-1">IP ADDRESS</label>
+              <label className="block text-slate-400 mb-1">IPv4 ADDRESS</label>
               <input
                 type="text"
                 disabled={networkCfg.dhcp}
                 value={networkCfg.ip_address}
                 onChange={(e) => setNetworkCfg({ ...networkCfg, ip_address: e.target.value })}
-                className="w-full px-3 py-2 bg-[#0d1117] border border-[#30363d] rounded-lg text-xs font-mono text-slate-200 focus:outline-none focus:border-emerald-500 disabled:opacity-50"
+                className="w-full px-3 py-2 bg-[#0d1117] border border-[#30363d] rounded-lg text-slate-200 disabled:opacity-50"
               />
             </div>
 
             <div>
-              <label className="block text-xs font-mono text-slate-400 mb-1">SUBNET MASK</label>
+              <label className="block text-slate-400 mb-1">SUBNET MASK</label>
               <input
                 type="text"
                 disabled={networkCfg.dhcp}
                 value={networkCfg.subnet_mask}
                 onChange={(e) => setNetworkCfg({ ...networkCfg, subnet_mask: e.target.value })}
-                className="w-full px-3 py-2 bg-[#0d1117] border border-[#30363d] rounded-lg text-xs font-mono text-slate-200 focus:outline-none focus:border-emerald-500 disabled:opacity-50"
+                className="w-full px-3 py-2 bg-[#0d1117] border border-[#30363d] rounded-lg text-slate-200 disabled:opacity-50"
               />
             </div>
 
             <div>
-              <label className="block text-xs font-mono text-slate-400 mb-1">DEFAULT GATEWAY</label>
+              <label className="block text-slate-400 mb-1">DEFAULT GATEWAY</label>
               <input
                 type="text"
                 disabled={networkCfg.dhcp}
                 value={networkCfg.gateway}
                 onChange={(e) => setNetworkCfg({ ...networkCfg, gateway: e.target.value })}
-                className="w-full px-3 py-2 bg-[#0d1117] border border-[#30363d] rounded-lg text-xs font-mono text-slate-200 focus:outline-none focus:border-emerald-500 disabled:opacity-50"
+                className="w-full px-3 py-2 bg-[#0d1117] border border-[#30363d] rounded-lg text-slate-200 disabled:opacity-50"
               />
             </div>
 
             <div>
-              <label className="block text-xs font-mono text-slate-400 mb-1">PRIMARY DNS</label>
+              <label className="block text-slate-400 mb-1">PRIMARY DNS</label>
               <input
                 type="text"
                 value={networkCfg.dns1}
                 onChange={(e) => setNetworkCfg({ ...networkCfg, dns1: e.target.value })}
-                className="w-full px-3 py-2 bg-[#0d1117] border border-[#30363d] rounded-lg text-xs font-mono text-slate-200 focus:outline-none"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-mono text-slate-400 mb-1">NTP TIME SERVER</label>
-              <input
-                type="text"
-                value={networkCfg.ntp_server}
-                onChange={(e) => setNetworkCfg({ ...networkCfg, ntp_server: e.target.value })}
-                className="w-full px-3 py-2 bg-[#0d1117] border border-[#30363d] rounded-lg text-xs font-mono text-slate-200 focus:outline-none"
+                className="w-full px-3 py-2 bg-[#0d1117] border border-[#30363d] rounded-lg text-slate-200"
               />
             </div>
           </div>
 
-          <div className="flex justify-end pt-4 border-t border-[#30363d]">
+          <div className="pt-4 border-t border-[#30363d] flex justify-end">
             <button
               onClick={handleGeneratePreview}
-              className="px-5 py-2.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-mono font-bold shadow-lg shadow-emerald-900/30 transition-all"
+              disabled={loading}
+              className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg font-mono text-xs font-bold transition-all flex items-center space-x-2"
             >
-              STAGE & PREVIEW CHANGES (STEP 5 & 6)
+              <span>PREVIEW & VALIDATE (STEPS 1-6)</span>
             </button>
           </div>
         </div>
-      ) : (
-        <div className="p-6 rounded-xl bg-[#161b22] border border-[#30363d] space-y-6">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+      )}
+
+      {/* Tab 2: Image Parameters */}
+      {activeTab === 'image' && (
+        <div className="p-6 bg-[#161b22] border border-[#30363d] rounded-xl space-y-6">
+          <div className="border-b border-[#30363d] pb-4">
+            <h3 className="text-sm font-bold text-slate-100 font-mono">SENSOR & COLOR ADJUSTMENTS</h3>
+            <p className="text-xs text-slate-400 font-mono">Adjust brightness, contrast, saturation, sharpness (0-100)</p>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 text-xs font-mono">
             <div>
-              <div className="flex justify-between text-xs font-mono text-slate-400 mb-1">
-                <span>BRIGHTNESS ({imageCfg.brightness}%)</span>
+              <div className="flex justify-between mb-1 text-slate-300">
+                <span>BRIGHTNESS</span>
+                <span className="text-emerald-400 font-bold">{imageCfg.brightness}</span>
               </div>
               <input
                 type="range"
@@ -337,8 +399,9 @@ export const Configuration: React.FC<ConfigurationProps> = ({
             </div>
 
             <div>
-              <div className="flex justify-between text-xs font-mono text-slate-400 mb-1">
-                <span>CONTRAST ({imageCfg.contrast}%)</span>
+              <div className="flex justify-between mb-1 text-slate-300">
+                <span>CONTRAST</span>
+                <span className="text-emerald-400 font-bold">{imageCfg.contrast}</span>
               </div>
               <input
                 type="range"
@@ -351,8 +414,9 @@ export const Configuration: React.FC<ConfigurationProps> = ({
             </div>
 
             <div>
-              <div className="flex justify-between text-xs font-mono text-slate-400 mb-1">
-                <span>SATURATION ({imageCfg.saturation}%)</span>
+              <div className="flex justify-between mb-1 text-slate-300">
+                <span>SATURATION</span>
+                <span className="text-emerald-400 font-bold">{imageCfg.saturation}</span>
               </div>
               <input
                 type="range"
@@ -365,8 +429,9 @@ export const Configuration: React.FC<ConfigurationProps> = ({
             </div>
 
             <div>
-              <div className="flex justify-between text-xs font-mono text-slate-400 mb-1">
-                <span>SHARPNESS ({imageCfg.sharpness}%)</span>
+              <div className="flex justify-between mb-1 text-slate-300">
+                <span>SHARPNESS</span>
+                <span className="text-emerald-400 font-bold">{imageCfg.sharpness}</span>
               </div>
               <input
                 type="range"
@@ -379,82 +444,70 @@ export const Configuration: React.FC<ConfigurationProps> = ({
             </div>
           </div>
 
-          <div className="flex justify-end pt-4 border-t border-[#30363d]">
+          <div className="pt-4 border-t border-[#30363d] flex justify-end">
             <button
               onClick={handleGeneratePreview}
-              className="px-5 py-2.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-mono font-bold shadow-lg shadow-emerald-900/30 transition-all"
+              disabled={loading}
+              className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg font-mono text-xs font-bold transition-all flex items-center space-x-2"
             >
-              STAGE & PREVIEW CHANGES (STEP 5 & 6)
+              <span>PREVIEW & VALIDATE (STEPS 1-6)</span>
             </button>
           </div>
         </div>
       )}
 
-      {/* Step 6 Preview Diff Modal */}
+      {/* Step 6 Modal: Preview & Staged Diff */}
       {previewModal && (
-        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="w-full max-w-xl rounded-2xl bg-[#161b22] border border-[#30363d] shadow-2xl p-6 space-y-4 font-mono">
+        <div className="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-[#161b22] border border-[#30363d] rounded-xl max-w-2xl w-full p-6 space-y-4 font-mono shadow-2xl">
             <div className="flex items-center justify-between border-b border-[#30363d] pb-3">
-              <div className="flex items-center space-x-2">
-                <AlertTriangle className="w-5 h-5 text-amber-400" />
-                <h3 className="text-sm font-bold text-slate-100 uppercase">
-                  STEP 6: CONFIGURATION PREVIEW & DIFF CONFIRMATION
-                </h3>
+              <div className="flex items-center space-x-2 text-emerald-400 font-bold text-sm">
+                <CheckCircle className="w-5 h-5" />
+                <span>STEP 6: CONFIGURATION PREVIEW & DIFF</span>
               </div>
-              <button
-                onClick={() => setPreviewModal(null)}
-                className="text-slate-400 hover:text-slate-200 text-sm"
-              >
-                ✕
-              </button>
+              <span className="text-[10px] bg-slate-800 text-slate-400 px-2 py-0.5 rounded border border-slate-700">
+                Token: {previewModal.preview_token.slice(0, 12)}...
+              </span>
             </div>
 
-            <div className="space-y-3 text-xs">
-              <div>
-                <span className="text-slate-400">TARGET:</span>{' '}
-                <span className="text-slate-200 font-bold">{previewModal.device_name}</span>
+            {/* Validation Alert */}
+            {!previewModal.valid ? (
+              <div className="p-3 bg-red-950/50 border border-red-800 text-red-300 rounded-lg text-xs space-y-1">
+                <div className="font-bold flex items-center space-x-1.5">
+                  <AlertTriangle className="w-4 h-4 text-red-400" />
+                  <span>VALIDATION CHECKS FAILED</span>
+                </div>
+                {previewModal.validation_errors.map((err, i) => (
+                  <div key={i} className="text-[11px]">• {err}</div>
+                ))}
               </div>
-
-              <div>
-                <span className="text-slate-400">PARAMETER DIFF:</span>
-                <div className="mt-1 p-3 rounded-lg bg-[#0d1117] border border-[#30363d] text-emerald-400 font-bold">
-                  {previewModal.diff}
-                </div>
+            ) : (
+              <div className="p-3 bg-emerald-950/40 border border-emerald-800 text-emerald-300 rounded-lg text-xs">
+                <span>All syntactic and hardware limits verified successfully.</span>
               </div>
+            )}
 
-              {previewModal.validation_errors && previewModal.validation_errors.length > 0 ? (
-                <div className="p-3 bg-red-950/40 border border-red-800 text-red-300 rounded-lg space-y-1">
-                  <div className="font-bold">VALIDATION BLOCKED:</div>
-                  {previewModal.validation_errors.map((err, i) => (
-                    <div key={i}>• {err}</div>
-                  ))}
-                </div>
-              ) : (
-                <div className="p-3 bg-emerald-950/30 border border-emerald-800/40 text-emerald-300 rounded-lg flex items-center space-x-2">
-                  <CheckCircle className="w-4 h-4 text-emerald-400" />
-                  <span>Proposed parameters passed syntactic and hardware validation checks.</span>
-                </div>
-              )}
+            {/* Structural Diff */}
+            <div>
+              <label className="text-xs text-slate-400 block mb-1">STRUCTURAL FIELD DIFF:</label>
+              <div className="p-3 bg-[#0d1117] border border-[#30363d] rounded-lg text-xs text-slate-200">
+                {previewModal.diff}
+              </div>
             </div>
 
-            <div className="pt-3 border-t border-[#30363d] flex justify-end space-x-3 text-xs">
+            <div className="flex items-center justify-end space-x-3 pt-3 border-t border-[#30363d]">
               <button
                 onClick={() => setPreviewModal(null)}
-                className="px-4 py-2 rounded-lg bg-[#21262d] text-slate-300 hover:bg-[#30363d]"
+                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs"
               >
                 CANCEL
               </button>
               <button
                 disabled={!previewModal.valid || isApplying}
                 onClick={handleConfirmApply}
-                className={`px-5 py-2 rounded-lg font-bold flex items-center space-x-2 ${
-                  previewModal.valid && !isApplying
-                    ? 'bg-emerald-600 hover:bg-emerald-500 text-white'
-                    : 'bg-slate-700 text-slate-500 cursor-not-allowed'
-                }`}
+                className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-lg text-xs font-bold flex items-center space-x-1.5"
               >
-                {isApplying && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
-                <span>CONFIRM & APPLY TO HARDWARE (STEP 7 & 8)</span>
+                <span>{isApplying ? 'APPLYING & VERIFYING...' : 'APPROVE & APPLY (STEPS 7-9)'}</span>
               </button>
             </div>
           </div>

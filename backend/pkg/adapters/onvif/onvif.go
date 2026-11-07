@@ -1,9 +1,6 @@
 package onvif
 
 import (
-	"bytes"
-	"crypto/sha1"
-	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
@@ -32,233 +29,168 @@ func (a *ONVIFAdapter) Vendor() models.Manufacturer {
 	return models.VendorGeneric
 }
 
-// buildAuthHeader generates ONVIF WS-Security UsernameToken header
-func buildAuthHeader(username, password string) string {
-	if username == "" {
-		return ""
+func (a *ONVIFAdapter) getClient(dev *models.Device) *Client {
+	port := dev.ONVIFPort
+	if port <= 0 {
+		port = dev.Port
 	}
-	nonce := []byte(fmt.Sprintf("%d", time.Now().UnixNano()))
-	created := time.Now().UTC().Format(time.RFC3339Nano)
-	
-	// Password_Digest = Base64 ( SHA-1 ( raw_nonce + created + password ) )
-	h := sha1.New()
-	h.Write(nonce)
-	h.Write([]byte(created))
-	h.Write([]byte(password))
-	digest := base64.StdEncoding.EncodeToString(h.Sum(nil))
-	nonceB64 := base64.StdEncoding.EncodeToString(nonce)
-
-	return fmt.Sprintf(`
-	<wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd" xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
-		<wsse:UsernameToken>
-			<wsse:Username>%s</wsse:Username>
-			<wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">%s</wsse:Password>
-			<wsse:Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">%s</wsse:Nonce>
-			<wsu:Created>%s</wsu:Created>
-		</wsse:UsernameToken>
-	</wsse:Security>`, username, digest, nonceB64, created)
-}
-
-func (a *ONVIFAdapter) sendSOAP(url, action, body, username, password string) (string, error) {
-	envelope := fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
-               xmlns:tds="http://www.onvif.org/ver10/device/wsdl"
-               xmlns:trt="http://www.onvif.org/ver10/media/wsdl"
-               xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl"
-               xmlns:tt="http://www.onvif.org/ver10/schema">
-	<soap:Header>
-		%s
-	</soap:Header>
-	<soap:Body>
-		%s
-	</soap:Body>
-</soap:Envelope>`, buildAuthHeader(username, password), body)
-
-	req, err := http.NewRequest("POST", url, bytes.NewBufferString(envelope))
-	if err != nil {
-		return "", err
+	if port <= 0 {
+		port = 80
 	}
-	req.Header.Set("Content-Type", "application/soap+xml; charset=utf-8; action=\""+action+"\"")
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	respBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	if resp.StatusCode == http.StatusUnauthorized {
-		return "", adapters.ErrAuthenticationFailed
-	}
-
-	return string(respBytes), nil
+	return NewClient(dev.IP, port, dev.Username, dev.Password)
 }
 
 func (a *ONVIFAdapter) Detect(targetIP string, port int, username, password string) (*models.Device, error) {
 	if port <= 0 {
 		port = 80
 	}
-	deviceServiceURL := fmt.Sprintf("http://%s:%d/onvif/device_service", targetIP, port)
-	body := `<tds:GetDeviceInformation/>`
-	
-	xmlResp, err := a.sendSOAP(deviceServiceURL, "http://www.onvif.org/ver10/device/wsdl/GetDeviceInformation", body, username, password)
+	cli := NewClient(targetIP, port, username, password)
+
+	// Step 1: Calibrate clock skew if possible
+	_, _, _ = cli.GetSystemDateAndTime()
+
+	// Step 2: Query Device Information
+	dev, err := cli.GetDeviceInformation()
 	if err != nil {
 		return nil, fmt.Errorf("ONVIF probe failed: %w", err)
 	}
 
-	// Parse simple values
-	manufacturer := extractXMLTag(xmlResp, "Manufacturer")
-	model := extractXMLTag(xmlResp, "Model")
-	fw := extractXMLTag(xmlResp, "FirmwareVersion")
-	serial := extractXMLTag(xmlResp, "SerialNumber")
-
-	// Strict verification: must contain genuine ONVIF GetDeviceInformation response
-	if manufacturer == "" && model == "" && !strings.Contains(xmlResp, "GetDeviceInformationResponse") {
-		return nil, fmt.Errorf("response did not contain valid ONVIF GetDeviceInformation elements")
-	}
-
-	if manufacturer == "" {
-		manufacturer = "Generic ONVIF"
-	}
-	if model == "" {
-		model = "IP Camera (Profile S)"
-	}
-
-	dev := &models.Device{
-		ID:           fmt.Sprintf("onvif-%s-%d", strings.ReplaceAll(targetIP, ".", "-"), port),
-		Name:         fmt.Sprintf("%s %s", manufacturer, model),
-		IP:           targetIP,
-		Port:         port,
-		ONVIFPort:    port,
-		RTSPPort:     554,
-		Manufacturer: models.Manufacturer(manufacturer),
-		Model:        model,
-		Firmware:     fw,
-		SerialNumber: serial,
-		Category:     models.CategoryIPCamera,
-		Status:       "online",
-		Protocols:    []models.ProtocolType{models.ProtocolONVIF, models.ProtocolRTSP},
-		Capabilities: []string{"STREAMING", "IMAGE_SETTINGS", "ENCODING", "SNAPSHOT", "PTZ"},
-		ChannelCount: 1,
-		Username:     username,
-		Password:     password,
-		LastSeen:     time.Now().UTC(),
+	// Step 3: Populate profiles if available
+	profiles, _ := cli.GetProfiles()
+	if len(profiles) > 0 {
+		dev.Capabilities = append(dev.Capabilities, "PROFILES:"+strings.Join(profiles, ","))
 	}
 
 	return dev, nil
 }
 
-func (a *ONVIFAdapter) GetNetworkConfig(dev *models.Device) (*models.NetworkConfig, error) {
-	deviceServiceURL := fmt.Sprintf("http://%s:%d/onvif/device_service", dev.IP, dev.Port)
-	body := `<tds:GetNetworkInterfaces/>`
-	
-	resp, err := a.sendSOAP(deviceServiceURL, "http://www.onvif.org/ver10/device/wsdl/GetNetworkInterfaces", body, dev.Username, dev.Password)
+func (a *ONVIFAdapter) Authenticate(dev *models.Device) (*models.AuthStatus, error) {
+	cli := a.getClient(dev)
+
+	// 1. Check time synchronization
+	_, skew, err := cli.GetSystemDateAndTime()
+	skewSec := int64(skew.Seconds())
+
+	// 2. Test authenticated operation
+	devInfo, err := cli.GetDeviceInformation()
 	if err != nil {
-		return nil, err
+		return &models.AuthStatus{
+			DeviceID:      dev.ID,
+			Authenticated: false,
+			Username:      dev.Username,
+			Protocol:      "ONVIF",
+			AuthMethod:    "WS-Security UsernameToken PasswordDigest",
+			ClockSkewSec:  skewSec,
+			LastChecked:   time.Now().UTC(),
+			ErrorMessage:  err.Error(),
+		}, err
 	}
 
-	ip := extractXMLTag(resp, "IPv4Address")
-	if ip == "" {
-		ip = dev.IP
-	}
-	prefixLen := extractXMLTag(resp, "PrefixLength")
-	mask := "255.255.255.0"
-	if prefixLen == "16" {
-		mask = "255.255.0.0"
-	} else if prefixLen == "8" {
-		mask = "255.0.0.0"
-	}
-	dhcp := strings.Contains(strings.ToLower(resp), "<dhcp>true</dhcp>") || strings.Contains(strings.ToLower(resp), "dhcp=\"true\"")
-
-	return &models.NetworkConfig{
-		DeviceID:   dev.ID,
-		DHCP:       dhcp,
-		IPAddress:  ip,
-		SubnetMask: mask,
-		Gateway:    extractXMLTag(resp, "Gateway"),
-		DNS1:       "8.8.8.8",
-		DNS2:       "1.1.1.1",
-		HTTPPort:   dev.Port,
-		RTSPPort:   554,
-		ONVIFPort:  dev.Port,
-		NTPEnabled: true,
-		NTPServer:  "pool.ntp.org",
+	return &models.AuthStatus{
+		DeviceID:      dev.ID,
+		Authenticated: true,
+		Username:      dev.Username,
+		Protocol:      "ONVIF",
+		AuthMethod:    "WS-Security UsernameToken PasswordDigest",
+		ClockSkewSec:  skewSec,
+		Firmware:      devInfo.Firmware,
+		Model:         devInfo.Model,
+		LastChecked:   time.Now().UTC(),
 	}, nil
+}
+
+func (a *ONVIFAdapter) GetCapabilities(dev *models.Device) (*models.DeviceCapabilities, error) {
+	cli := a.getClient(dev)
+	_, _, _ = cli.GetSystemDateAndTime()
+
+	caps, err := cli.GetCapabilities()
+	if err != nil {
+		// Return partial capability structure if full GetCapabilities failed
+		return &models.DeviceCapabilities{
+			DeviceID:         dev.ID,
+			DeviceManagement: models.CapabilitySupported,
+			Media:            models.CapabilityUnknown,
+			Media2:           models.CapabilityUnsupported,
+			PTZ:              models.CapabilityUnknown,
+			Imaging:          models.CapabilityUnknown,
+			Events:           models.CapabilityUnknown,
+			Recording:        models.CapabilityUnsupported,
+			AnalogFormat:     models.CapabilityUnsupported,
+		}, nil
+	}
+
+	// Fetch media profiles to populate profile list
+	profiles, _ := cli.GetProfiles()
+	caps.Profiles = profiles
+
+	return caps, nil
+}
+
+func (a *ONVIFAdapter) GetNetworkConfig(dev *models.Device) (*models.NetworkConfig, error) {
+	cli := a.getClient(dev)
+	_, _, _ = cli.GetSystemDateAndTime()
+	return cli.GetNetworkInterfaces()
 }
 
 func (a *ONVIFAdapter) ApplyNetworkConfig(dev *models.Device, cfg *models.NetworkConfig) error {
-	deviceServiceURL := fmt.Sprintf("http://%s:%d/onvif/device_service", dev.IP, dev.Port)
-	dhcpStr := "false"
-	if cfg.DHCP {
-		dhcpStr = "true"
-	}
-	body := fmt.Sprintf(`
-		<tds:SetNetworkInterfaces>
-			<tds:InterfaceToken>eth0</tds:InterfaceToken>
-			<tds:NetworkInterface>
-				<tt:IPv4>
-					<tt:Enabled>true</tt:Enabled>
-					<tt:Manual>
-						<tt:Address>%s</tt:Address>
-						<tt:PrefixLength>24</tt:PrefixLength>
-					</tt:Manual>
-					<tt:DHCP>%s</tt:DHCP>
-				</tt:IPv4>
-			</tds:NetworkInterface>
-		</tds:SetNetworkInterfaces>`, cfg.IPAddress, dhcpStr)
-
-	_, err := a.sendSOAP(deviceServiceURL, "http://www.onvif.org/ver10/device/wsdl/SetNetworkInterfaces", body, dev.Username, dev.Password)
-	return err
+	cli := a.getClient(dev)
+	_, _, _ = cli.GetSystemDateAndTime()
+	return cli.SetNetworkInterfaces(cfg)
 }
 
 func (a *ONVIFAdapter) GetImageConfig(dev *models.Device) (*models.ImageConfig, error) {
-	// Query image settings via ONVIF Imaging service or defaults
-	return &models.ImageConfig{
-		DeviceID:      dev.ID,
-		Brightness:    50,
-		Contrast:      50,
-		Saturation:    50,
-		Sharpness:     50,
-		WDRMode:       "auto",
-		WDRLevel:      50,
-		IRMode:        "auto",
-		BacklightComp: true,
-	}, nil
+	cli := a.getClient(dev)
+	_, _, _ = cli.GetSystemDateAndTime()
+	return cli.GetImagingSettings("")
 }
 
 func (a *ONVIFAdapter) ApplyImageConfig(dev *models.Device, cfg *models.ImageConfig) error {
-	return nil
+	cli := a.getClient(dev)
+	_, _, _ = cli.GetSystemDateAndTime()
+	return cli.SetImagingSettings("", cfg)
 }
 
 func (a *ONVIFAdapter) GetVideoEncodingConfig(dev *models.Device) ([]models.VideoEncodingConfig, error) {
-	return []models.VideoEncodingConfig{
-		{
+	cli := a.getClient(dev)
+	_, _, _ = cli.GetSystemDateAndTime()
+
+	profiles, err := cli.GetProfiles()
+	if err != nil || len(profiles) == 0 {
+		profiles = []string{"Profile_1", "Profile_2"}
+	}
+
+	var configs []models.VideoEncodingConfig
+	for i, prof := range profiles {
+		streamName := "MainStream"
+		res := "1920x1080"
+		fps := 25
+		kbps := 4096
+		if i > 0 {
+			streamName = "SubStream"
+			res = "704x576"
+			fps = 15
+			kbps = 1024
+		}
+
+		rtspURI, _ := cli.GetStreamUri(prof)
+		if rtspURI == "" {
+			rtspURI = fmt.Sprintf("rtsp://%s:554/live/ch%d", dev.IP, i)
+		}
+
+		configs = append(configs, models.VideoEncodingConfig{
 			DeviceID:    dev.ID,
-			StreamIndex: 0,
-			StreamName:  "MainStream",
+			StreamIndex: i,
+			StreamName:  streamName,
 			Codec:       "H.264",
-			Resolution:  "1920x1080",
-			FrameRate:   25,
-			BitrateKbps: 4096,
+			Resolution:  res,
+			FrameRate:   fps,
+			BitrateKbps: kbps,
 			RateControl: "CBR",
-			RTSPURL:     fmt.Sprintf("rtsp://%s:554/live/ch0", dev.IP),
-		},
-		{
-			DeviceID:    dev.ID,
-			StreamIndex: 1,
-			StreamName:  "SubStream",
-			Codec:       "H.264",
-			Resolution:  "704x576",
-			FrameRate:   15,
-			BitrateKbps: 1024,
-			RateControl: "VBR",
-			RTSPURL:     fmt.Sprintf("rtsp://%s:554/live/ch1", dev.IP),
-		},
-	}, nil
+			RTSPURL:     rtspURI,
+		})
+	}
+
+	return configs, nil
 }
 
 func (a *ONVIFAdapter) ApplyVideoEncodingConfig(dev *models.Device, cfgs []models.VideoEncodingConfig) error {
@@ -266,47 +198,47 @@ func (a *ONVIFAdapter) ApplyVideoEncodingConfig(dev *models.Device, cfgs []model
 }
 
 func (a *ONVIFAdapter) SendPTZ(dev *models.Device, action models.PTZAction) error {
-	ptzURL := fmt.Sprintf("http://%s:%d/onvif/ptz_service", dev.IP, dev.Port)
-	var body string
-	if action.Command == "STOP" {
-		body = `<tptz:Stop><tptz:ProfileToken>Profile_1</tptz:ProfileToken><tptz:PanTilt>true</tptz:PanTilt><tptz:Zoom>true</tptz:Zoom></tptz:Stop>`
-	} else if action.Command == "GOTO_PRESET" {
-		body = fmt.Sprintf(`<tptz:GotoPreset><tptz:ProfileToken>Profile_1</tptz:ProfileToken><tptz:PresetToken>%d</tptz:PresetToken></tptz:GotoPreset>`, action.PresetID)
-	} else {
-		// ContinuousMove
-		panSpeed := action.Pan * action.Speed
-		tiltSpeed := action.Tilt * action.Speed
-		zoomSpeed := action.Zoom * action.Speed
-		body = fmt.Sprintf(`
-			<tptz:ContinuousMove>
-				<tptz:ProfileToken>Profile_1</tptz:ProfileToken>
-				<tptz:Velocity>
-					<tt:PanTilt x="%f" y="%f" space="http://www.onvif.org/ver10/tptz/PanTiltSpaces/VelocityGenericSpace"/>
-					<tt:Zoom x="%f" space="http://www.onvif.org/ver10/tptz/ZoomSpaces/VelocityGenericSpace"/>
-				</tptz:Velocity>
-			</tptz:ContinuousMove>`, panSpeed, tiltSpeed, zoomSpeed)
-	}
-	_, err := a.sendSOAP(ptzURL, "http://www.onvif.org/ver20/ptz/wsdl/ContinuousMove", body, dev.Username, dev.Password)
-	return err
+	cli := a.getClient(dev)
+	_, _, _ = cli.GetSystemDateAndTime()
+	return cli.SendPTZ(action)
 }
 
 func (a *ONVIFAdapter) GetStreamURI(dev *models.Device, streamIndex int) (string, error) {
-	return fmt.Sprintf("rtsp://%s:554/live/ch%d", dev.IP, streamIndex), nil
+	cli := a.getClient(dev)
+	_, _, _ = cli.GetSystemDateAndTime()
+
+	profiles, err := cli.GetProfiles()
+	profToken := "Profile_1"
+	if err == nil && streamIndex < len(profiles) {
+		profToken = profiles[streamIndex]
+	}
+
+	return cli.GetStreamUri(profToken)
 }
 
 func (a *ONVIFAdapter) CaptureSnapshot(dev *models.Device) ([]byte, error) {
-	url := fmt.Sprintf("http://%s:%d/onvif/snapshot", dev.IP, dev.Port)
-	req, _ := http.NewRequest("GET", url, nil)
-	if dev.Username != "" {
-		req.SetBasicAuth(dev.Username, dev.Password)
+	cli := a.getClient(dev)
+	_, _, _ = cli.GetSystemDateAndTime()
+
+	snapURI, err := cli.GetSnapshotUri("Profile_1")
+	if err == nil && snapURI != "" {
+		req, err := http.NewRequest("GET", snapURI, nil)
+		if err == nil {
+			if dev.Username != "" {
+				req.SetBasicAuth(dev.Username, dev.Password)
+			}
+			resp, err := cli.HTTPClient.Do(req)
+			if err == nil && resp.StatusCode == http.StatusOK {
+				defer resp.Body.Close()
+				data, err := io.ReadAll(resp.Body)
+				if err == nil && len(data) > 0 {
+					return data, nil
+				}
+			}
+		}
 	}
-	resp, err := a.client.Do(req)
-	if err != nil {
-		// Return generated SVG placeholder frame if camera snapshot URI is offline
-		return generateTestFrame(dev.Name, dev.IP), nil
-	}
-	defer resp.Body.Close()
-	return io.ReadAll(resp.Body)
+
+	return generateTestFrame(dev.Name, dev.IP), nil
 }
 
 func (a *ONVIFAdapter) GetRecorderChannels(dev *models.Device) ([]models.RecorderChannel, error) {
@@ -327,32 +259,6 @@ func (a *ONVIFAdapter) GetRecorderChannels(dev *models.Device) ([]models.Recorde
 
 func (a *ONVIFAdapter) SetChannelAnalogMode(dev *models.Device, channelID int, signalFormat string) error {
 	return adapters.ErrUnsupportedOperation
-}
-
-func extractXMLTag(raw, tag string) string {
-	startTag := "<" + tag + ">"
-	endTag := "</" + tag + ">"
-	idx := strings.Index(raw, startTag)
-	if idx == -1 {
-		// Try case-insensitive search or with namespaces
-		startTag = ":" + tag + ">"
-		idx = strings.Index(raw, startTag)
-		if idx == -1 {
-			return ""
-		}
-		idx += len(startTag)
-		endIdx := strings.Index(raw[idx:], "<")
-		if endIdx == -1 {
-			return ""
-		}
-		return strings.TrimSpace(raw[idx : idx+endIdx])
-	}
-	idx += len(startTag)
-	endIdx := strings.Index(raw[idx:], endTag)
-	if endIdx == -1 {
-		return ""
-	}
-	return strings.TrimSpace(raw[idx : idx+endIdx])
 }
 
 func generateTestFrame(name, ip string) []byte {

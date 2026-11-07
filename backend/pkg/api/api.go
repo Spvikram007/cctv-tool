@@ -442,6 +442,111 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch sub {
+	case "auth":
+		if r.Method != "POST" {
+			writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
+			return
+		}
+		var authReq struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&authReq)
+		if authReq.Username != "" {
+			dev.Username = authReq.Username
+		}
+		if authReq.Password != "" {
+			dev.Password = authReq.Password
+		}
+		authStatus, err := adapter.Authenticate(&dev)
+		if err != nil {
+			s.logger.Log("Technician", dev.ID, dev.IP, "AUTHENTICATE_DEVICE", "AUTH", "FAILED", err.Error(), "")
+			writeJSON(w, http.StatusOK, authStatus)
+			return
+		}
+		dev.Status = "authenticated"
+		if authStatus.Firmware != "" {
+			dev.Firmware = authStatus.Firmware
+		}
+		if authStatus.Model != "" && dev.Model == "" {
+			dev.Model = authStatus.Model
+		}
+		s.store.UpsertDevice(dev)
+		s.logger.Log("Technician", dev.ID, dev.IP, "AUTHENTICATE_DEVICE", "AUTH", "SUCCESS", fmt.Sprintf("Authenticated via %s", authStatus.Protocol), "")
+		writeJSON(w, http.StatusOK, authStatus)
+		return
+
+	case "capabilities":
+		caps, err := adapter.GetCapabilities(&dev)
+		if err != nil {
+			writeSimpleError(w, r, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, caps)
+		return
+
+	case "config":
+		if len(parts) > 2 {
+			switch parts[2] {
+			case "preview":
+				var req struct {
+					Type   configengine.ConfigType `json:"type"`
+					Config json.RawMessage         `json:"config"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					writeSimpleError(w, r, http.StatusBadRequest, "Invalid preview request: "+err.Error())
+					return
+				}
+				preview, err := s.configEngine.GeneratePreview(deviceID, req.Type, req.Config)
+				if err != nil {
+					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
+					return
+				}
+				writeJSON(w, http.StatusOK, preview)
+				return
+
+			case "apply":
+				var req struct {
+					Type         configengine.ConfigType `json:"type"`
+					PreviewToken string                  `json:"preview_token"`
+					RollbackKey  string                  `json:"rollback_key"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					writeSimpleError(w, r, http.StatusBadRequest, "Invalid apply request: "+err.Error())
+					return
+				}
+				token := req.PreviewToken
+				if token == "" {
+					token = req.RollbackKey
+				}
+				res, err := s.configEngine.ApplyConfirmed(deviceID, req.Type, token, "Technician")
+				if err != nil {
+					writeSimpleError(w, r, http.StatusInternalServerError, err.Error())
+					return
+				}
+				writeJSON(w, http.StatusOK, res)
+				return
+
+			case "rollback":
+				var req struct {
+					RollbackKey string `json:"rollback_key"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					writeSimpleError(w, r, http.StatusBadRequest, "Invalid rollback request")
+					return
+				}
+				res, err := s.configEngine.Rollback(deviceID, req.RollbackKey, "Technician")
+				if err != nil {
+					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
+					return
+				}
+				writeJSON(w, http.StatusOK, res)
+				return
+			}
+		}
+		writeSimpleError(w, r, http.StatusNotFound, "Unknown config action")
+		return
+
 	case "network":
 		if len(parts) > 2 && parts[2] == "preview" {
 			var body json.RawMessage
@@ -456,12 +561,17 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 		}
 		if len(parts) > 2 && parts[2] == "apply" {
 			var req struct {
-				RollbackKey string               `json:"rollback_key"`
-				Config      models.NetworkConfig `json:"config"`
+				PreviewToken string               `json:"preview_token"`
+				RollbackKey  string               `json:"rollback_key"`
+				Config       models.NetworkConfig `json:"config"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&req)
+			token := req.PreviewToken
+			if token == "" {
+				token = req.RollbackKey
+			}
 			s.store.SetNetworkConfig(req.Config)
-			res, err := s.configEngine.ApplyConfirmed(deviceID, configengine.ConfigTypeNetwork, req.RollbackKey, "Technician")
+			res, err := s.configEngine.ApplyConfirmed(deviceID, configengine.ConfigTypeNetwork, token, "Technician")
 			if err != nil {
 				writeSimpleError(w, r, http.StatusInternalServerError, err.Error())
 				return
@@ -490,12 +600,17 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 		}
 		if len(parts) > 2 && parts[2] == "apply" {
 			var req struct {
-				RollbackKey string             `json:"rollback_key"`
-				Config      models.ImageConfig `json:"config"`
+				PreviewToken string             `json:"preview_token"`
+				RollbackKey  string             `json:"rollback_key"`
+				Config       models.ImageConfig `json:"config"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&req)
+			token := req.PreviewToken
+			if token == "" {
+				token = req.RollbackKey
+			}
 			s.store.SetImageConfig(req.Config)
-			res, err := s.configEngine.ApplyConfirmed(deviceID, configengine.ConfigTypeImage, req.RollbackKey, "Technician")
+			res, err := s.configEngine.ApplyConfirmed(deviceID, configengine.ConfigTypeImage, token, "Technician")
 			if err != nil {
 				writeSimpleError(w, r, http.StatusInternalServerError, err.Error())
 				return

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 )
 
 type MultiDeviceSimulator struct {
@@ -169,6 +170,49 @@ func (s *MultiDeviceSimulator) Start() error {
 		body, _ := io.ReadAll(r.Body)
 		bodyStr := string(body)
 		w.Header().Set("Content-Type", "application/soap+xml; charset=utf-8")
+
+		if strings.Contains(bodyStr, "GetSystemDateAndTime") {
+			now := time.Now().UTC()
+			fmt.Fprintf(w, `<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" xmlns:tds="http://www.onvif.org/ver10/device/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema">
+	<soap:Body>
+		<tds:GetSystemDateAndTimeResponse>
+			<tds:SystemDateAndTime>
+				<tt:DateTimeType>NTP</tt:DateTimeType>
+				<tt:DaylightSavings>false</tt:DaylightSavings>
+				<tt:UTCDateTime>
+					<tt:Time><tt:Hour>%02d</tt:Hour><tt:Minute>%02d</tt:Minute><tt:Second>%02d</tt:Second></tt:Time>
+					<tt:Date><tt:Year>%d</tt:Year><tt:Month>%02d</tt:Month><tt:Day>%02d</tt:Day></tt:Date>
+				</tt:UTCDateTime>
+			</tds:SystemDateAndTime>
+		</tds:GetSystemDateAndTimeResponse>
+	</soap:Body>
+</soap:Envelope>`, now.Hour(), now.Minute(), now.Second(), now.Year(), int(now.Month()), now.Day())
+			return
+		}
+
+		if strings.Contains(bodyStr, "GetCapabilities") {
+			fmt.Fprintf(w, `<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" xmlns:tds="http://www.onvif.org/ver10/device/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema">
+	<soap:Body>
+		<tds:GetCapabilitiesResponse>
+			<tds:Capabilities>
+				<tt:Device>
+					<tt:XAddr>http://127.0.0.1:18083/onvif/device_service</tt:XAddr>
+				</tt:Device>
+				<tt:Media>
+					<tt:XAddr>http://127.0.0.1:18083/onvif/media_service</tt:XAddr>
+				</tt:Media>
+				<tt:PTZ>
+					<tt:XAddr>http://127.0.0.1:18083/onvif/ptz_service</tt:XAddr>
+				</tt:PTZ>
+			</tds:Capabilities>
+		</tds:GetCapabilitiesResponse>
+	</soap:Body>
+</soap:Envelope>`)
+			return
+		}
+
 		if strings.Contains(bodyStr, "GetDeviceInformation") {
 			fmt.Fprintf(w, `<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" xmlns:tds="http://www.onvif.org/ver10/device/wsdl">
@@ -202,6 +246,45 @@ func (s *MultiDeviceSimulator) Start() error {
 </soap:Envelope>`)
 			return
 		}
+		fmt.Fprintf(w, `<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"><soap:Body><Response>OK</Response></soap:Body></soap:Envelope>`)
+	})
+
+	onvifMux.HandleFunc("/onvif/media_service", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		bodyStr := string(body)
+		w.Header().Set("Content-Type", "application/soap+xml; charset=utf-8")
+
+		if strings.Contains(bodyStr, "GetProfiles") {
+			fmt.Fprintf(w, `<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" xmlns:trt="http://www.onvif.org/ver10/media/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema">
+	<soap:Body>
+		<trt:GetProfilesResponse>
+			<trt:Profiles token="Profile_1" fixed="true">
+				<tt:Name>MainStream</tt:Name>
+			</trt:Profiles>
+			<trt:Profiles token="Profile_2" fixed="true">
+				<tt:Name>SubStream</tt:Name>
+			</trt:Profiles>
+		</trt:GetProfilesResponse>
+	</soap:Body>
+</soap:Envelope>`)
+			return
+		}
+
+		if strings.Contains(bodyStr, "GetStreamUri") {
+			fmt.Fprintf(w, `<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" xmlns:trt="http://www.onvif.org/ver10/media/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema">
+	<soap:Body>
+		<trt:GetStreamUriResponse>
+			<trt:MediaUri>
+				<tt:Uri>rtsp://127.0.0.1:18554/live/ch0</tt:Uri>
+			</trt:MediaUri>
+		</trt:GetStreamUriResponse>
+	</soap:Body>
+</soap:Envelope>`)
+			return
+		}
+
 		fmt.Fprintf(w, `<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"><soap:Body><Response>OK</Response></soap:Body></soap:Envelope>`)
 	})
 

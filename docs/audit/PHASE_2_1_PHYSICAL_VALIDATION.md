@@ -197,3 +197,4 @@ ok      cctv-sentinel/pkg/security      0.632s
 | **Dahua IP Cameras (`DH-IPC-HFW1230`, `DH-IPC-HDW1230`, `DH-P3B-PV`, `DH-IPC-HFW1249`)** | Physical Network Live Probe | **CERTIFIED PHYSICAL BENCH** |
 | **CP PLUS Camera & NVR (`CP-UNC-TA21PL3`, `CP-UNR-4K4162`)** | Physical Network Live Probe | **CERTIFIED PHYSICAL BENCH** |
 | **Third-Party PTZ Camera (`H43`)** | Physical Network Live Probe | **CERTIFIED PHYSICAL BENCH** |
+

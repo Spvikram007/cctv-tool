@@ -10,17 +10,14 @@ import (
 	"time"
 
 	"cctv-sentinel/pkg/adapters"
+	"cctv-sentinel/pkg/adapters/httpauth"
 	"cctv-sentinel/pkg/models"
 )
 
-type DahuaAdapter struct {
-	client *http.Client
-}
+type DahuaAdapter struct{}
 
 func NewDahuaAdapter() *DahuaAdapter {
-	return &DahuaAdapter{
-		client: &http.Client{Timeout: 5 * time.Second},
-	}
+	return &DahuaAdapter{}
 }
 
 func (d *DahuaAdapter) Name() string {
@@ -31,19 +28,21 @@ func (d *DahuaAdapter) Vendor() models.Manufacturer {
 	return models.VendorDahua
 }
 
+func (d *DahuaAdapter) getClient(username, password string) *http.Client {
+	return httpauth.NewClient(username, password, 6*time.Second, true)
+}
+
 func (d *DahuaAdapter) doRequest(endpoint string, targetIP string, port int, username, password string) (string, error) {
 	reqURL := fmt.Sprintf("http://%s:%d%s", targetIP, port, endpoint)
 	req, err := http.NewRequest("GET", reqURL, nil)
 	if err != nil {
 		return "", err
 	}
-	if username != "" {
-		req.SetBasicAuth(username, password)
-	}
 
-	resp, err := d.client.Do(req)
+	client := d.getClient(username, password)
+	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: %v", adapters.ErrDeviceUnreachable, err)
 	}
 	defer resp.Body.Close()
 
@@ -96,6 +95,9 @@ func (d *DahuaAdapter) Detect(targetIP string, port int, username, password stri
 	if strings.Contains(strings.ToLower(devType), "xvr") || strings.Contains(strings.ToLower(devType), "dvr") {
 		cat = models.CategoryXVR
 		chans = 8
+	} else if strings.Contains(strings.ToLower(devType), "nvr") {
+		cat = models.CategoryNVR
+		chans = 16
 	}
 
 	return &models.Device{
@@ -117,6 +119,66 @@ func (d *DahuaAdapter) Detect(targetIP string, port int, username, password stri
 		Username:     username,
 		Password:     password,
 		LastSeen:     time.Now().UTC(),
+	}, nil
+}
+
+func (d *DahuaAdapter) Authenticate(dev *models.Device) (*models.AuthStatus, error) {
+	resp, err := d.doRequest("/cgi-bin/magicBox.cgi?action=getSystemInfo", dev.IP, dev.Port, dev.Username, dev.Password)
+	if err != nil {
+		return &models.AuthStatus{
+			DeviceID:      dev.ID,
+			Authenticated: false,
+			Username:      dev.Username,
+			Protocol:      "DAHUA_CGI",
+			AuthMethod:    "HTTP Digest (RFC 2617)",
+			LastChecked:   time.Now().UTC(),
+			ErrorMessage:  err.Error(),
+		}, err
+	}
+
+	kv := parseCGIResponse(resp)
+	devType := kv["deviceType"]
+	version := kv["appVersion"]
+
+	return &models.AuthStatus{
+		DeviceID:      dev.ID,
+		Authenticated: true,
+		Username:      dev.Username,
+		Protocol:      "DAHUA_CGI",
+		AuthMethod:    "HTTP Digest (RFC 2617)",
+		ClockSkewSec:  0,
+		Firmware:      version,
+		Model:         devType,
+		LastChecked:   time.Now().UTC(),
+	}, nil
+}
+
+func (d *DahuaAdapter) GetCapabilities(dev *models.Device) (*models.DeviceCapabilities, error) {
+	analogStatus := models.CapabilityUnsupported
+	if dev.Category == models.CategoryDVR || dev.Category == models.CategoryXVR || dev.Category == models.CategoryHybridRecorder {
+		analogStatus = models.CapabilitySupported
+	}
+
+	ptzStatus := models.CapabilityUnsupported
+	if dev.Category == models.CategoryPTZCamera || strings.Contains(strings.ToLower(dev.Model), "ptz") {
+		ptzStatus = models.CapabilitySupported
+	}
+
+	return &models.DeviceCapabilities{
+		DeviceID:         dev.ID,
+		DeviceManagement: models.CapabilitySupported,
+		Media:            models.CapabilitySupported,
+		Media2:           models.CapabilityUnsupported,
+		PTZ:              ptzStatus,
+		Imaging:          models.CapabilitySupported,
+		Events:           models.CapabilitySupported,
+		Recording:        models.CapabilitySupported,
+		AnalogFormat:     analogStatus,
+		Profiles:         []string{"Channel 1 Main", "Channel 1 Sub"},
+		Details: map[string]string{
+			"cgi_interface": "Dahua RPC2.0 / CGI",
+			"vendor":        "Zhejiang Dahua Technology",
+		},
 	}, nil
 }
 
@@ -177,6 +239,13 @@ func (d *DahuaAdapter) GetImageConfig(dev *models.Device) (*models.ImageConfig, 
 	c, _ := strconv.Atoi(kv["table.VideoColor[0][0].Contrast"])
 	s, _ := strconv.Atoi(kv["table.VideoColor[0][0].Saturation"])
 	sh, _ := strconv.Atoi(kv["table.VideoColor[0][0].Sharpness"])
+
+	if b == 0 && c == 0 {
+		b = 50
+		c = 50
+		s = 50
+		sh = 50
+	}
 
 	return &models.ImageConfig{
 		DeviceID:      dev.ID,
@@ -260,12 +329,14 @@ func (d *DahuaAdapter) GetStreamURI(dev *models.Device, streamIndex int) (string
 func (d *DahuaAdapter) CaptureSnapshot(dev *models.Device) ([]byte, error) {
 	endpoint := "/cgi-bin/snapshot.cgi?channel=1"
 	reqURL := fmt.Sprintf("http://%s:%d%s", dev.IP, dev.Port, endpoint)
-	req, _ := http.NewRequest("GET", reqURL, nil)
-	if dev.Username != "" {
-		req.SetBasicAuth(dev.Username, dev.Password)
-	}
-	resp, err := d.client.Do(req)
+	client := d.getClient(dev.Username, dev.Password)
+	req, err := http.NewRequest("GET", reqURL, nil)
 	if err != nil {
+		return generateDahuaFrame(dev.Model, dev.IP), nil
+	}
+
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
 		return generateDahuaFrame(dev.Model, dev.IP), nil
 	}
 	defer resp.Body.Close()
