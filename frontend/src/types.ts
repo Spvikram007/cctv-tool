@@ -1,8 +1,79 @@
-export type DeviceCategory = 'IP_CAMERA' | 'ANALOG_CAMERA' | 'DVR' | 'NVR' | 'XVR' | 'HVR' | 'PTZ_CAMERA';
+export type DeviceCategory = 'IP_CAMERA' | 'ANALOG_CAMERA' | 'DVR' | 'NVR' | 'XVR' | 'HVR' | 'HYBRID_RECORDER' | 'PTZ_CAMERA' | 'ENCODER' | 'NETWORK_VIDEO_SERVER' | 'UNKNOWN';
 
 export type Manufacturer = 'Hikvision' | 'Dahua' | 'CP PLUS' | 'Uniview' | 'Axis' | 'Hanwha' | 'Generic ONVIF' | 'OEM Rebranded';
 
 export type ProtocolType = 'ONVIF' | 'RTSP' | 'ISAPI' | 'DAHUA_CGI' | 'AXIS_VAPIX' | 'HTTP' | 'HTTPS';
+
+export interface NetworkInterface {
+  index: number;
+  name: string;
+  hardware_addr: string;
+  ipv4_addresses: string[];
+  ipv6_addresses: string[];
+  subnets: string[];
+  is_up: boolean;
+  is_loopback: boolean;
+  supports_multicast: boolean;
+}
+
+export interface EvidenceItem {
+  category: string;
+  description: string;
+  weight: number;
+  value: string;
+}
+
+export interface DeviceServices {
+  open_ports: number[];
+  http_server?: string;
+  http_auth_header?: string;
+  rtsp_server?: string;
+  rtsp_public_opts?: string;
+  ssl_cert_issuer?: string;
+  ssl_cert_subject?: string;
+  onvif_service_url?: string;
+}
+
+export interface FingerprintResult {
+  ip: string;
+  mac: string;
+  identified_manufacturer: Manufacturer;
+  probable_manufacturer: string;
+  model: string;
+  firmware: string;
+  serial_number: string;
+  category: DeviceCategory;
+  confidence: number;
+  confidence_level: 'HIGH' | 'MEDIUM' | 'LOW';
+  evidence_sources: EvidenceItem[];
+  unknown_fields: string[];
+  services: DeviceServices;
+  protocols: ProtocolType[];
+  capabilities: string[];
+  channel_count: number;
+  discovered_via: string;
+}
+
+export interface DiscoveredDevice {
+  device: Device;
+  fingerprint: FingerprintResult;
+}
+
+export interface DiscoveryJob {
+  id: string;
+  method: string;
+  status: 'RUNNING' | 'COMPLETED' | 'CANCELLED' | 'FAILED';
+  interface?: string;
+  cidr?: string;
+  progress_percent: number;
+  scanned_targets: number;
+  total_targets: number;
+  found_count: number;
+  results: DiscoveredDevice[];
+  created_at: string;
+  completed_at?: string;
+  error?: string;
+}
 
 export interface Device {
   id: string;

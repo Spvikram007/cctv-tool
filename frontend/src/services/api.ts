@@ -2,7 +2,8 @@ import {
   Device, NetworkConfig, ImageConfig, VideoEncodingConfig,
   RecorderChannel, DiagnosticsReport, SubnetCalc, HDDCalc,
   BandwidthCalc, License, AuditLogEntry, ConfigPreview,
-  CompatibilityEntry, BatchJob
+  CompatibilityEntry, BatchJob, NetworkInterface, DiscoveryJob,
+  DiscoveredDevice
 } from '../types';
 
 const BASE_URL = 'http://127.0.0.1:8080/api/v1';
@@ -38,9 +39,26 @@ export const api = {
   deleteDevice: (id: string) => request<any>(`/devices/${id}`, { method: 'DELETE' }),
 
   // Discovery
-  startDiscovery: (cidr: string, username?: string, password?: string) =>
-    request<any>('/devices/discover', { method: 'POST', body: JSON.stringify({ cidr, username, password }) }),
+  getInterfaces: () => request<NetworkInterface[]>('/discovery/interfaces'),
+  startDiscovery: (opts: {
+    method?: string;
+    interface?: string;
+    cidr?: string;
+    ports?: number[];
+    timeout_ms?: number;
+    concurrency?: number;
+    username?: string;
+    password?: string;
+  }) => request<any>('/devices/discover', { method: 'POST', body: JSON.stringify(opts) }),
+  getDiscoveryJob: (id: string) => request<DiscoveryJob>(`/discovery/${id}`),
+  getDiscoveryResults: (id: string) =>
+    request<{ job_id: string; status: string; found_count: number; results: DiscoveredDevice[] }>(`/discovery/${id}/results`),
+  cancelDiscovery: (id: string) => request<any>(`/discovery/${id}/cancel`, { method: 'POST' }),
   getDiscoveryProgress: () => request<any>('/devices/discover/progress'),
+
+  // Device Identity & Services
+  getDeviceIdentity: (id: string) => request<any>(`/devices/${id}/identity`),
+  getDeviceServices: (id: string) => request<any>(`/devices/${id}/services`),
 
   // Device Configs
   getNetworkConfig: (id: string) => request<NetworkConfig>(`/devices/${id}/network`),

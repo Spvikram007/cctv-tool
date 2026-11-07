@@ -171,3 +171,4 @@ func (v *Vault) Decrypt(encryptedVal string) (string, error) {
 
 	return string(plaintext), nil
 }
+

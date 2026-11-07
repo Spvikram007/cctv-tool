@@ -143,3 +143,88 @@ func TestStructuredErrorHandling(t *testing.T) {
 		t.Errorf("internal runtime details leaked in error response: %s", bodyStr)
 	}
 }
+
+func TestDiscoveryEndpoints(t *testing.T) {
+	server, handler := setupTestServer(t)
+
+	// 1. Test GET /api/v1/discovery/interfaces
+	reqIf := httptest.NewRequest("GET", "/api/v1/discovery/interfaces", nil)
+	recIf := httptest.NewRecorder()
+	handler.ServeHTTP(recIf, reqIf)
+	if recIf.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /discovery/interfaces, got %d", recIf.Code)
+	}
+
+	// 2. Test POST /api/v1/devices/discover
+	body := strings.NewReader(`{"method":"TCP","cidr":"127.0.0.1/32","timeout_ms":50,"concurrency":4}`)
+	reqDisc := httptest.NewRequest("POST", "/api/v1/devices/discover", body)
+	recDisc := httptest.NewRecorder()
+	handler.ServeHTTP(recDisc, reqDisc)
+
+	if recDisc.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted from /devices/discover, got %d: %s", recDisc.Code, recDisc.Body.String())
+	}
+
+	var discResp map[string]interface{}
+	if err := json.Unmarshal(recDisc.Body.Bytes(), &discResp); err != nil {
+		t.Fatalf("failed to decode discover response: %v", err)
+	}
+	jobID, ok := discResp["job_id"].(string)
+	if !ok || jobID == "" {
+		t.Fatalf("missing or invalid job_id in response: %v", discResp)
+	}
+
+	// 3. Test GET /api/v1/discovery/{id}
+	reqJob := httptest.NewRequest("GET", "/api/v1/discovery/"+jobID, nil)
+	recJob := httptest.NewRecorder()
+	handler.ServeHTTP(recJob, reqJob)
+	if recJob.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /discovery/%s, got %d", jobID, recJob.Code)
+	}
+
+	// 4. Test GET /api/v1/discovery/{id}/results
+	reqRes := httptest.NewRequest("GET", "/api/v1/discovery/"+jobID+"/results", nil)
+	recRes := httptest.NewRecorder()
+	handler.ServeHTTP(recRes, reqRes)
+	if recRes.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /discovery/%s/results, got %d", jobID, recRes.Code)
+	}
+
+	// 5. Test POST /api/v1/discovery/{id}/cancel
+	reqCancel := httptest.NewRequest("POST", "/api/v1/discovery/"+jobID+"/cancel", nil)
+	recCancel := httptest.NewRecorder()
+	handler.ServeHTTP(recCancel, reqCancel)
+	if recCancel.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /discovery/%s/cancel, got %d", jobID, recCancel.Code)
+	}
+
+	// 6. Test GET /api/v1/devices/{id}/identity and /services on an enrolled device
+	devList := server.store.ListDevices()
+	if len(devList) > 0 {
+		testDev := devList[0]
+
+		// Identity endpoint
+		reqIden := httptest.NewRequest("GET", "/api/v1/devices/"+testDev.ID+"/identity", nil)
+		recIden := httptest.NewRecorder()
+		handler.ServeHTTP(recIden, reqIden)
+		if recIden.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK from /devices/%s/identity, got %d", testDev.ID, recIden.Code)
+		}
+
+		var idenResp map[string]interface{}
+		_ = json.Unmarshal(recIden.Body.Bytes(), &idenResp)
+		if idenResp["confidence"] == nil {
+			t.Errorf("expected confidence score in identity response")
+		}
+
+		// Services endpoint
+		reqSvc := httptest.NewRequest("GET", "/api/v1/devices/"+testDev.ID+"/services", nil)
+		recSvc := httptest.NewRecorder()
+		handler.ServeHTTP(recSvc, reqSvc)
+		if recSvc.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK from /devices/%s/services, got %d", testDev.ID, recSvc.Code)
+		}
+	}
+}
+
+

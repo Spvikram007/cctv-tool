@@ -130,3 +130,4 @@ func TestVaultKeyPersistence(t *testing.T) {
 		t.Errorf("expected decrypted secret %q, got %q", secret, dec)
 	}
 }
+

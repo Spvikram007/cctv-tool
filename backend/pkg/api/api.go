@@ -202,40 +202,13 @@ func (s *Server) registerRoutes() {
 	})
 
 	// 3. Network Discovery
-	s.mux.HandleFunc("/api/v1/devices/discover", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" {
-			writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
-			return
-		}
-		var req struct {
-			CIDR     string `json:"cidr"`
-			Username string `json:"username"`
-			Password string `json:"password"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		if req.CIDR == "" {
-			req.CIDR = "127.0.0.1/32" // default safe loopback scan
-		}
-
-		go func() {
-			found, err := s.discoveryEng.ScanSubnet(context.Background(), req.CIDR, req.Username, req.Password)
-			if err == nil {
-				for _, d := range found {
-					s.store.UpsertDevice(d)
-				}
-			}
-		}()
-
-		writeJSON(w, http.StatusAccepted, map[string]interface{}{
-			"message": "Subnet discovery scan started",
-			"cidr":    req.CIDR,
-		})
-	})
-
+	s.mux.HandleFunc("/api/v1/devices/discover", s.handleStartDiscovery)
 	s.mux.HandleFunc("/api/v1/devices/discover/progress", func(w http.ResponseWriter, r *http.Request) {
 		prog := s.discoveryEng.GetProgress()
 		writeJSON(w, http.StatusOK, prog)
 	})
+	s.mux.HandleFunc("/api/v1/discovery/interfaces", s.handleDiscoveryInterfaces)
+	s.mux.HandleFunc("/api/v1/discovery/", s.handleDiscoverySubroutes)
 
 	// 4. Device specific routes dispatcher: /api/v1/devices/
 	s.mux.HandleFunc("/api/v1/devices/", s.handleDeviceSubroutes)
@@ -441,12 +414,6 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	adapter, err := s.registry.ResolveForDevice(&dev)
-	if err != nil {
-		writeSimpleError(w, r, http.StatusBadGateway, err.Error())
-		return
-	}
-
 	// Route: GET /api/v1/devices/:id
 	if len(parts) == 1 {
 		if r.Method == "DELETE" {
@@ -460,6 +427,20 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sub := parts[1]
+	if sub == "identity" {
+		s.handleDeviceIdentity(w, r, &dev)
+		return
+	}
+	if sub == "services" {
+		s.handleDeviceServices(w, r, &dev)
+		return
+	}
+
+	adapter, err := s.registry.ResolveForDevice(&dev)
+	if err != nil {
+		writeSimpleError(w, r, http.StatusBadGateway, err.Error())
+		return
+	}
 	switch sub {
 	case "network":
 		if len(parts) > 2 && parts[2] == "preview" {
@@ -582,4 +563,234 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeSimpleError(w, r, http.StatusNotFound, "Unknown device subresource")
 	}
+}
+
+func (s *Server) handleStartDiscovery(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	var req struct {
+		Method      string `json:"method"`
+		Interface   string `json:"interface"`
+		CIDR        string `json:"cidr"`
+		Ports       []int  `json:"ports"`
+		TimeoutMs   int    `json:"timeout_ms"`
+		Concurrency int    `json:"concurrency"`
+		Username    string `json:"username"`
+		Password    string `json:"password"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	opts := discovery.DiscoveryOptions{
+		Method:      req.Method,
+		Interface:   req.Interface,
+		CIDR:        req.CIDR,
+		Ports:       req.Ports,
+		TimeoutMs:   req.TimeoutMs,
+		Concurrency: req.Concurrency,
+		Username:    req.Username,
+		Password:    req.Password,
+	}
+
+	job, err := s.discoveryEng.StartDiscovery(context.Background(), opts)
+	if err != nil {
+		writeSimpleError(w, r, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// In the background, ensure discovered devices are safely registered into the inventory store
+	// while strictly preserving authenticated credentials and verified fields
+	go func(jobID string) {
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		for range ticker.C {
+			j, ok := s.discoveryEng.JobManager.GetJob(jobID)
+			if !ok {
+				return
+			}
+			for _, res := range j.Results {
+				existing, exists := s.store.GetDevice(res.Device.ID)
+				devToSave := res.Device
+				if exists {
+					// PRESERVATION RULE: Never overwrite authenticated credentials or verified fields
+					if devToSave.Username == "" && existing.Username != "" {
+						devToSave.Username = existing.Username
+						devToSave.Password = existing.Password
+					}
+					if existing.SerialNumber != "" && devToSave.SerialNumber == "" {
+						devToSave.SerialNumber = existing.SerialNumber
+					}
+					if existing.Firmware != "" && devToSave.Firmware == "" {
+						devToSave.Firmware = existing.Firmware
+					}
+				}
+				s.store.UpsertDevice(devToSave)
+			}
+			if j.Status == discovery.JobStatusCompleted || j.Status == discovery.JobStatusCancelled || j.Status == discovery.JobStatusFailed {
+				return
+			}
+		}
+	}(job.ID)
+
+	writeJSON(w, http.StatusAccepted, map[string]interface{}{
+		"message":    "Discovery job started",
+		"job_id":     job.ID,
+		"status":     job.Status,
+		"method":     job.Method,
+		"created_at": job.CreatedAt,
+	})
+}
+
+func (s *Server) handleDiscoveryInterfaces(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	ifaces, err := discovery.GetAvailableInterfaces()
+	if err != nil {
+		writeSimpleError(w, r, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, ifaces)
+}
+
+func (s *Server) handleDiscoverySubroutes(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/api/v1/discovery/")
+	parts := strings.Split(path, "/")
+	if len(parts) == 0 || parts[0] == "" {
+		writeSimpleError(w, r, http.StatusNotFound, "Discovery job ID required")
+		return
+	}
+
+	jobID := parts[0]
+	job, ok := s.discoveryEng.JobManager.GetJob(jobID)
+	if !ok {
+		writeSimpleError(w, r, http.StatusNotFound, "Discovery job not found")
+		return
+	}
+
+	if len(parts) == 1 {
+		if r.Method != "GET" {
+			writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
+			return
+		}
+		writeJSON(w, http.StatusOK, job)
+		return
+	}
+
+	sub := parts[1]
+	switch sub {
+	case "results":
+		if r.Method != "GET" {
+			writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"job_id":      job.ID,
+			"status":      job.Status,
+			"found_count": job.FoundCount,
+			"results":     job.Results,
+		})
+	case "cancel":
+		if r.Method != "POST" {
+			writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
+			return
+		}
+		success := s.discoveryEng.JobManager.CancelJob(jobID)
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success": success,
+			"job_id":  jobID,
+			"status":  "CANCELLED",
+		})
+	default:
+		writeSimpleError(w, r, http.StatusNotFound, "Unknown discovery subresource")
+	}
+}
+
+func (s *Server) handleDeviceIdentity(w http.ResponseWriter, r *http.Request, dev *models.Device) {
+	if r.Method != "GET" {
+		writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	mac := dev.MAC
+	if mac == "" {
+		mac = discovery.LookupSystemARP(dev.IP)
+	}
+	openPorts := []int{dev.Port}
+	if dev.RTSPPort > 0 && dev.RTSPPort != dev.Port {
+		openPorts = append(openPorts, dev.RTSPPort)
+	}
+	services := discovery.DeviceServices{
+		OpenPorts: openPorts,
+	}
+	fp := discovery.AnalyzeFingerprint(dev.IP, mac, openPorts, nil, services, "INVENTORY")
+	if dev.Model != "" && dev.Model != "Standard Streamer" {
+		fp.Model = dev.Model
+	}
+	if dev.Manufacturer != "" && dev.Manufacturer != models.VendorGeneric {
+		fp.IdentifiedManufacturer = dev.Manufacturer
+		fp.ProbableManufacturer = string(dev.Manufacturer)
+		fp.Confidence = 95
+		fp.ConfidenceLevel = "HIGH"
+	}
+	if dev.Firmware != "" {
+		fp.Firmware = dev.Firmware
+	}
+	if dev.SerialNumber != "" {
+		fp.SerialNumber = dev.SerialNumber
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"device_id":             dev.ID,
+		"name":                  dev.Name,
+		"ip":                    dev.IP,
+		"mac":                   mac,
+		"manufacturer":          dev.Manufacturer,
+		"probable_manufacturer": fp.ProbableManufacturer,
+		"model":                 fp.Model,
+		"firmware":              dev.Firmware,
+		"serial_number":         dev.SerialNumber,
+		"category":              dev.Category,
+		"confidence":            fp.Confidence,
+		"confidence_level":      fp.ConfidenceLevel,
+		"evidence_sources":      fp.EvidenceSources,
+		"unknown_fields":        fp.UnknownFields,
+	})
+}
+
+func (s *Server) handleDeviceServices(w http.ResponseWriter, r *http.Request, dev *models.Device) {
+	if r.Method != "GET" {
+		writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	openPorts := []int{dev.Port}
+	if dev.RTSPPort > 0 && dev.RTSPPort != dev.Port {
+		openPorts = append(openPorts, dev.RTSPPort)
+	}
+	if dev.ONVIFPort > 0 && dev.ONVIFPort != dev.Port {
+		openPorts = append(openPorts, dev.ONVIFPort)
+	}
+
+	var rtspBanner, rtspOpts string
+	if dev.RTSPPort > 0 {
+		rtspBanner, rtspOpts, _ = discovery.ProbeRTSPServer(r.Context(), dev.IP, dev.RTSPPort)
+	}
+
+	srvHeader, authHeader, _ := s.discoveryEng.Fingerprinter.ProbeHTTPServer(r.Context(), dev.IP, dev.Port)
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"device_id":        dev.ID,
+		"ip":               dev.IP,
+		"open_ports":       openPorts,
+		"http_server":      srvHeader,
+		"http_auth_header": authHeader,
+		"rtsp_server":      rtspBanner,
+		"rtsp_public_opts": rtspOpts,
+		"protocols":        dev.Protocols,
+		"capabilities":     dev.Capabilities,
+	})
 }

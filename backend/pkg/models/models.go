@@ -6,13 +6,17 @@ import "time"
 type DeviceCategory string
 
 const (
-	CategoryIPCamera     DeviceCategory = "IP_CAMERA"
-	CategoryAnalogCamera DeviceCategory = "ANALOG_CAMERA"
-	CategoryDVR          DeviceCategory = "DVR"
-	CategoryNVR          DeviceCategory = "NVR"
-	CategoryXVR          DeviceCategory = "XVR"
-	CategoryHVR          DeviceCategory = "HVR"
-	CategoryPTZCamera    DeviceCategory = "PTZ_CAMERA"
+	CategoryIPCamera           DeviceCategory = "IP_CAMERA"
+	CategoryAnalogCamera       DeviceCategory = "ANALOG_CAMERA"
+	CategoryDVR                DeviceCategory = "DVR"
+	CategoryNVR                DeviceCategory = "NVR"
+	CategoryXVR                DeviceCategory = "XVR"
+	CategoryHVR                DeviceCategory = "HVR"
+	CategoryHybridRecorder     DeviceCategory = "HYBRID_RECORDER"
+	CategoryPTZCamera          DeviceCategory = "PTZ_CAMERA"
+	CategoryEncoder            DeviceCategory = "ENCODER"
+	CategoryNetworkVideoServer DeviceCategory = "NETWORK_VIDEO_SERVER"
+	CategoryUnknown            DeviceCategory = "UNKNOWN"
 )
 
 // Manufacturer represents detected or manual manufacturer
