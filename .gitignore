@@ -16,3 +16,7 @@ tmp/
 .tools/
 sentinel-server.exe~
 sentinel_store.json
+
+.tools/
+*.zip
+sentinel_store.json
