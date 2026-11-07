@@ -8,7 +8,9 @@ import {
   CapacityBandwidthCalculation, BatchAction, BatchPreview,
   FirmwarePackage, UpdateEligibility, FirmwareUpdatePreview,
   FirmwareUpdateJob, UserAccount, Session, AuditChainVerification,
-  VaultStatus
+  VaultStatus, RecorderProfile, RecorderChannelInfo, AnalogFormatResult,
+  IPRegistrationReq, RecordingSchedule, RecordingSegment, PlaybackSession,
+  StorageHealthReport, DiskFormatPreview
 } from '../types';
 
 const BASE_URL = 'http://127.0.0.1:8080/api/v1';
@@ -194,4 +196,59 @@ export const api = {
     request<UserAccount>('/security/users', { method: 'POST', body: JSON.stringify(user) }),
   getVaultStatus: () => request<VaultStatus>('/security/vault'),
   verifyAuditChain: () => request<AuditChainVerification>('/audit/verify'),
+
+  // DVR / NVR / XVR Channel, Recording & Playback (Phase 6)
+  getRecorders: () => request<Device[]>('/recorders'),
+  getRecorderProfile: (id: string) => request<RecorderProfile>(`/recorders/${id}/profile`),
+  getRecorderChannels: (id: string) => request<RecorderChannelInfo[]>(`/recorders/${id}/channels`),
+  setRecorderAnalogFormat: (id: string, channelId: number, format: string) =>
+    request<AnalogFormatResult>(`/recorders/${id}/analog-format`, {
+      method: 'POST',
+      body: JSON.stringify({ channel_id: channelId, format })
+    }),
+  sendRecorderCoaxialControl: (id: string, channelId: number, command: string) =>
+    request<{ channel_id: number; command: string; success: boolean; message: string }>(`/recorders/${id}/coaxial-control`, {
+      method: 'POST',
+      body: JSON.stringify({ channel_id: channelId, command })
+    }),
+  registerRecorderIPCamera: (id: string, payload: IPRegistrationReq) =>
+    request<{ channel_id: number; status: string; message: string }>(`/recorders/${id}/ip-registration`, {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    }),
+  getRecorderSchedule: (id: string, channelId: number) =>
+    request<RecordingSchedule>(`/recorders/${id}/schedule?channel_id=${channelId}`),
+  updateRecorderSchedule: (id: string, schedule: RecordingSchedule) =>
+    request<RecordingSchedule>(`/recorders/${id}/schedule`, {
+      method: 'PUT',
+      body: JSON.stringify(schedule)
+    }),
+  searchRecordings: (id: string, channelId: number, startTime?: string, endTime?: string, eventType?: string) => {
+    const q = new URLSearchParams({ channel_id: channelId.toString() });
+    if (startTime) q.set('start_time', startTime);
+    if (endTime) q.set('end_time', endTime);
+    if (eventType && eventType !== 'ALL') q.set('event_type', eventType);
+    return request<RecordingSegment[]>(`/recorders/${id}/search-recordings?${q.toString()}`);
+  },
+  createPlaybackSession: (id: string, channelId: number, startTime: string, endTime: string, speed: number = 1.0) =>
+    request<PlaybackSession>(`/recorders/${id}/playback-session`, {
+      method: 'POST',
+      body: JSON.stringify({ channel_id: channelId, start_time: startTime, end_time: endTime, speed })
+    }),
+  exportRecording: (id: string, segmentId: string, outputPath: string) =>
+    request<{ success: boolean; message: string; output_path: string; size_bytes: number }>(`/recorders/${id}/export`, {
+      method: 'POST',
+      body: JSON.stringify({ segment_id: segmentId, output_path: outputPath })
+    }),
+  getRecorderStorage: (id: string) => request<StorageHealthReport>(`/recorders/${id}/storage`),
+  stageFormatDiskPreview: (id: string, diskIndex: number) =>
+    request<DiskFormatPreview>(`/recorders/${id}/storage/format-preview`, {
+      method: 'POST',
+      body: JSON.stringify({ disk_index: diskIndex })
+    }),
+  approveFormatDisk: (id: string, formatToken: string, confirmation: string) =>
+    request<{ success: boolean; message: string }>(`/recorders/${id}/storage/format-approve`, {
+      method: 'POST',
+      body: JSON.stringify({ format_token: formatToken, confirmation })
+    }),
 };

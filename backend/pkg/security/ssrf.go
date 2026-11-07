@@ -50,6 +50,12 @@ func ValidateSurveillanceIP(ipStr string, allowLoopback bool) (net.IP, error) {
 	return ipv4, nil
 }
 
+// ValidateSurveillanceTarget is a helper wrapper for ValidateSurveillanceIP
+func ValidateSurveillanceTarget(ipStr string, allowLoopback bool) error {
+	_, err := ValidateSurveillanceIP(ipStr, allowLoopback)
+	return err
+}
+
 // SanitizePath prevents directory traversal attacks by stripping path delimiters
 func SanitizePath(filename string) (string, error) {
 	cleaned := filepath.Base(filename)

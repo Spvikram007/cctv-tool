@@ -540,3 +540,166 @@ export interface CapacityBandwidthCalculation {
   recommended_hdds: number;
   calculation_basis: string;
 }
+
+// Phase 6 - Recorder, Channel, Playback & Storage Types
+export type RecorderType = 'DVR' | 'NVR' | 'XVR' | 'HVR' | 'HYBRID_RECORDER';
+export type ChannelType = 'ANALOG' | 'IP';
+export type AnalogFormat = 'CVI' | 'TVI' | 'AHD' | 'CVBS' | 'AUTO' | 'IP';
+export type ChannelStatus = 'ONLINE' | 'OFFLINE' | 'NO_SIGNAL' | 'DISABLED';
+export type SignalStatus = 'SIGNAL_LOCKED' | 'SIGNAL_LOST' | 'UNCONFIGURED';
+export type RecordMode = 'CONTINUOUS' | 'MOTION' | 'ALARM' | 'MANUAL' | 'DISABLED';
+
+export interface RecorderProfile {
+  device_id: string;
+  name: string;
+  ip: string;
+  port: number;
+  manufacturer: string;
+  model: string;
+  hardware_revision: string;
+  firmware_version: string;
+  serial_number: string;
+  recorder_type: RecorderType;
+  physical_analog_channels: number;
+  supported_ip_channels: number;
+  total_channels: number;
+  max_resolution: string;
+  supported_analog_formats: AnalogFormat[];
+  supported_codecs: string[];
+  coaxial_control_supported: boolean;
+  audio_over_coax_supported: boolean;
+  ptz_over_coax_supported: boolean;
+  ai_analytics_supported: boolean;
+  disk_count: number;
+  total_storage_gb: number;
+  used_storage_gb: number;
+  network_interfaces: string[];
+}
+
+export interface RecorderChannelInfo {
+  recorder_id: string;
+  channel_id: number;
+  channel_number: number;
+  name: string;
+  channel_type: ChannelType;
+  connected_camera_id?: string;
+  connected_camera_ip?: string;
+  connected_camera_model?: string;
+  connection_status: ChannelStatus;
+  signal_status: SignalStatus;
+  signal_format: AnalogFormat;
+  resolution: string;
+  frame_rate: number;
+  bitrate_kbps: number;
+  encoding_format: string;
+  recording_status: RecordMode;
+  audio_enabled: boolean;
+  ptz_supported: boolean;
+  rtsp_stream_url?: string;
+}
+
+export interface AnalogFormatResult {
+  channel_id: number;
+  previous_format: AnalogFormat;
+  current_format: AnalogFormat;
+  switch_method: string;
+  success: boolean;
+  message: string;
+  timestamp: string;
+}
+
+export interface IPRegistrationReq {
+  channel_id: number;
+  ip: string;
+  port: number;
+  protocol: string;
+  username: string;
+  password: string;
+  stream_index: number;
+}
+
+export interface RecordingSchedule {
+  recorder_id: string;
+  channel_id: number;
+  channel_name: string;
+  pre_record_sec: number;
+  post_record_sec: number;
+  weekly_schedule: Record<number, string[]>;
+  holiday_enabled: boolean;
+}
+
+export interface RecordingSegment {
+  id: string;
+  recorder_id: string;
+  channel_id: number;
+  channel_name: string;
+  start_time: string;
+  end_time: string;
+  duration_sec: number;
+  event_type: 'CONTINUOUS' | 'MOTION' | 'ALARM' | 'MANUAL' | string;
+  size_bytes: number;
+  file_format: string;
+  playback_uri: string;
+}
+
+export interface PlaybackSession {
+  session_id: string;
+  playback_token: string;
+  recorder_id: string;
+  channel_id: number;
+  start_time: string;
+  end_time: string;
+  current_position: string;
+  speed: number;
+  state: 'PLAYING' | 'PAUSED' | 'STOPPED';
+  stream_url: string;
+  expires_at: string;
+}
+
+export interface StorageDisk {
+  disk_index: number;
+  name: string;
+  model: string;
+  serial: string;
+  capacity_gb: number;
+  used_gb: number;
+  free_gb: number;
+  usage_percent: number;
+  status: 'NORMAL' | 'ERROR' | 'UNFORMATTED' | 'REBUILDING' | string;
+  smart_status: 'HEALTHY' | 'WARNING' | 'FAILED' | string;
+  temperature_c: number;
+  bad_sectors: number;
+  overwrite_mode: 'OVERWRITE' | 'STOP_RECORDING' | string;
+}
+
+export interface RetentionEstimate {
+  channel_count: number;
+  avg_bitrate_kbps: number;
+  daily_recording_hours: number;
+  daily_storage_gb: number;
+  total_retention_days: number;
+}
+
+export interface StorageHealthReport {
+  recorder_id: string;
+  total_disks: number;
+  total_capacity_gb: number;
+  total_used_gb: number;
+  total_free_gb: number;
+  disks: StorageDisk[];
+  overall_health: 'GOOD' | 'WARNING' | 'CRITICAL' | string;
+  recording_interruption_warning: boolean;
+  estimated_retention_days: number;
+  measured_retention_basis: string;
+  retention_estimate: RetentionEstimate;
+}
+
+export interface DiskFormatPreview {
+  format_token: string;
+  recorder_id: string;
+  disk_index: number;
+  model: string;
+  capacity_gb: number;
+  warning: string;
+  expires_at: string;
+}

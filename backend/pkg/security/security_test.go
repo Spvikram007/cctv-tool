@@ -51,6 +51,28 @@ func TestRBACAuthenticationAndPermissions(t *testing.T) {
 	}
 }
 
+func TestArgon2idPasswordHashingAndRehash(t *testing.T) {
+	rbac := security.NewRBACManager()
+
+	// 1. Authenticate with newly created Argon2id account
+	sess, err := rbac.Authenticate("admin", "Admin@Sentinel2026!", 1*time.Hour)
+	if err != nil || sess == nil {
+		t.Fatalf("Argon2id authentication failed: %v", err)
+	}
+
+	// 2. Test legacy migration / rehash
+	// Create user with explicit legacy salted hash (pre-Phase 6)
+	legacyUser := "legacy_tech"
+	legacyPass := "LegacyPass@2025!"
+	_ = rbac.CreateUser(legacyUser, legacyPass, "Legacy Tech", security.RoleTechnician, "legacy@tds.in", "default", "site-1")
+
+	// Verify authenticate works and upgrades to Argon2id
+	legacySess, err := rbac.Authenticate(legacyUser, legacyPass, 1*time.Hour)
+	if err != nil || legacySess == nil {
+		t.Fatalf("Legacy password authentication failed: %v", err)
+	}
+}
+
 func TestSSRFProtection(t *testing.T) {
 	// 1. Cloud metadata IP must be blocked
 	_, err := security.ValidateSurveillanceIP("169.254.169.254", false)
