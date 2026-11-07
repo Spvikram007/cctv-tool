@@ -116,6 +116,11 @@ func (a *ONVIFAdapter) Detect(targetIP string, port int, username, password stri
 	fw := extractXMLTag(xmlResp, "FirmwareVersion")
 	serial := extractXMLTag(xmlResp, "SerialNumber")
 
+	// Strict verification: must contain genuine ONVIF GetDeviceInformation response
+	if manufacturer == "" && model == "" && !strings.Contains(xmlResp, "GetDeviceInformationResponse") {
+		return nil, fmt.Errorf("response did not contain valid ONVIF GetDeviceInformation elements")
+	}
+
 	if manufacturer == "" {
 		manufacturer = "Generic ONVIF"
 	}

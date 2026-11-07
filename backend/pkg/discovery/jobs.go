@@ -145,14 +145,93 @@ func (jm *JobManager) AddResult(id string, dev DiscoveredDevice) {
 		return
 	}
 
-	// Deduplicate by IP + Port or MAC
+	// Deduplicate and intelligently merge by IP or MAC
 	for i, r := range job.Results {
-		if (dev.Device.MAC != "" && r.Device.MAC == dev.Device.MAC) ||
-			(dev.Device.IP == r.Device.IP && dev.Device.Port == r.Device.Port) {
-			// Update existing record if new fingerprint has higher confidence
-			if dev.Fingerprint.Confidence > r.Fingerprint.Confidence {
-				job.Results[i] = dev
+		isSameHost := (dev.Device.IP == r.Device.IP) ||
+			(dev.Device.MAC != "" && dev.Device.MAC != "00:00:00:00:00:00" && r.Device.MAC == dev.Device.MAC)
+
+		if isSameHost {
+			merged := r
+
+			// 1. Keep higher confidence manufacturer and model
+			if r.Device.Model == "" || r.Device.Model == "Unknown" {
+				if dev.Device.Model != "" && dev.Device.Model != "Unknown" {
+					merged.Device.Model = dev.Device.Model
+					merged.Fingerprint.Model = dev.Fingerprint.Model
+				}
 			}
+			if r.Device.Manufacturer == models.VendorGeneric && dev.Device.Manufacturer != models.VendorGeneric {
+				merged.Device.Manufacturer = dev.Device.Manufacturer
+				merged.Fingerprint.IdentifiedManufacturer = dev.Fingerprint.IdentifiedManufacturer
+			}
+			if merged.Device.Category == models.CategoryUnknown || merged.Device.Category == models.CategoryIPCamera {
+				if dev.Device.Category != models.CategoryUnknown {
+					merged.Device.Category = dev.Device.Category
+					merged.Fingerprint.Category = dev.Fingerprint.Category
+				}
+			}
+
+			// 2. Merge MAC if previously missing
+			if merged.Device.MAC == "" && dev.Device.MAC != "" {
+				merged.Device.MAC = dev.Device.MAC
+				merged.Fingerprint.MAC = dev.Fingerprint.MAC
+			}
+
+			// 3. Merge open ports and services
+			for _, p := range dev.Fingerprint.Services.OpenPorts {
+				if !containsPort(merged.Fingerprint.Services.OpenPorts, p) {
+					merged.Fingerprint.Services.OpenPorts = append(merged.Fingerprint.Services.OpenPorts, p)
+				}
+			}
+			if merged.Fingerprint.Services.RTSPServer == "" && dev.Fingerprint.Services.RTSPServer != "" {
+				merged.Fingerprint.Services.RTSPServer = dev.Fingerprint.Services.RTSPServer
+			}
+			if merged.Fingerprint.Services.RTSPPublicOpts == "" && dev.Fingerprint.Services.RTSPPublicOpts != "" {
+				merged.Fingerprint.Services.RTSPPublicOpts = dev.Fingerprint.Services.RTSPPublicOpts
+			}
+			if merged.Fingerprint.Services.HTTPServer == "" && dev.Fingerprint.Services.HTTPServer != "" {
+				merged.Fingerprint.Services.HTTPServer = dev.Fingerprint.Services.HTTPServer
+			}
+			if merged.Fingerprint.Services.ONVIFServiceURL == "" && dev.Fingerprint.Services.ONVIFServiceURL != "" {
+				merged.Fingerprint.Services.ONVIFServiceURL = dev.Fingerprint.Services.ONVIFServiceURL
+			}
+
+			// 4. Merge protocols
+			for _, proto := range dev.Device.Protocols {
+				hasProto := false
+				for _, existingP := range merged.Device.Protocols {
+					if existingP == proto {
+						hasProto = true
+						break
+					}
+				}
+				if !hasProto {
+					merged.Device.Protocols = append(merged.Device.Protocols, proto)
+					merged.Fingerprint.Protocols = append(merged.Fingerprint.Protocols, proto)
+				}
+			}
+
+			// 5. Update confidence score to highest level
+			if dev.Fingerprint.Confidence > merged.Fingerprint.Confidence {
+				merged.Fingerprint.Confidence = dev.Fingerprint.Confidence
+				merged.Fingerprint.ConfidenceLevel = dev.Fingerprint.ConfidenceLevel
+			}
+
+			// 6. Append non-duplicate evidence sources
+			for _, newEv := range dev.Fingerprint.EvidenceSources {
+				hasEv := false
+				for _, oldEv := range merged.Fingerprint.EvidenceSources {
+					if oldEv.Category == newEv.Category {
+						hasEv = true
+						break
+					}
+				}
+				if !hasEv {
+					merged.Fingerprint.EvidenceSources = append(merged.Fingerprint.EvidenceSources, newEv)
+				}
+			}
+
+			job.Results[i] = merged
 			return
 		}
 	}
@@ -183,3 +262,4 @@ func (jm *JobManager) MarkCompleted(id string, err error) {
 		job.Status = JobStatusCompleted
 	}
 }
+

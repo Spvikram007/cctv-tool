@@ -117,3 +117,4 @@ func TestProbeONVIF_Cancellation(t *testing.T) {
 		t.Logf("Found %d matches during immediate cancel test", len(matches))
 	}
 }
+

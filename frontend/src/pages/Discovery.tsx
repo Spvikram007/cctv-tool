@@ -194,31 +194,28 @@ export const Discovery: React.FC<DiscoveryProps> = ({ onDeviceEnrolled }) => {
         <div className="flex flex-wrap gap-2 pt-2 border-t border-[#21262d]">
           <button
             onClick={() => setMethod('HYBRID')}
-            className={`px-3 py-1.5 rounded-lg text-xs font-mono font-semibold transition-all ${
-              method === 'HYBRID'
+            className={`px-3 py-1.5 rounded-lg text-xs font-mono font-semibold transition-all ${method === 'HYBRID'
                 ? 'bg-emerald-600 text-white shadow-md shadow-emerald-950/40'
                 : 'bg-[#0d1117] text-slate-400 hover:text-slate-200 border border-[#30363d]'
-            }`}
+              }`}
           >
             Universal Hybrid (ONVIF + TCP Sweep) [Recommended]
           </button>
           <button
             onClick={() => setMethod('ONVIF')}
-            className={`px-3 py-1.5 rounded-lg text-xs font-mono font-semibold transition-all ${
-              method === 'ONVIF'
+            className={`px-3 py-1.5 rounded-lg text-xs font-mono font-semibold transition-all ${method === 'ONVIF'
                 ? 'bg-emerald-600 text-white shadow-md shadow-emerald-950/40'
                 : 'bg-[#0d1117] text-slate-400 hover:text-slate-200 border border-[#30363d]'
-            }`}
+              }`}
           >
             Multicast ONVIF (WS-Discovery)
           </button>
           <button
             onClick={() => setMethod('TCP')}
-            className={`px-3 py-1.5 rounded-lg text-xs font-mono font-semibold transition-all ${
-              method === 'TCP'
+            className={`px-3 py-1.5 rounded-lg text-xs font-mono font-semibold transition-all ${method === 'TCP'
                 ? 'bg-emerald-600 text-white shadow-md shadow-emerald-950/40'
                 : 'bg-[#0d1117] text-slate-400 hover:text-slate-200 border border-[#30363d]'
-            }`}
+              }`}
           >
             Subnet TCP Multi-Port Sweep
           </button>
@@ -252,11 +249,10 @@ export const Discovery: React.FC<DiscoveryProps> = ({ onDeviceEnrolled }) => {
               onChange={(e) => setCidr(e.target.value)}
               disabled={method === 'ONVIF'}
               placeholder="192.168.1.0/24"
-              className={`w-full px-3 py-2 bg-[#0d1117] border rounded-lg text-xs font-mono focus:outline-none ${
-                method === 'ONVIF'
+              className={`w-full px-3 py-2 bg-[#0d1117] border rounded-lg text-xs font-mono focus:outline-none ${method === 'ONVIF'
                   ? 'border-[#21262d] text-slate-600 cursor-not-allowed'
                   : 'border-[#30363d] text-slate-200 focus:border-emerald-500'
-              }`}
+                }`}
             />
           </div>
 
@@ -268,11 +264,10 @@ export const Discovery: React.FC<DiscoveryProps> = ({ onDeviceEnrolled }) => {
               onChange={(e) => setPortsStr(e.target.value)}
               disabled={method === 'ONVIF'}
               placeholder="80, 554, 8000, 37777..."
-              className={`w-full px-3 py-2 bg-[#0d1117] border rounded-lg text-xs font-mono focus:outline-none ${
-                method === 'ONVIF'
+              className={`w-full px-3 py-2 bg-[#0d1117] border rounded-lg text-xs font-mono focus:outline-none ${method === 'ONVIF'
                   ? 'border-[#21262d] text-slate-600 cursor-not-allowed'
                   : 'border-[#30363d] text-slate-200 focus:border-emerald-500'
-              }`}
+                }`}
             />
           </div>
 
@@ -280,11 +275,10 @@ export const Discovery: React.FC<DiscoveryProps> = ({ onDeviceEnrolled }) => {
             <button
               onClick={handleStartScan}
               disabled={scanning}
-              className={`flex-1 py-2 px-3 rounded-lg text-xs font-bold font-mono flex items-center justify-center space-x-2 transition-all ${
-                scanning
+              className={`flex-1 py-2 px-3 rounded-lg text-xs font-bold font-mono flex items-center justify-center space-x-2 transition-all ${scanning
                   ? 'bg-slate-800 text-slate-500 cursor-not-allowed border border-[#30363d]'
                   : 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-900/30'
-              }`}
+                }`}
             >
               {scanning ? (
                 <>
@@ -350,13 +344,12 @@ export const Discovery: React.FC<DiscoveryProps> = ({ onDeviceEnrolled }) => {
             </div>
             <div className="w-full h-2 rounded-full bg-[#0d1117] overflow-hidden border border-[#30363d]">
               <div
-                className={`h-full transition-all duration-300 ${
-                  progress.status === 'CANCELLED'
+                className={`h-full transition-all duration-300 ${progress.status === 'CANCELLED'
                     ? 'bg-amber-500'
                     : progress.status === 'FAILED'
-                    ? 'bg-red-500'
-                    : 'bg-emerald-500'
-                }`}
+                      ? 'bg-red-500'
+                      : 'bg-emerald-500'
+                  }`}
                 style={{ width: `${progress.progress_percent}%` }}
               ></div>
             </div>
@@ -457,11 +450,10 @@ export const Discovery: React.FC<DiscoveryProps> = ({ onDeviceEnrolled }) => {
                     <button
                       onClick={() => handleEnroll(dev)}
                       disabled={isEnrolled}
-                      className={`px-3 py-1.5 rounded text-xs font-mono font-semibold flex items-center space-x-1.5 transition-colors ${
-                        isEnrolled
+                      className={`px-3 py-1.5 rounded text-xs font-mono font-semibold flex items-center space-x-1.5 transition-colors ${isEnrolled
                           ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
                           : 'bg-emerald-600 hover:bg-emerald-500 text-white'
-                      }`}
+                        }`}
                     >
                       {isEnrolled ? (
                         <>
@@ -554,7 +546,7 @@ export const Discovery: React.FC<DiscoveryProps> = ({ onDeviceEnrolled }) => {
               </h4>
               <div className="space-y-2">
                 {selectedDetailDevice.fingerprint.evidence_sources &&
-                selectedDetailDevice.fingerprint.evidence_sources.length > 0 ? (
+                  selectedDetailDevice.fingerprint.evidence_sources.length > 0 ? (
                   selectedDetailDevice.fingerprint.evidence_sources.map((ev, idx) => (
                     <div
                       key={idx}

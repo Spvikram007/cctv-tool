@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +22,7 @@ var ComprehensiveMACPrefixVendor = map[string]models.Manufacturer{
 	// Hikvision
 	"bc:54:51": models.VendorHikvision,
 	"c0:56:e3": models.VendorHikvision,
+	"c0:51:7e": models.VendorHikvision,
 	"44:19:b6": models.VendorHikvision,
 	"a4:14:37": models.VendorHikvision,
 	"10:12:fb": models.VendorHikvision,
@@ -38,12 +40,18 @@ var ComprehensiveMACPrefixVendor = map[string]models.Manufacturer{
 	"b8:a3:87": models.VendorDahua,
 	"f4:b8:5e": models.VendorDahua,
 	"70:2c:1f": models.VendorDahua,
+	"30:dd:aa": models.VendorDahua,
+	"fc:b6:9d": models.VendorDahua,
+	"f8:ce:07": models.VendorDahua,
+	"90:6a:94": models.VendorDahua,
 
-	// CP PLUS
+	// CP PLUS / Aditya Infotech
 	"f0:c8:50": models.VendorCPPlus,
 	"b0:c5:54": models.VendorCPPlus,
 	"84:b5:41": models.VendorCPPlus,
 	"24:52:6a": models.VendorCPPlus,
+	"14:07:08": models.VendorCPPlus,
+	"28:18:fd": models.VendorCPPlus,
 
 	// Axis
 	"00:40:8c": models.VendorAxis,
@@ -51,7 +59,7 @@ var ComprehensiveMACPrefixVendor = map[string]models.Manufacturer{
 	"b8:a4:4f": models.VendorAxis,
 	"00:02:d1": models.VendorAxis,
 
-	// Hanwha / Samsung
+	// Hanwha / Samsung Techwin
 	"00:16:6c": models.VendorHanwha,
 	"00:09:18": models.VendorHanwha,
 	"00:24:90": models.VendorHanwha,
@@ -69,6 +77,19 @@ var ComprehensiveMACPrefixVendor = map[string]models.Manufacturer{
 	// TVT
 	"68:69:2e": models.VendorTVT,
 	"48:ea:63": models.VendorTVT,
+
+	// Xiongmai (XM) OEMs
+	"00:12:12": models.VendorOEM,
+	"00:12:13": models.VendorOEM,
+	"00:12:14": models.VendorOEM,
+	"00:12:15": models.VendorOEM,
+	"00:12:16": models.VendorOEM,
+
+	// Reolink
+	"ec:71:db": models.VendorGeneric,
+
+	// VStarcam
+	"00:0e:c6": models.VendorGeneric,
 }
 
 // EvidenceItem represents a single piece of evidence contributing to device identification
@@ -77,40 +98,42 @@ type EvidenceItem struct {
 	Description string `json:"description"` // Description of what was found
 	Weight      int    `json:"weight"`      // Contribution weight to confidence
 	Value       string `json:"value"`       // Extracted raw evidence value
+	Explanation string `json:"explanation"` // Engineering rationale for weighting
 }
 
 // DeviceServices represents network services discovered on the device
 type DeviceServices struct {
-	OpenPorts        []int             `json:"open_ports"`
-	HTTPServer       string            `json:"http_server,omitempty"`
-	HTTPAuthHeader   string            `json:"http_auth_header,omitempty"`
-	RTSPServer       string            `json:"rtsp_server,omitempty"`
-	RTSPPublicOpts   string            `json:"rtsp_public_opts,omitempty"`
-	SSLCertIssuer    string            `json:"ssl_cert_issuer,omitempty"`
-	SSLCertSubject   string            `json:"ssl_cert_subject,omitempty"`
-	ONVIFServiceURL  string            `json:"onvif_service_url,omitempty"`
+	OpenPorts         []int             `json:"open_ports"`
+	HTTPServer        string            `json:"http_server,omitempty"`
+	HTTPAuthHeader    string            `json:"http_auth_header,omitempty"`
+	RTSPServer        string            `json:"rtsp_server,omitempty"`
+	RTSPPublicOpts    string            `json:"rtsp_public_opts,omitempty"`
+	SSLCertIssuer     string            `json:"ssl_cert_issuer,omitempty"`
+	SSLCertSubject    string            `json:"ssl_cert_subject,omitempty"`
+	ONVIFServiceURL   string            `json:"onvif_service_url,omitempty"`
 	AdditionalBanners map[string]string `json:"additional_banners,omitempty"`
 }
 
 // FingerprintResult holds the complete result of the fingerprinting and identification process
 type FingerprintResult struct {
-	IP                       string                `json:"ip"`
-	MAC                      string                `json:"mac"`
-	IdentifiedManufacturer   models.Manufacturer   `json:"identified_manufacturer"`
-	ProbableManufacturer     string                `json:"probable_manufacturer"`
-	Model                    string                `json:"model"`
-	Firmware                 string                `json:"firmware"`
-	SerialNumber             string                `json:"serial_number"`
-	Category                 models.DeviceCategory `json:"category"`
-	Confidence               int                   `json:"confidence"` // 0 - 100
-	ConfidenceLevel          string                `json:"confidence_level"` // HIGH, MEDIUM, LOW
-	EvidenceSources          []EvidenceItem        `json:"evidence_sources"`
-	UnknownFields            []string              `json:"unknown_fields"`
-	Services                 DeviceServices        `json:"services"`
-	Protocols                []models.ProtocolType `json:"protocols"`
-	Capabilities             []string              `json:"capabilities"`
-	ChannelCount             int                   `json:"channel_count"`
-	DiscoveredVia            string                `json:"discovered_via"` // ONVIF, TCP_SWEEP, HYBRID
+	IP                     string                `json:"ip"`
+	MAC                    string                `json:"mac"`
+	IdentifiedManufacturer models.Manufacturer   `json:"identified_manufacturer"`
+	ProbableManufacturer   string                `json:"probable_manufacturer"`
+	Model                  string                `json:"model"`
+	Firmware               string                `json:"firmware"`
+	SerialNumber           string                `json:"serial_number"`
+	Category               models.DeviceCategory `json:"category"`
+	Confidence             int                   `json:"confidence"` // 0 - 100
+	ConfidenceLevel        string                `json:"confidence_level"` // HIGH, MEDIUM, LOW
+	ConfidenceExplanation string                `json:"confidence_explanation"`
+	EvidenceSources        []EvidenceItem        `json:"evidence_sources"`
+	UnknownFields          []string              `json:"unknown_fields"`
+	Services               DeviceServices        `json:"services"`
+	Protocols              []models.ProtocolType `json:"protocols"`
+	Capabilities           []string              `json:"capabilities"`
+	ChannelCount           int                   `json:"channel_count"`
+	DiscoveredVia          string                `json:"discovered_via"` // ONVIF, TCP_SWEEP, HYBRID
 }
 
 // Fingerprinter performs active protocol fingerprinting
@@ -135,8 +158,39 @@ func NewFingerprinter() *Fingerprinter {
 	}
 }
 
-// LookupMACFromOUI checks known OUI tables
+// IsLocallyAdministeredMAC checks if the IEEE 802 U/L bit (bit 1 of octet 0) is set.
+// Locally administered addresses are private, virtual, or randomized and are NOT globally assigned by IEEE.
+func IsLocallyAdministeredMAC(mac string) bool {
+	clean := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(mac, "-", ":"), ".", ":"))
+	parts := strings.Split(clean, ":")
+	if len(parts) >= 1 && len(parts[0]) == 2 {
+		val, err := strconv.ParseUint(parts[0], 16, 8)
+		if err == nil {
+			return (val & 0x02) != 0
+		}
+	}
+	return false
+}
+
+// IsMulticastOrBroadcastMAC checks if the IEEE 802 I/G bit (bit 0 of octet 0) is set.
+func IsMulticastOrBroadcastMAC(mac string) bool {
+	clean := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(mac, "-", ":"), ".", ":"))
+	parts := strings.Split(clean, ":")
+	if len(parts) >= 1 && len(parts[0]) == 2 {
+		val, err := strconv.ParseUint(parts[0], 16, 8)
+		if err == nil {
+			return (val & 0x01) != 0
+		}
+	}
+	return false
+}
+
+// LookupMACFromOUI checks known OUI tables. Never returns a specific model.
 func LookupMACFromOUI(mac string) (models.Manufacturer, bool) {
+	if IsLocallyAdministeredMAC(mac) || IsMulticastOrBroadcastMAC(mac) {
+		return models.VendorGeneric, false
+	}
+
 	clean := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(mac, "-", ":"), ".", ":"))
 	if len(clean) >= 8 {
 		prefix := clean[:8]
@@ -165,7 +219,6 @@ func LookupSystemARP(ip string) string {
 		return ""
 	}
 
-	// Regex matching MAC address format xx:xx:xx:xx:xx:xx or xx-xx-xx-xx-xx-xx
 	macRe := regexp.MustCompile(`([0-9a-fA-F]{2}[:-]){5}([0-9a-fA-F]{2})`)
 	match := macRe.FindString(string(out))
 	if match != "" {
@@ -246,7 +299,6 @@ func (fp *Fingerprinter) ProbeHTTPServer(ctx context.Context, ip string, port in
 	server = resp.Header.Get("Server")
 	authHeader = resp.Header.Get("WWW-Authenticate")
 
-	// Read small preview of body for HTML title
 	buf := make([]byte, 1024)
 	n, _ := resp.Body.Read(buf)
 	if n > 0 {
@@ -260,7 +312,9 @@ func (fp *Fingerprinter) ProbeHTTPServer(ctx context.Context, ip string, port in
 	return server, authHeader, title
 }
 
-// AnalyzeFingerprint evaluates all collected evidence, computes confidence score, and classifies device
+// AnalyzeFingerprint evaluates all collected evidence, computes confidence score,
+// avoids double-counting correlated evidence, handles locally administered MACs, and classifies device.
+// RULE: Never infer a specific model from an OUI alone.
 func AnalyzeFingerprint(
 	ip string,
 	mac string,
@@ -282,18 +336,23 @@ func AnalyzeFingerprint(
 	}
 
 	totalConfidence := 0
+	corroborations := make([]string, 0)
 
-	// 1. Evaluate ONVIF WS-Discovery evidence (Definitive: 50 - 60 points)
-	if onvifMatch != nil {
+	// 1. Evaluate ONVIF WS-Discovery evidence (Definitive: 55 points)
+	hasONVIF := (onvifMatch != nil)
+	if hasONVIF {
 		result.Protocols = append(result.Protocols, models.ProtocolONVIF)
-		evidenceVal := fmt.Sprintf("Scopes: %s; XAddrs: %s", strings.Join(onvifMatch.Scopes, " "), strings.Join(onvifMatch.XAddrs, " "))
+		evidenceVal := fmt.Sprintf("Scopes: %s", strings.Join(onvifMatch.Scopes, " "))
+		weight := 55
 		result.EvidenceSources = append(result.EvidenceSources, EvidenceItem{
 			Category:    "ONVIF_WS_DISCOVERY",
 			Description: "Active ONVIF WS-Discovery SOAP ProbeMatch response received",
-			Weight:      55,
+			Weight:      weight,
 			Value:       evidenceVal,
+			Explanation: "SOAP ProbeMatches envelope confirmed presence of ONVIF web services stack.",
 		})
-		totalConfidence += 55
+		totalConfidence += weight
+		corroborations = append(corroborations, fmt.Sprintf("ONVIF WS-Discovery (+%d%%)", weight))
 
 		if onvifMatch.Manufacturer != "" {
 			result.IdentifiedManufacturer = models.Manufacturer(onvifMatch.Manufacturer)
@@ -310,30 +369,56 @@ func AnalyzeFingerprint(
 		}
 	}
 
-	// 2. Evaluate MAC OUI evidence (Probable: 25 - 35 points, NEVER 100% on its own)
+	// 2. Evaluate MAC OUI evidence
+	// RULE: Handle locally administered MACs; missing OUIs; never infer model from OUI alone!
 	if mac != "" {
-		if ouiVendor, ok := LookupMACFromOUI(mac); ok {
+		if IsLocallyAdministeredMAC(mac) {
 			result.EvidenceSources = append(result.EvidenceSources, EvidenceItem{
 				Category:    "MAC_OUI",
-				Description: fmt.Sprintf("MAC prefix matches vendor assignment for %s", ouiVendor),
-				Weight:      30,
+				Description: "Locally Administered / Private MAC address (IEEE U/L bit set) - vendor OUI not globally assigned",
+				Weight:      0,
 				Value:       mac,
+				Explanation: "Bit 1 of first octet is set. Hardware uses randomized or virtual switch MAC; OUI vendor inference is invalid.",
 			})
-			totalConfidence += 30
+		} else if IsMulticastOrBroadcastMAC(mac) {
+			result.EvidenceSources = append(result.EvidenceSources, EvidenceItem{
+				Category:    "MAC_OUI",
+				Description: "Multicast or Broadcast MAC address - not a unique device identity",
+				Weight:      0,
+				Value:       mac,
+				Explanation: "Bit 0 of first octet is set.",
+			})
+		} else if ouiVendor, ok := LookupMACFromOUI(mac); ok {
+			// MAC alone contributes at most 25 points. If ONVIF already proved vendor, MAC corroboration is +15.
+			weight := 25
+			if hasONVIF {
+				weight = 15
+			}
+			result.EvidenceSources = append(result.EvidenceSources, EvidenceItem{
+				Category:    "MAC_OUI",
+				Description: fmt.Sprintf("IEEE OUI prefix matches registered vendor block for %s", ouiVendor),
+				Weight:      weight,
+				Value:       mac,
+				Explanation: fmt.Sprintf("Hardware NIC prefix assigned to %s. Note: Model is NOT inferred from OUI.", ouiVendor),
+			})
+			totalConfidence += weight
+			corroborations = append(corroborations, fmt.Sprintf("MAC OUI %s (+%d%%)", ouiVendor, weight))
+
 			if result.IdentifiedManufacturer == "" || result.IdentifiedManufacturer == models.VendorGeneric {
 				result.ProbableManufacturer = string(ouiVendor)
 			}
 		} else {
 			result.EvidenceSources = append(result.EvidenceSources, EvidenceItem{
 				Category:    "MAC_OUI",
-				Description: "MAC OUI prefix does not match known CCTV manufacturer",
-				Weight:      5,
+				Description: "MAC OUI prefix does not match known CCTV manufacturer block",
+				Weight:      0,
 				Value:       mac,
+				Explanation: "MAC prefix is valid IEEE unicast, but vendor is generic or unlisted in surveillance OUI database.",
 			})
 		}
 	}
 
-	// 3. Evaluate RTSP OPTIONS Server banner evidence (Strong: 20 - 30 points)
+	// 3. Evaluate RTSP OPTIONS Server banner evidence (20 - 25 points)
 	if services.RTSPServer != "" {
 		result.Protocols = append(result.Protocols, models.ProtocolRTSP)
 		result.Capabilities = append(result.Capabilities, "RTSP_H264", "SNAPSHOT")
@@ -341,16 +426,16 @@ func AnalyzeFingerprint(
 		serverLower := strings.ToLower(services.RTSPServer)
 
 		if strings.Contains(serverLower, "hikvision") {
-			weight = 30
+			weight = 25
 			result.IdentifiedManufacturer = models.VendorHikvision
 		} else if strings.Contains(serverLower, "dahua") || strings.Contains(serverLower, "gm_rtsp") {
-			weight = 30
+			weight = 25
 			result.IdentifiedManufacturer = models.VendorDahua
 		} else if strings.Contains(serverLower, "axis") {
-			weight = 30
+			weight = 25
 			result.IdentifiedManufacturer = models.VendorAxis
 		} else if strings.Contains(serverLower, "live555") {
-			weight = 15 // Common generic RTSP streamer library
+			weight = 10 // Generic open source streaming server
 		}
 
 		result.EvidenceSources = append(result.EvidenceSources, EvidenceItem{
@@ -358,26 +443,32 @@ func AnalyzeFingerprint(
 			Description: fmt.Sprintf("RTSP OPTIONS returned Server header: %s", services.RTSPServer),
 			Weight:      weight,
 			Value:       services.RTSPServer,
+			Explanation: "Direct RTSP streaming daemon handshake confirmed video transport capability.",
 		})
 		totalConfidence += weight
+		corroborations = append(corroborations, fmt.Sprintf("RTSP Server (%s, +%d%%)", services.RTSPServer, weight))
 	}
 
-	// 4. Evaluate HTTP Server header & Auth evidence (15 - 25 points)
+	// 4. Evaluate HTTP Server header & Auth evidence (Single HTTP proof to avoid double-counting)
 	if services.HTTPServer != "" || services.HTTPAuthHeader != "" {
-		weight := 15
 		srvLower := strings.ToLower(services.HTTPServer)
 		authLower := strings.ToLower(services.HTTPAuthHeader)
+		weight := 15
+		bannerNote := services.HTTPServer
+		if bannerNote == "" {
+			bannerNote = services.HTTPAuthHeader
+		}
 
 		if strings.Contains(srvLower, "hikvision") || strings.Contains(authLower, "hikvision") {
-			weight = 25
+			weight = 20
 			result.IdentifiedManufacturer = models.VendorHikvision
 			result.Protocols = append(result.Protocols, models.ProtocolISAPI)
 		} else if strings.Contains(srvLower, "dahua") || strings.Contains(authLower, "dahua") {
-			weight = 25
+			weight = 20
 			result.IdentifiedManufacturer = models.VendorDahua
 			result.Protocols = append(result.Protocols, models.ProtocolDahuaCGI)
-		} else if strings.Contains(srvLower, "app-webs") { // Common Hikvision HTTP server banner
-			weight = 20
+		} else if strings.Contains(srvLower, "app-webs") {
+			weight = 15
 			if result.ProbableManufacturer == "" {
 				result.ProbableManufacturer = string(models.VendorHikvision)
 			}
@@ -385,29 +476,27 @@ func AnalyzeFingerprint(
 
 		result.EvidenceSources = append(result.EvidenceSources, EvidenceItem{
 			Category:    "HTTP_BANNER",
-			Description: fmt.Sprintf("HTTP Server: %s, Auth: %s", services.HTTPServer, services.HTTPAuthHeader),
+			Description: fmt.Sprintf("HTTP Server / Auth Header: %s", bannerNote),
 			Weight:      weight,
-			Value:       services.HTTPServer,
+			Value:       bannerNote,
+			Explanation: "HTTP web admin interface identified; correlated headers evaluated without credential challenges.",
 		})
 		totalConfidence += weight
+		corroborations = append(corroborations, fmt.Sprintf("HTTP Header (+%d%%)", weight))
 	}
 
-	// 5. Evaluate SSL Certificate evidence (15 - 20 points)
+	// 5. Evaluate SSL Certificate evidence (15 points)
 	if services.SSLCertIssuer != "" || services.SSLCertSubject != "" {
-		weight := 15
 		certLower := strings.ToLower(services.SSLCertSubject + " " + services.SSLCertIssuer)
+		weight := 15
 		if strings.Contains(certLower, "hikvision") {
 			result.IdentifiedManufacturer = models.VendorHikvision
-			weight = 20
 		} else if strings.Contains(certLower, "dahua") {
 			result.IdentifiedManufacturer = models.VendorDahua
-			weight = 20
 		} else if strings.Contains(certLower, "axis") {
 			result.IdentifiedManufacturer = models.VendorAxis
-			weight = 20
 		} else if strings.Contains(certLower, "cpplus") || strings.Contains(certLower, "cp plus") {
 			result.IdentifiedManufacturer = models.VendorCPPlus
-			weight = 20
 		}
 
 		result.EvidenceSources = append(result.EvidenceSources, EvidenceItem{
@@ -415,47 +504,68 @@ func AnalyzeFingerprint(
 			Description: fmt.Sprintf("TLS Certificate Subject: %s", services.SSLCertSubject),
 			Weight:      weight,
 			Value:       services.SSLCertSubject,
+			Explanation: "X.509 SSL certificate inspects self-signed camera identity without CA bypass.",
 		})
 		totalConfidence += weight
+		corroborations = append(corroborations, fmt.Sprintf("TLS Cert (+%d%%)", weight))
 	}
 
-	// 6. Evaluate Open Ports signatures (10 - 20 points)
+	// 6. Evaluate Open Ports signatures
+	// RULE: Avoid counting correlated evidence redundantly if ONVIF already proved vendor.
 	hasHikSDK := containsPort(openPorts, 8000)
 	hasDahuaSDK := containsPort(openPorts, 37777)
 	hasXM := containsPort(openPorts, 34567)
 
 	if hasHikSDK {
+		weight := 15
+		if result.IdentifiedManufacturer == models.VendorHikvision {
+			weight = 10 // Corroborating weight
+		}
 		result.EvidenceSources = append(result.EvidenceSources, EvidenceItem{
 			Category:    "PORT_SIGNATURE",
-			Description: "Port 8000 (Hikvision SDK / SADP service) open",
-			Weight:      20,
+			Description: "Port 8000/tcp (Hikvision SADP / SDK port) open",
+			Weight:      weight,
 			Value:       "8000/tcp",
+			Explanation: "Port 8000 is universally allocated to Hikvision ISAPI / SADP binary protocol.",
 		})
-		totalConfidence += 20
+		totalConfidence += weight
+		corroborations = append(corroborations, fmt.Sprintf("Hikvision Port 8000 (+%d%%)", weight))
 		if result.ProbableManufacturer == "" {
 			result.ProbableManufacturer = string(models.VendorHikvision)
 		}
 	}
 	if hasDahuaSDK {
+		weight := 15
+		if result.IdentifiedManufacturer == models.VendorDahua {
+			weight = 10 // Corroborating weight
+		}
 		result.EvidenceSources = append(result.EvidenceSources, EvidenceItem{
 			Category:    "PORT_SIGNATURE",
-			Description: "Port 37777 (Dahua NetSDK) open",
-			Weight:      20,
+			Description: "Port 37777/tcp (Dahua NetSDK port) open",
+			Weight:      weight,
 			Value:       "37777/tcp",
+			Explanation: "Port 37777 is universally allocated to Dahua NetSDK TCP binary protocol.",
 		})
-		totalConfidence += 20
+		totalConfidence += weight
+		corroborations = append(corroborations, fmt.Sprintf("Dahua Port 37777 (+%d%%)", weight))
 		if result.ProbableManufacturer == "" {
 			result.ProbableManufacturer = string(models.VendorDahua)
 		}
 	}
 	if hasXM {
+		weight := 15
 		result.EvidenceSources = append(result.EvidenceSources, EvidenceItem{
 			Category:    "PORT_SIGNATURE",
-			Description: "Port 34567 (Xiongmai / XM Xiongmai protocol) open",
-			Weight:      15,
+			Description: "Port 34567/tcp (Xiongmai XM protocol port) open",
+			Weight:      weight,
 			Value:       "34567/tcp",
+			Explanation: "Port 34567 indicates Xiongmai (XM) hardware chipset / firmware OEM base.",
 		})
-		totalConfidence += 15
+		totalConfidence += weight
+		corroborations = append(corroborations, fmt.Sprintf("Xiongmai Port 34567 (+%d%%)", weight))
+		if result.ProbableManufacturer == "" {
+			result.ProbableManufacturer = "Xiongmai (XM OEM Base)"
+		}
 	}
 
 	// Cap confidence at 100%
@@ -473,6 +583,9 @@ func AnalyzeFingerprint(
 		result.ConfidenceLevel = "LOW"
 	}
 
+	result.ConfidenceExplanation = fmt.Sprintf("Confidence: %d%% (%s) [Corroborated by: %s]",
+		result.Confidence, result.ConfidenceLevel, strings.Join(corroborations, ", "))
+
 	// Reconcile Identified vs Probable Manufacturer
 	if result.IdentifiedManufacturer == "" {
 		if result.ProbableManufacturer != "" {
@@ -483,9 +596,10 @@ func AnalyzeFingerprint(
 		}
 	}
 
-	// Default model if unestablished
+	// RULE: Never infer a specific model from an OUI alone!
+	// If model was not established by ONVIF or explicit probe, mark Unknown
 	if result.Model == "" {
-		result.Model = "Standard Streamer"
+		result.Model = "Unknown"
 		result.UnknownFields = append(result.UnknownFields, "model")
 	}
 	if result.Firmware == "" {

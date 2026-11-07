@@ -219,3 +219,134 @@ func TestStoreMigrationsAndRollback(t *testing.T) {
 		t.Errorf("expected schema version 1 after rollback, got %d", s.SchemaVersion)
 	}
 }
+
+func TestInventoryIntegrity_ChangedIPAndDowngradeProtection(t *testing.T) {
+	tmpDir := t.TempDir()
+	storeFile := filepath.Join(tmpDir, "test_integrity_store.json")
+
+	vault, err := security.NewVault(tmpDir)
+	if err != nil {
+		t.Fatalf("failed to init vault: %v", err)
+	}
+
+	store := NewStoreWithVault(storeFile, vault)
+
+	// Step 1: Enroll a verified physical device with credentials, serial number, and firmware
+	origDev := models.Device{
+		ID:           "dev-initial",
+		Name:         "Entrance PTZ Camera",
+		IP:           "192.168.1.50",
+		MAC:          "bc:54:51:aa:bb:cc",
+		Manufacturer: models.VendorHikvision,
+		Model:        "DS-2DE4225IW-DE",
+		Category:     models.CategoryPTZCamera,
+		Firmware:     "V5.6.14_build200428",
+		SerialNumber: "DS-2DE4225IW-DE20200428AAWR123456789",
+		Username:     "admin",
+		Password:     "OperatorPass@123",
+		Port:         80,
+		RTSPPort:     554,
+		ONVIFPort:    80,
+		LastSeen:     time.Now().UTC(),
+	}
+	store.UpsertDevice(origDev)
+
+	// Verify original enrollment
+	retrieved, found := store.GetDeviceDecrypted("dev-initial")
+	if !found {
+		t.Fatalf("origDev not found in store")
+	}
+	if retrieved.Password != "OperatorPass@123" {
+		t.Errorf("expected password OperatorPass@123, got %q", retrieved.Password)
+	}
+
+	// Step 2: A subsequent discovery scan runs on a changed subnet IP (DHCP renewal from .50 to .75)
+	// The raw discovery probe detects port 80 only: it has EMPTY password, EMPTY serial, and generic manufacturer
+	discoveryProbeDev := models.Device{
+		ID:           "dev-192-168-1-75",
+		Name:         "Generic ONVIF Unit (192.168.1.75)",
+		IP:           "192.168.1.75",     // Changed IP address!
+		MAC:          "bc:54:51:aa:bb:cc", // Same hardware MAC address!
+		Manufacturer: models.VendorGeneric, // Weaker discovery evidence!
+		Model:        "Unknown",
+		Category:     models.CategoryIPCamera,
+		Firmware:     "", // Empty firmware from raw port scan
+		SerialNumber: "", // Empty serial from raw port scan
+		Username:     "", // Empty username
+		Password:     "", // Empty password
+		Port:         80,
+		LastSeen:     time.Now().UTC(),
+	}
+
+	updated := store.UpsertDiscoveredDevice(discoveryProbeDev, 30)
+
+	// Step 3: Verify Integrity & Preservation Invariants:
+	// 1. IP address must be updated to 192.168.1.75
+	if updated.IP != "192.168.1.75" {
+		t.Errorf("Expected IP to be updated to 192.168.1.75, got %s", updated.IP)
+	}
+
+	// 2. Previously authenticated credentials MUST be preserved
+	decUpdated, _ := store.GetDeviceDecrypted(updated.ID)
+	if decUpdated.Username != "admin" || decUpdated.Password != "OperatorPass@123" {
+		t.Errorf("Authenticated credentials were lost/overwritten! Got username=%q, password=%q",
+			decUpdated.Username, decUpdated.Password)
+	}
+
+	// 3. Verified Serial Number MUST be preserved (not cleared)
+	if updated.SerialNumber != "DS-2DE4225IW-DE20200428AAWR123456789" {
+		t.Errorf("Verified serial number was downgraded! Got %s", updated.SerialNumber)
+	}
+
+	// 4. Verified Firmware MUST be preserved
+	if updated.Firmware != "V5.6.14_build200428" {
+		t.Errorf("Verified firmware was downgraded! Got %s", updated.Firmware)
+	}
+
+	// 5. Verified Manufacturer & Model MUST NOT be downgraded to Generic ONVIF
+	if updated.Manufacturer != models.VendorHikvision || updated.Model != "DS-2DE4225IW-DE" {
+		t.Errorf("Verified manufacturer/model downgraded to generic! Got %s %s", updated.Manufacturer, updated.Model)
+	}
+}
+
+func TestConcurrentDiscoveryUpserts(t *testing.T) {
+	tmpDir := t.TempDir()
+	storeFile := filepath.Join(tmpDir, "test_concurrent_disc.json")
+	vault, err := security.NewVault(tmpDir)
+	if err != nil {
+		t.Fatalf("failed to init vault: %v", err)
+	}
+	store := NewStoreWithVault(storeFile, vault)
+
+	const numJobs = 10
+	const devicesPerJob = 20
+	var wg sync.WaitGroup
+
+	// Run concurrent discovery jobs writing to the inventory
+	for j := 0; j < numJobs; j++ {
+		wg.Add(1)
+		go func(jobIdx int) {
+			defer wg.Done()
+			for d := 0; d < devicesPerJob; d++ {
+				dev := models.Device{
+					ID:           fmt.Sprintf("disc-dev-%d-%d", jobIdx, d),
+					IP:           fmt.Sprintf("192.168.%d.%d", jobIdx+1, d+1),
+					MAC:          fmt.Sprintf("bc:54:51:%02x:%02x:00", jobIdx, d),
+					Manufacturer: models.VendorHikvision,
+					Model:        "DS-2CD2042WD-I",
+					Category:     models.CategoryIPCamera,
+					Port:         80,
+				}
+				store.UpsertDiscoveredDevice(dev, 85)
+			}
+		}(j)
+	}
+
+	wg.Wait()
+
+	devs := store.ListDevices()
+	expectedCount := numJobs * devicesPerJob
+	if len(devs) != expectedCount {
+		t.Errorf("Expected %d devices in store, got %d", expectedCount, len(devs))
+	}
+}

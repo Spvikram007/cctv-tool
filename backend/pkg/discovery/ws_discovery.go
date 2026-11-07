@@ -11,11 +11,12 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
-	WSDiscoveryMulticastIPv4 = "239.255.255.250:3702"
+	WSDiscoveryMulticastIPv4  = "239.255.255.250:3702"
 	DefaultWSDiscoveryTimeout = 3 * time.Second
 )
 
@@ -94,7 +95,6 @@ func ParseProbeMatches(data []byte) ([]WSProbeMatch, error) {
 			if err == io.EOF {
 				break
 			}
-			// Tolerant XML parser: If error before reading matches, return what we have or error if none
 			if len(matches) > 0 {
 				return matches, nil
 			}
@@ -177,8 +177,6 @@ func parseProbeMatchRaw(raw struct {
 
 // parseScopeItem extracts hardware model, manufacturer and name from an ONVIF scope URL
 func parseScopeItem(scope string, match *WSProbeMatch) {
-	// Standard ONVIF scope prefix: onvif://www.onvif.org/
-	// Scopes can be URL encoded, e.g. onvif://www.onvif.org/name/Hikvision%20DS-2CD...
 	decoded, err := url.QueryUnescape(scope)
 	if err != nil {
 		decoded = scope
@@ -201,9 +199,13 @@ func parseScopeItem(scope string, match *WSProbeMatch) {
 		if len(parts) == 2 {
 			match.HardwareProfile = strings.TrimSpace(parts[1])
 		}
+	} else if strings.Contains(lower, "onvif://www.onvif.org/manufacturer/") {
+		parts := strings.SplitN(decoded, "manufacturer/", 2)
+		if len(parts) == 2 && match.Manufacturer == "" {
+			match.Manufacturer = strings.TrimSpace(parts[1])
+		}
 	}
 
-	// Check for known vendor names in scopes
 	vendors := []struct {
 		substr string
 		vendor string
@@ -227,9 +229,27 @@ func parseScopeItem(scope string, match *WSProbeMatch) {
 			match.Manufacturer = v.vendor
 		}
 	}
+
+	// Corroborate vendor from model prefix if scope vendor was unestablished
+	if match.Manufacturer == "" || match.Manufacturer == "Generic ONVIF" {
+		modelUpper := strings.ToUpper(match.Model)
+		if strings.HasPrefix(modelUpper, "DH-") || strings.HasPrefix(modelUpper, "DHI-") {
+			match.Manufacturer = "Dahua"
+		} else if strings.HasPrefix(modelUpper, "CP-") || strings.HasPrefix(modelUpper, "CP ") {
+			match.Manufacturer = "CP PLUS"
+		} else if strings.HasPrefix(modelUpper, "DS-") || strings.HasPrefix(modelUpper, "HIK") {
+			match.Manufacturer = "Hikvision"
+		}
+	}
+}
+
+type ifaceTarget struct {
+	iface *net.Interface
+	ip    net.IP
 }
 
 // ProbeONVIF sends WS-Discovery probes to the network and collects responses
+// Executes interface probing in parallel with guaranteed socket cleanup and deadline cancellation
 func ProbeONVIF(ctx context.Context, opts WSDiscoveryOptions) ([]WSProbeMatch, error) {
 	timeout := opts.Timeout
 	if timeout <= 0 {
@@ -244,8 +264,8 @@ func ProbeONVIF(ctx context.Context, opts WSDiscoveryOptions) ([]WSProbeMatch, e
 		return nil, fmt.Errorf("failed to resolve WS-Discovery multicast address: %w", err)
 	}
 
-	// Determine source interfaces/local IPs to probe from
-	localAddrs := make([]*net.UDPAddr, 0)
+	// Determine source interfaces and IPs to probe from
+	targets := make([]ifaceTarget, 0)
 
 	if opts.InterfaceName != "" {
 		iface, err := net.InterfaceByName(opts.InterfaceName)
@@ -255,7 +275,7 @@ func ProbeONVIF(ctx context.Context, opts WSDiscoveryOptions) ([]WSProbeMatch, e
 				for _, a := range addrs {
 					if ipnet, ok := a.(*net.IPNet); ok {
 						if ip4 := ipnet.IP.To4(); ip4 != nil && !ip4.IsLoopback() {
-							localAddrs = append(localAddrs, &net.UDPAddr{IP: ip4, Port: 0})
+							targets = append(targets, ifaceTarget{iface: iface, ip: ip4})
 						}
 					}
 				}
@@ -263,10 +283,11 @@ func ProbeONVIF(ctx context.Context, opts WSDiscoveryOptions) ([]WSProbeMatch, e
 		}
 	}
 
-	// If no interface selected or specified interface had no valid IPv4, probe from all active non-loopback interfaces
-	if len(localAddrs) == 0 {
+	// If no interface selected or specified interface had no valid IPv4, discover across all active multicast-capable UP interfaces
+	if len(targets) == 0 {
 		ifaces, _ := net.Interfaces()
-		for _, iface := range ifaces {
+		for i := range ifaces {
+			iface := &ifaces[i]
 			if (iface.Flags&net.FlagUp) != 0 && (iface.Flags&net.FlagMulticast) != 0 {
 				addrs, err := iface.Addrs()
 				if err != nil {
@@ -275,7 +296,7 @@ func ProbeONVIF(ctx context.Context, opts WSDiscoveryOptions) ([]WSProbeMatch, e
 				for _, a := range addrs {
 					if ipnet, ok := a.(*net.IPNet); ok {
 						if ip4 := ipnet.IP.To4(); ip4 != nil && !ip4.IsLoopback() {
-							localAddrs = append(localAddrs, &net.UDPAddr{IP: ip4, Port: 0})
+							targets = append(targets, ifaceTarget{iface: iface, ip: ip4})
 						}
 					}
 				}
@@ -284,40 +305,50 @@ func ProbeONVIF(ctx context.Context, opts WSDiscoveryOptions) ([]WSProbeMatch, e
 	}
 
 	// Fallback to default wild-card 0.0.0.0:0 if no specific local address found
-	if len(localAddrs) == 0 {
-		localAddrs = append(localAddrs, &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	if len(targets) == 0 {
+		targets = append(targets, ifaceTarget{iface: nil, ip: net.IPv4zero})
 	}
 
 	messageID := GenerateMessageID()
 	probeMsg := BuildProbeMessage(messageID)
 
+	var mu sync.Mutex
 	matchMap := make(map[string]WSProbeMatch)
+	var wg sync.WaitGroup
 
-	for _, localAddr := range localAddrs {
-		select {
-		case <-probeCtx.Done():
-			break
-		default:
-		}
+	deadline, ok := probeCtx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(timeout)
+	}
 
-		conn, err := net.ListenUDP("udp4", localAddr)
-		if err != nil {
-			// Permission or socket error on this interface, continue to next
-			continue
-		}
+	// Probe all target interfaces in parallel
+	for _, target := range targets {
+		wg.Add(1)
+		go func(tgt ifaceTarget) {
+			defer wg.Done()
 
-		// Ensure socket is closed when done with this interface
-		func() {
+			localAddr := &net.UDPAddr{IP: tgt.ip, Port: 0}
+			conn, err := net.ListenUDP("udp4", localAddr)
+			if err != nil {
+				return
+			}
 			defer conn.Close()
 
-			// Set read deadline based on remaining context timeout
-			deadline, ok := probeCtx.Deadline()
-			if !ok {
-				deadline = time.Now().Add(timeout)
-			}
 			_ = conn.SetDeadline(deadline)
 
-			// Send probe multicast
+			// Immediate unblock on context cancellation
+			stopCh := make(chan struct{})
+			go func() {
+				select {
+				case <-probeCtx.Done():
+					_ = conn.SetDeadline(time.Now())
+					_ = conn.Close()
+				case <-stopCh:
+				}
+			}()
+			defer close(stopCh)
+
+			// Transmit probe multicast envelope
 			_, err = conn.WriteToUDP(probeMsg, multicastDst)
 			if err != nil {
 				return
@@ -334,13 +365,13 @@ func ProbeONVIF(ctx context.Context, opts WSDiscoveryOptions) ([]WSProbeMatch, e
 
 				n, remoteAddr, err := conn.ReadFrom(buf)
 				if err != nil {
-					// Read timeout reached or context expired
 					return
 				}
 
 				if n > 0 {
 					matches, parseErr := ParseProbeMatches(buf[:n])
 					if parseErr == nil {
+						mu.Lock()
 						for _, m := range matches {
 							if m.IP == "" && remoteAddr != nil {
 								if udpAddr, ok := remoteAddr.(*net.UDPAddr); ok {
@@ -355,11 +386,15 @@ func ProbeONVIF(ctx context.Context, opts WSDiscoveryOptions) ([]WSProbeMatch, e
 								matchMap[dedupKey] = m
 							}
 						}
+						mu.Unlock()
 					}
 				}
 			}
-		}()
+		}(target)
 	}
+
+	// Wait for all interface listeners to terminate cleanly
+	wg.Wait()
 
 	result := make([]WSProbeMatch, 0, len(matchMap))
 	for _, m := range matchMap {

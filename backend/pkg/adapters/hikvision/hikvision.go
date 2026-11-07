@@ -77,6 +77,11 @@ func (h *HikvisionAdapter) Detect(targetIP string, port int, username, password 
 	fw := extractTag(xmlResp, "firmwareVersion")
 	devType := extractTag(xmlResp, "deviceType")
 
+	// Strict verification: must contain genuine Hikvision deviceInfo elements
+	if model == "" && serial == "" && fw == "" && !strings.Contains(xmlResp, "deviceInfo") {
+		return nil, fmt.Errorf("response did not contain valid Hikvision ISAPI deviceInfo elements")
+	}
+
 	category := models.CategoryIPCamera
 	channelCount := 1
 	if strings.Contains(strings.ToLower(model), "720") || strings.Contains(strings.ToLower(devType), "dvr") || strings.Contains(strings.ToLower(devType), "xvr") {

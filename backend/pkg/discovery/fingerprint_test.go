@@ -1,6 +1,7 @@
 package discovery
 
 import (
+	"strings"
 	"testing"
 
 	"cctv-sentinel/pkg/models"
@@ -32,10 +33,130 @@ func TestLookupMACFromOUI(t *testing.T) {
 	}
 }
 
+func TestLocallyAdministeredMAC(t *testing.T) {
+	// Locally administered MACs have bit 1 of the first octet set (e.g. 02:xx, 06:xx, 0a:xx, 0e:xx, 12:xx...)
+	localMACs := []string{
+		"02:00:00:00:00:01",
+		"06:11:22:33:44:55",
+		"0a:bb:cc:dd:ee:ff",
+		"12:34:56:78:9a:bc",
+		"ee:50:8b:11:22:33",
+	}
+
+	for _, mac := range localMACs {
+		if !IsLocallyAdministeredMAC(mac) {
+			t.Errorf("Expected MAC %s to be recognized as locally administered", mac)
+		}
+		_, found := LookupMACFromOUI(mac)
+		if found {
+			t.Errorf("Locally administered MAC %s must NOT resolve to a vendor OUI!", mac)
+		}
+	}
+
+	// Globally unique physical MACs
+	globalMACs := []string{
+		"bc:54:51:11:22:33", // Hikvision (0xbc = 10111100, bit 1 is 0)
+		"38:af:29:11:22:33", // Dahua (0x38 = 00111000, bit 1 is 0)
+		"f0:c8:50:11:22:33", // CP PLUS (0xf0 = 11110000, bit 1 is 0)
+	}
+
+	for _, mac := range globalMACs {
+		if IsLocallyAdministeredMAC(mac) {
+			t.Errorf("Physical MAC %s must NOT be flagged as locally administered", mac)
+		}
+	}
+
+	// Verify that locally administered MAC gets 0 weight in fingerprinting
+	fp := AnalyzeFingerprint("192.168.1.99", "02:11:22:33:44:55", []int{80}, nil, DeviceServices{}, "TCP_SWEEP")
+	for _, ev := range fp.EvidenceSources {
+		if ev.Category == "MAC_OUI" {
+			if ev.Weight != 0 {
+				t.Errorf("Locally administered MAC should get 0 weight, got %d", ev.Weight)
+			}
+			if !strings.Contains(ev.Description, "Locally Administered") {
+				t.Errorf("Expected Locally Administered explanation, got %s", ev.Description)
+			}
+		}
+	}
+}
+
+func TestNeverInferModelFromOUIAlone(t *testing.T) {
+	// A MAC OUI alone must NEVER infer a specific model
+	res := AnalyzeFingerprint("192.168.1.50", "bc:54:51:11:22:33", []int{80}, nil, DeviceServices{}, "TCP_SWEEP")
+
+	if res.Model != "Unknown" {
+		t.Errorf("Model must remain 'Unknown' when only OUI is available! Got: %s", res.Model)
+	}
+
+	foundModelUnknown := false
+	for _, f := range res.UnknownFields {
+		if f == "model" {
+			foundModelUnknown = true
+			break
+		}
+	}
+	if !foundModelUnknown {
+		t.Errorf("Expected 'model' in UnknownFields list")
+	}
+
+	if res.Confidence > 30 {
+		t.Errorf("OUI alone must stay <= 30%% confidence, got %d", res.Confidence)
+	}
+	if res.ConfidenceLevel != "LOW" {
+		t.Errorf("Expected LOW confidence level for OUI alone, got %s", res.ConfidenceLevel)
+	}
+}
+
+func TestAvoidDoubleCountingCorrelatedEvidence(t *testing.T) {
+	// Probing device with both HTTP Server and WWW-Authenticate pointing to Hikvision
+	services := DeviceServices{
+		HTTPServer:     "Hikvision-Webs",
+		HTTPAuthHeader: "Digest realm=\"Hikvision-DS2CD\"",
+	}
+
+	fp := AnalyzeFingerprint("192.168.1.64", "", []int{80}, nil, services, "TCP_SWEEP")
+
+	// Verify that HTTP evidence is counted as a single consolidated proof
+	httpEvidenceCount := 0
+	for _, ev := range fp.EvidenceSources {
+		if ev.Category == "HTTP_BANNER" {
+			httpEvidenceCount++
+			if ev.Weight > 20 {
+				t.Errorf("HTTP evidence should be capped at 20, got %d", ev.Weight)
+			}
+		}
+	}
+	if httpEvidenceCount != 1 {
+		t.Errorf("Expected exactly 1 consolidated HTTP evidence item, got %d", httpEvidenceCount)
+	}
+
+	if fp.ConfidenceExplanation == "" {
+		t.Errorf("Expected non-empty ConfidenceExplanation")
+	}
+}
+
+func TestOEMRecognition(t *testing.T) {
+	// Port 34567 is Xiongmai (XM) NetSDK port
+	fp := AnalyzeFingerprint("192.168.1.80", "", []int{80, 34567}, nil, DeviceServices{}, "TCP_SWEEP")
+
+	foundXM := false
+	for _, ev := range fp.EvidenceSources {
+		if ev.Category == "PORT_SIGNATURE" && strings.Contains(ev.Description, "34567") {
+			foundXM = true
+		}
+	}
+	if !foundXM {
+		t.Errorf("Expected XM port 34567 evidence signature")
+	}
+	if !strings.Contains(fp.ProbableManufacturer, "Xiongmai") {
+		t.Errorf("Expected Xiongmai OEM probable manufacturer, got %s", fp.ProbableManufacturer)
+	}
+}
+
 func TestAnalyzeFingerprint_ConfidenceLevels(t *testing.T) {
 	// Case 1: MAC alone should NOT yield 100% confidence
 	res1 := AnalyzeFingerprint("192.168.1.50", "bc:54:51:11:22:33", []int{80}, nil, DeviceServices{}, "TCP_SWEEP")
-	if res1.Confidence > 40 {
+	if res1.Confidence > 35 {
 		t.Errorf("MAC alone must not yield high confidence! Got: %d", res1.Confidence)
 	}
 	if res1.ConfidenceLevel != "LOW" {
@@ -54,8 +175,8 @@ func TestAnalyzeFingerprint_ConfidenceLevels(t *testing.T) {
 		},
 		"TCP_SWEEP",
 	)
-	if res2.Confidence < 75 {
-		t.Errorf("Expected >=75%% confidence with banner + RTSP + port, got %d", res2.Confidence)
+	if res2.Confidence < 70 {
+		t.Errorf("Expected >=70%% confidence with banner + RTSP + port, got %d", res2.Confidence)
 	}
 	if res2.IdentifiedManufacturer != models.VendorHikvision {
 		t.Errorf("Expected Hikvision, got %s", res2.IdentifiedManufacturer)
@@ -78,7 +199,7 @@ func TestAnalyzeFingerprint_ConfidenceLevels(t *testing.T) {
 		},
 		"ONVIF",
 	)
-	if res3.Confidence < 85 {
+	if res3.Confidence < 75 {
 		t.Errorf("Expected high confidence for ONVIF + RTSP, got %d", res3.Confidence)
 	}
 	if res3.ConfidenceLevel != "HIGH" {

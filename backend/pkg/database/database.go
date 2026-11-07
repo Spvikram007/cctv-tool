@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -240,6 +241,131 @@ func (s *Store) GetDevice(id string) (models.Device, bool) {
 	defer s.mu.RUnlock()
 	dev, ok := s.Devices[id]
 	return dev, ok
+}
+
+// FindDeviceByMAC locates an enrolled device by hardware MAC address
+func (s *Store) FindDeviceByMAC(mac string) (models.Device, bool) {
+	if mac == "" {
+		return models.Device{}, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	cleanMAC := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(mac, "-", ":"), ".", ":"))
+	for _, dev := range s.Devices {
+		if strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(dev.MAC, "-", ":"), ".", ":")) == cleanMAC {
+			return dev, true
+		}
+	}
+	return models.Device{}, false
+}
+
+// FindDeviceByIP locates an enrolled device by current IP address
+func (s *Store) FindDeviceByIP(ip string) (models.Device, bool) {
+	if ip == "" {
+		return models.Device{}, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, dev := range s.Devices {
+		if dev.IP == ip {
+			return dev, true
+		}
+	}
+	return models.Device{}, false
+}
+
+// UpsertDiscoveredDevice registers discovery results with strict preservation guarantees
+func (s *Store) UpsertDiscoveredDevice(dev models.Device, discoveryConfidence int) models.Device {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var existingKey string
+	var existing models.Device
+	var foundExisting bool
+
+	// 1. Check by ID
+	if d, ok := s.Devices[dev.ID]; ok {
+		existingKey = dev.ID
+		existing = d
+		foundExisting = true
+	}
+
+	// 2. Check by unique MAC (ignore generic / zero / locally administered)
+	if !foundExisting && dev.MAC != "" && dev.MAC != "00:00:00:00:00:00" {
+		cleanMAC := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(dev.MAC, "-", ":"), ".", ":"))
+		for k, d := range s.Devices {
+			if strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(d.MAC, "-", ":"), ".", ":")) == cleanMAC {
+				existingKey = k
+				existing = d
+				foundExisting = true
+				break
+			}
+		}
+	}
+
+	// 3. Check by IP
+	if !foundExisting && dev.IP != "" {
+		for k, d := range s.Devices {
+			if d.IP == dev.IP {
+				existingKey = k
+				existing = d
+				foundExisting = true
+				break
+			}
+		}
+	}
+
+	targetDev := dev
+	if foundExisting {
+		targetDev.ID = existingKey
+
+		// PRESERVATION RULE 1: Never overwrite authenticated credentials
+		if targetDev.Username == "" && existing.Username != "" {
+			targetDev.Username = existing.Username
+			targetDev.Password = existing.Password
+		}
+		// PRESERVATION RULE 2: Never overwrite verified SerialNumber with empty discovery data
+		if existing.SerialNumber != "" && (targetDev.SerialNumber == "" || strings.HasPrefix(targetDev.SerialNumber, "urn:")) {
+			targetDev.SerialNumber = existing.SerialNumber
+		}
+		// PRESERVATION RULE 3: Never overwrite verified Firmware with empty discovery data
+		if existing.Firmware != "" && targetDev.Firmware == "" {
+			targetDev.Firmware = existing.Firmware
+		}
+		// PRESERVATION RULE 4: Weaker discovery evidence must not downgrade verified manufacturer/model
+		if existing.Manufacturer != models.VendorGeneric && targetDev.Manufacturer == models.VendorGeneric {
+			targetDev.Manufacturer = existing.Manufacturer
+			targetDev.Model = existing.Model
+			targetDev.Category = existing.Category
+		}
+		// PRESERVATION RULE 5: Handle changed IP address (DHCP renewal)
+		if existing.IP != dev.IP && dev.IP != "" {
+			targetDev.IP = dev.IP
+			targetDev.Port = dev.Port
+		}
+		// Preserve SiteID if previously assigned
+		if existing.SiteID != "" && targetDev.SiteID == "" {
+			targetDev.SiteID = existing.SiteID
+		}
+	}
+
+	if targetDev.LastSeen.IsZero() {
+		targetDev.LastSeen = time.Now().UTC()
+	}
+
+	// Encrypt credentials if newly provided
+	if targetDev.Password != "" && s.vault != nil {
+		if enc, err := s.vault.Encrypt(targetDev.Password); err == nil {
+			s.EncryptedCredentials[targetDev.ID] = enc
+			targetDev.Password = enc
+		}
+	} else if existingEnc, ok := s.EncryptedCredentials[targetDev.ID]; ok {
+		targetDev.Password = existingEnc
+	}
+
+	s.Devices[targetDev.ID] = targetDev
+	_ = s.saveLocked()
+	return targetDev
 }
 
 // GetDeviceDecrypted returns device with password decrypted via vault for authorized protocol adapters

@@ -97,3 +97,4 @@ func FindInterfaceByName(name string) (*net.Interface, error) {
 	}
 	return net.InterfaceByName(name)
 }
+

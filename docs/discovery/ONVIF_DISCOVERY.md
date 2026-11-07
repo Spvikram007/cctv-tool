@@ -116,3 +116,4 @@ Space-delimited URI strings indicating hardware profile, manufacturer, and model
 3. **Socket Lifecycle & Goroutine Leak Prevention**:
    - All network sockets are closed via `defer conn.Close()` upon context cancellation or timeout.
    - Context timeouts default to 3 seconds, ensuring no hanging routines.
+

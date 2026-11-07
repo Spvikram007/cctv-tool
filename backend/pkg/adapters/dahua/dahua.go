@@ -86,8 +86,9 @@ func (d *DahuaAdapter) Detect(targetIP string, port int, username, password stri
 	serial := kv["serialNumber"]
 	version := kv["appVersion"]
 
-	if devType == "" {
-		devType = "DH-IPC-HFW2431S"
+	// Strict verification: must contain at least one valid Dahua system info key
+	if devType == "" && serial == "" && version == "" {
+		return nil, fmt.Errorf("response did not contain valid Dahua CGI deviceType/serialNumber/appVersion")
 	}
 
 	cat := models.CategoryIPCamera

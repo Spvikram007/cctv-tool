@@ -611,22 +611,7 @@ func (s *Server) handleStartDiscovery(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			for _, res := range j.Results {
-				existing, exists := s.store.GetDevice(res.Device.ID)
-				devToSave := res.Device
-				if exists {
-					// PRESERVATION RULE: Never overwrite authenticated credentials or verified fields
-					if devToSave.Username == "" && existing.Username != "" {
-						devToSave.Username = existing.Username
-						devToSave.Password = existing.Password
-					}
-					if existing.SerialNumber != "" && devToSave.SerialNumber == "" {
-						devToSave.SerialNumber = existing.SerialNumber
-					}
-					if existing.Firmware != "" && devToSave.Firmware == "" {
-						devToSave.Firmware = existing.Firmware
-					}
-				}
-				s.store.UpsertDevice(devToSave)
+				s.store.UpsertDiscoveredDevice(res.Device, res.Fingerprint.Confidence)
 			}
 			if j.Status == discovery.JobStatusCompleted || j.Status == discovery.JobStatusCancelled || j.Status == discovery.JobStatusFailed {
 				return

@@ -141,3 +141,4 @@ PASS
 In strict accordance with project safety guidelines:
 1. **Current Certified Status**: Protocol compliance, SOAP Probe parsing, multi-interface selection, port scanning, evidence weighting, job lifecycle, and cancellation are certified in automated testing and against active local simulators.
 2. **Physical Hardware Status**: Physical hardware validation is **PENDING BENCH EXECUTION**. The test runbook is published in `docs/discovery/PHYSICAL_TEST_PROCEDURE.md`. No claims of physical device certification are made until tested on physical hardware.
+
