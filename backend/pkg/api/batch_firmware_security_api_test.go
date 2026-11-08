@@ -63,6 +63,12 @@ func TestPhase5BatchFirmwareSecurityAPIE2E(t *testing.T) {
 
 	client := &http.Client{Timeout: 5 * time.Second}
 
+	// 0. Complete initial first-run setup
+	setupToken := rbacMgr.GetSetupToken()
+	if err := rbacMgr.CompleteSetup(setupToken, "admin", "Admin@Sentinel2026!", "Administrator", "admin@sentinel.internal"); err != nil {
+		t.Fatalf("failed to complete setup: %v", err)
+	}
+
 	// 1. Test Security Login (RBAC)
 	loginReq := map[string]string{
 		"username": "admin",
@@ -84,8 +90,27 @@ func TestPhase5BatchFirmwareSecurityAPIE2E(t *testing.T) {
 		t.Fatalf("expected login success, got %+v", loginResp)
 	}
 
+	sessMap, ok := loginResp["session"].(map[string]interface{})
+	if !ok || sessMap["token"] == nil {
+		t.Fatalf("expected session token in login response: %+v", loginResp)
+	}
+	token := sessMap["token"].(string)
+
+	authReq := func(method, urlStr string, body []byte) *http.Request {
+		var r *http.Request
+		if len(body) > 0 {
+			r, _ = http.NewRequest(method, urlStr, bytes.NewReader(body))
+			r.Header.Set("Content-Type", "application/json")
+		} else {
+			r, _ = http.NewRequest(method, urlStr, nil)
+		}
+		r.Header.Set("Authorization", "Bearer "+token)
+		return r
+	}
+
 	// 2. Test Vault Status
-	vaultResp, err := client.Get(ts.URL + "/api/v1/security/vault/status")
+	vaultReq := authReq("GET", ts.URL+"/api/v1/security/vault/status", nil)
+	vaultResp, err := client.Do(vaultReq)
 	if err != nil || vaultResp.StatusCode != http.StatusOK {
 		t.Fatalf("vault status endpoint failed")
 	}
@@ -97,7 +122,8 @@ func TestPhase5BatchFirmwareSecurityAPIE2E(t *testing.T) {
 	}
 
 	// 3. Test Audit Hash Chain Integrity Verification
-	auditResp, err := client.Get(ts.URL + "/api/v1/audit/verify")
+	auditReq := authReq("GET", ts.URL+"/api/v1/audit/verify", nil)
+	auditResp, err := client.Do(auditReq)
 	if err != nil || auditResp.StatusCode != http.StatusOK {
 		t.Fatalf("audit verify endpoint failed")
 	}
@@ -115,7 +141,8 @@ func TestPhase5BatchFirmwareSecurityAPIE2E(t *testing.T) {
 		"operator":   "Admin",
 	}
 	b, _ = json.Marshal(previewReq)
-	prevResp, err := client.Post(ts.URL+"/api/v1/batch/preview", "application/json", bytes.NewReader(b))
+	prevReq := authReq("POST", ts.URL+"/api/v1/batch/preview", b)
+	prevResp, err := client.Do(prevReq)
 	if err != nil || prevResp.StatusCode != http.StatusOK {
 		t.Fatalf("batch preview failed: code %d, err %v", prevResp.StatusCode, err)
 	}
@@ -129,22 +156,24 @@ func TestPhase5BatchFirmwareSecurityAPIE2E(t *testing.T) {
 	}
 
 	// Execute batch job
-	execReq := map[string]interface{}{
+	execReqData := map[string]interface{}{
 		"preview_token": previewToken,
 		"job_name":      "Unit Test Fleet Check",
 		"concurrency":   2,
 		"rate_limit_ms": 10,
 		"operator":      "Admin",
 	}
-	b, _ = json.Marshal(execReq)
-	execResp, err := client.Post(ts.URL+"/api/v1/batch/execute", "application/json", bytes.NewReader(b))
+	b, _ = json.Marshal(execReqData)
+	execReq := authReq("POST", ts.URL+"/api/v1/batch/execute", b)
+	execResp, err := client.Do(execReq)
 	if err != nil || execResp.StatusCode != http.StatusAccepted {
 		t.Fatalf("batch execute failed: code %d, err %v", execResp.StatusCode, err)
 	}
 	execResp.Body.Close()
 
 	// 5. Test Firmware Inventory & Compatibility Check
-	fwInvResp, err := client.Get(ts.URL + "/api/v1/firmware/inventory")
+	fwReq := authReq("GET", ts.URL+"/api/v1/firmware/inventory", nil)
+	fwInvResp, err := client.Do(fwReq)
 	if err != nil || fwInvResp.StatusCode != http.StatusOK {
 		t.Fatalf("firmware inventory failed")
 	}
@@ -161,7 +190,8 @@ func TestPhase5BatchFirmwareSecurityAPIE2E(t *testing.T) {
 		"package_id": fwList[0]["id"].(string),
 	}
 	b, _ = json.Marshal(checkReq)
-	checkResp, err := client.Post(ts.URL+"/api/v1/firmware/check-compatibility", "application/json", bytes.NewReader(b))
+	chkReq := authReq("POST", ts.URL+"/api/v1/firmware/check-compatibility", b)
+	checkResp, err := client.Do(chkReq)
 	if err != nil || checkResp.StatusCode != http.StatusOK {
 		t.Fatalf("firmware compatibility check failed")
 	}

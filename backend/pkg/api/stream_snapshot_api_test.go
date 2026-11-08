@@ -18,6 +18,7 @@ import (
 	"cctv-sentinel/pkg/media/snapshot"
 	"cctv-sentinel/pkg/media/streamhub"
 	"cctv-sentinel/pkg/models"
+	"cctv-sentinel/pkg/security"
 	"cctv-sentinel/pkg/simulator"
 )
 
@@ -62,6 +63,19 @@ func TestStreamAndSnapshotAPIE2E(t *testing.T) {
 	store.UpsertDevice(dev)
 
 	client := &http.Client{Timeout: 5 * time.Second}
+	authToken := server.IssueSessionForTest(security.RoleAdmin, "default", "hq")
+
+	authReq := func(method, urlStr string, body []byte) *http.Request {
+		var r *http.Request
+		if len(body) > 0 {
+			r, _ = http.NewRequest(method, urlStr, bytes.NewReader(body))
+			r.Header.Set("Content-Type", "application/json")
+		} else {
+			r, _ = http.NewRequest(method, urlStr, nil)
+		}
+		r.Header.Set("Authorization", "Bearer "+authToken)
+		return r
+	}
 
 	// 2. Request scoped Stream Token: POST /api/v1/devices/{id}/stream/token
 	tokenReq := map[string]interface{}{
@@ -70,7 +84,7 @@ func TestStreamAndSnapshotAPIE2E(t *testing.T) {
 		"ttl_seconds": 3600,
 	}
 	reqBytes, _ := json.Marshal(tokenReq)
-	resp, err := client.Post(ts.URL+"/api/v1/devices/"+dev.ID+"/stream/token", "application/json", bytes.NewReader(reqBytes))
+	resp, err := client.Do(authReq("POST", ts.URL+"/api/v1/devices/"+dev.ID+"/stream/token", reqBytes))
 	if err != nil {
 		t.Fatalf("failed to request stream token: %v", err)
 	}
@@ -93,7 +107,7 @@ func TestStreamAndSnapshotAPIE2E(t *testing.T) {
 	}
 
 	// 3. Query stream stats: GET /api/v1/streams/{token}/stats
-	statsResp, err := client.Get(ts.URL + "/api/v1/streams/" + tokenResp.Token + "/stats")
+	statsResp, err := client.Do(authReq("GET", ts.URL+"/api/v1/streams/"+tokenResp.Token+"/stats", nil))
 	if err != nil {
 		t.Fatalf("failed to query stream stats: %v", err)
 	}
@@ -109,7 +123,7 @@ func TestStreamAndSnapshotAPIE2E(t *testing.T) {
 	}
 
 	// 4. Test Stream Diagnostics endpoint: GET /api/v1/devices/{id}/diagnostics/stream
-	diagResp, err := client.Get(ts.URL + "/api/v1/devices/" + dev.ID + "/diagnostics/stream")
+	diagResp, err := client.Do(authReq("GET", ts.URL+"/api/v1/devices/"+dev.ID+"/diagnostics/stream", nil))
 	if err != nil {
 		t.Fatalf("failed to run stream diagnostics: %v", err)
 	}
@@ -125,7 +139,7 @@ func TestStreamAndSnapshotAPIE2E(t *testing.T) {
 	}
 
 	// 5. Test Capacity Calculator endpoint: GET /api/v1/diagnostics/capacity
-	capResp, err := client.Get(ts.URL + "/api/v1/diagnostics/capacity?cameras=16&resolution=4K&codec=H.265&days=30&viewers=4")
+	capResp, err := client.Do(authReq("GET", ts.URL+"/api/v1/diagnostics/capacity?cameras=16&resolution=4K&codec=H.265&days=30&viewers=4", nil))
 	if err != nil {
 		t.Fatalf("failed to call capacity calculator: %v", err)
 	}

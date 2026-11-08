@@ -18,18 +18,26 @@ import {
 const BASE_URL = 'http://127.0.0.1:8080/api/v1';
 
 async function request<T>(endpoint: string, options?: RequestInit): Promise<T> {
+  const token = typeof window !== 'undefined' ? localStorage.getItem('sentinel_token') : null;
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...(options?.headers as Record<string, string>),
+  };
+  if (token && !headers['Authorization']) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+
   const res = await fetch(`${BASE_URL}${endpoint}`, {
     ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      ...options?.headers,
-    },
+    headers,
   });
   if (!res.ok) {
     let errMessage = 'Request failed';
     try {
       const errData = await res.json();
-      errMessage = errData.error || errData.message || res.statusText;
+      errMessage = (typeof errData.error === 'object' && errData.error?.message) 
+        ? errData.error.message 
+        : (errData.error || errData.message || res.statusText);
     } catch {
       errMessage = await res.text();
     }
@@ -190,14 +198,30 @@ export const api = {
     request<FirmwareUpdateJob>('/firmware/approve', { method: 'POST', body: JSON.stringify({ preview_token: previewToken, operator_confirmation: operatorConfirmation }) }),
   getFirmwareJob: (id: string) => request<FirmwareUpdateJob>(`/firmware/jobs/${id}`),
 
-  // Security, RBAC & Audit Integrity (Phase 5)
-  login: (username: string, password: string) =>
-    request<Session>('/security/login', { method: 'POST', body: JSON.stringify({ username, password }) }),
+  // Security, RBAC & Audit Integrity (Phase 5 & 6.1)
+  getSetupStatus: () => request<{ setup_required: boolean; users_count: number }>('/auth/setup/status'),
+  completeSetup: (payload: { setup_token: string; username: string; password: string; full_name?: string; email?: string }) =>
+    request<{ success: boolean; message: string; username: string }>('/auth/setup', { method: 'POST', body: JSON.stringify(payload) }),
+  login: async (username: string, password: string) => {
+    const res = await request<{ success: boolean; session: Session; permissions: string[] }>('/security/login', {
+      method: 'POST',
+      body: JSON.stringify({ username, password })
+    });
+    if (res && res.session?.token) {
+      localStorage.setItem('sentinel_token', res.session.token);
+    }
+    return res;
+  },
+  logout: () => {
+    localStorage.removeItem('sentinel_token');
+  },
   getUsers: () => request<UserAccount[]>('/security/users'),
   createUser: (user: { username: string; password: string; role: string; site_id?: string }) =>
     request<UserAccount>('/security/users', { method: 'POST', body: JSON.stringify(user) }),
   getVaultStatus: () => request<VaultStatus>('/security/vault'),
   verifyAuditChain: () => request<AuditChainVerification>('/audit/verify'),
+  rotateAuditKey: () => request<{ success: boolean; new_key_id: string }>('/audit/rotate-key', { method: 'POST' }),
+  getSignedAuditExportUrl: () => `${BASE_URL}/audit/export/signed`,
 
   // DVR / NVR / XVR Channel, Recording & Playback (Phase 6)
   getRecorders: () => request<Device[]>('/recorders'),

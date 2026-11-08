@@ -61,10 +61,23 @@ func setupPhase7TestServer(t *testing.T) (*Server, http.Handler) {
 }
 
 func TestPhase7PTZAPIE2E(t *testing.T) {
-	_, handler := setupPhase7TestServer(t)
+	srv, handler := setupPhase7TestServer(t)
+	token := srv.IssueSessionForTest(security.RoleAdmin, "default", "hq")
+
+	authReq := func(method, urlStr string, body *bytes.Buffer) *http.Request {
+		var r *http.Request
+		if body != nil {
+			r = httptest.NewRequest(method, urlStr, body)
+			r.Header.Set("Content-Type", "application/json")
+		} else {
+			r = httptest.NewRequest(method, urlStr, nil)
+		}
+		r.Header.Set("Authorization", "Bearer "+token)
+		return r
+	}
 
 	// 1. Check PTZ Capabilities on Vatilon H43 (Must be supported)
-	req := httptest.NewRequest("GET", "/api/v1/devices/dev-vatilon-h43/ptz/capabilities", nil)
+	req := authReq("GET", "/api/v1/devices/dev-vatilon-h43/ptz/capabilities", nil)
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 
@@ -81,7 +94,7 @@ func TestPhase7PTZAPIE2E(t *testing.T) {
 	}
 
 	// 2. Check PTZ Capabilities on Fixed Camera (Must NOT be supported)
-	reqFixed := httptest.NewRequest("GET", "/api/v1/devices/dev-hik-fixed/ptz/capabilities", nil)
+	reqFixed := authReq("GET", "/api/v1/devices/dev-hik-fixed/ptz/capabilities", nil)
 	wFixed := httptest.NewRecorder()
 	handler.ServeHTTP(wFixed, reqFixed)
 
@@ -96,8 +109,7 @@ func TestPhase7PTZAPIE2E(t *testing.T) {
 
 	// 3. Move Fixed Camera -> Must return 400 Bad Request
 	moveBody := bytes.NewBufferString(`{"movement_type":"CONTINUOUS","pan":0.5,"tilt":0,"speed":0.5}`)
-	reqMoveFixed := httptest.NewRequest("POST", "/api/v1/devices/dev-hik-fixed/ptz/move", moveBody)
-	reqMoveFixed.Header.Set("Content-Type", "application/json")
+	reqMoveFixed := authReq("POST", "/api/v1/devices/dev-hik-fixed/ptz/move", moveBody)
 	wMoveFixed := httptest.NewRecorder()
 	handler.ServeHTTP(wMoveFixed, reqMoveFixed)
 
@@ -107,8 +119,7 @@ func TestPhase7PTZAPIE2E(t *testing.T) {
 
 	// 4. Create and Goto Preset on Vatilon H43
 	presetBody := bytes.NewBufferString(`{"id":5,"name":"East Gate Observation"}`)
-	reqPreset := httptest.NewRequest("POST", "/api/v1/devices/dev-vatilon-h43/ptz/presets", presetBody)
-	reqPreset.Header.Set("Content-Type", "application/json")
+	reqPreset := authReq("POST", "/api/v1/devices/dev-vatilon-h43/ptz/presets", presetBody)
 	wPreset := httptest.NewRecorder()
 	handler.ServeHTTP(wPreset, reqPreset)
 
@@ -116,8 +127,7 @@ func TestPhase7PTZAPIE2E(t *testing.T) {
 		t.Fatalf("expected 200 OK creating preset, got %d (%s)", wPreset.Code, wPreset.Body.String())
 	}
 
-	reqGoto := httptest.NewRequest("POST", "/api/v1/devices/dev-vatilon-h43/ptz/presets/5/goto", bytes.NewBufferString(`{"speed":0.8}`))
-	reqGoto.Header.Set("Content-Type", "application/json")
+	reqGoto := authReq("POST", "/api/v1/devices/dev-vatilon-h43/ptz/presets/5/goto", bytes.NewBufferString(`{"speed":0.8}`))
 	wGoto := httptest.NewRecorder()
 	handler.ServeHTTP(wGoto, reqGoto)
 
@@ -126,7 +136,7 @@ func TestPhase7PTZAPIE2E(t *testing.T) {
 	}
 
 	// 5. Test Stop Command
-	reqStop := httptest.NewRequest("POST", "/api/v1/devices/dev-vatilon-h43/ptz/stop", nil)
+	reqStop := authReq("POST", "/api/v1/devices/dev-vatilon-h43/ptz/stop", nil)
 	wStop := httptest.NewRecorder()
 	handler.ServeHTTP(wStop, reqStop)
 	if wStop.Code != http.StatusOK {
@@ -136,11 +146,23 @@ func TestPhase7PTZAPIE2E(t *testing.T) {
 
 func TestPhase7EventsAndAlarmsAPIE2E(t *testing.T) {
 	srv, handler := setupPhase7TestServer(t)
+	token := srv.IssueSessionForTest(security.RoleAdmin, "default", "hq")
+
+	authReq := func(method, urlStr string, body *bytes.Buffer) *http.Request {
+		var r *http.Request
+		if body != nil {
+			r = httptest.NewRequest(method, urlStr, body)
+			r.Header.Set("Content-Type", "application/json")
+		} else {
+			r = httptest.NewRequest(method, urlStr, nil)
+		}
+		r.Header.Set("Authorization", "Bearer "+token)
+		return r
+	}
 
 	// 1. Create Event Subscription
 	subBody := bytes.NewBufferString(`{"device_id":"dev-vatilon-h43","protocol":"ONVIF_PULLPOINT"}`)
-	reqSub := httptest.NewRequest("POST", "/api/v1/events/subscriptions", subBody)
-	reqSub.Header.Set("Content-Type", "application/json")
+	reqSub := authReq("POST", "/api/v1/events/subscriptions", subBody)
 	wSub := httptest.NewRecorder()
 	handler.ServeHTTP(wSub, reqSub)
 
@@ -149,7 +171,7 @@ func TestPhase7EventsAndAlarmsAPIE2E(t *testing.T) {
 	}
 
 	// 2. Query Live Events
-	reqLive := httptest.NewRequest("GET", "/api/v1/events/live?limit=10", nil)
+	reqLive := authReq("GET", "/api/v1/events/live?limit=10", nil)
 	wLive := httptest.NewRecorder()
 	handler.ServeHTTP(wLive, reqLive)
 
@@ -177,7 +199,7 @@ func TestPhase7EventsAndAlarmsAPIE2E(t *testing.T) {
 	}
 
 	// 4. Query Alarms List
-	reqAlms := httptest.NewRequest("GET", "/api/v1/alarms?device_id=dev-vatilon-h43", nil)
+	reqAlms := authReq("GET", "/api/v1/alarms?device_id=dev-vatilon-h43", nil)
 	wAlms := httptest.NewRecorder()
 	handler.ServeHTTP(wAlms, reqAlms)
 
@@ -196,7 +218,7 @@ func TestPhase7EventsAndAlarmsAPIE2E(t *testing.T) {
 	targetAlmID := alarmList[0].ID
 
 	// 5. Acknowledge Alarm
-	reqAck := httptest.NewRequest("POST", "/api/v1/alarms/"+targetAlmID+"/acknowledge", nil)
+	reqAck := authReq("POST", "/api/v1/alarms/"+targetAlmID+"/acknowledge", nil)
 	wAck := httptest.NewRecorder()
 	handler.ServeHTTP(wAck, reqAck)
 
@@ -205,8 +227,7 @@ func TestPhase7EventsAndAlarmsAPIE2E(t *testing.T) {
 	}
 
 	// 6. Assign Alarm
-	reqAssign := httptest.NewRequest("POST", "/api/v1/alarms/"+targetAlmID+"/assign", bytes.NewBufferString(`{"technician":"SurveillanceSpecialist"}`))
-	reqAssign.Header.Set("Content-Type", "application/json")
+	reqAssign := authReq("POST", "/api/v1/alarms/"+targetAlmID+"/assign", bytes.NewBufferString(`{"technician":"SurveillanceSpecialist"}`))
 	wAssign := httptest.NewRecorder()
 	handler.ServeHTTP(wAssign, reqAssign)
 
@@ -215,8 +236,7 @@ func TestPhase7EventsAndAlarmsAPIE2E(t *testing.T) {
 	}
 
 	// 7. Resolve Alarm
-	reqResolve := httptest.NewRequest("POST", "/api/v1/alarms/"+targetAlmID+"/resolve", bytes.NewBufferString(`{"notes":"Investigated perimeter: false trigger from foliage"}`))
-	reqResolve.Header.Set("Content-Type", "application/json")
+	reqResolve := authReq("POST", "/api/v1/alarms/"+targetAlmID+"/resolve", bytes.NewBufferString(`{"notes":"Investigated perimeter: false trigger from foliage"}`))
 	wResolve := httptest.NewRecorder()
 	handler.ServeHTTP(wResolve, reqResolve)
 
@@ -225,7 +245,7 @@ func TestPhase7EventsAndAlarmsAPIE2E(t *testing.T) {
 	}
 
 	// 8. Alarm Stats
-	reqStats := httptest.NewRequest("GET", "/api/v1/alarms/stats", nil)
+	reqStats := authReq("GET", "/api/v1/alarms/stats", nil)
 	wStats := httptest.NewRecorder()
 	handler.ServeHTTP(wStats, reqStats)
 
@@ -234,7 +254,7 @@ func TestPhase7EventsAndAlarmsAPIE2E(t *testing.T) {
 	}
 
 	// 9. Export Alarms CSV
-	reqExport := httptest.NewRequest("GET", "/api/v1/alarms/export?format=csv", nil)
+	reqExport := authReq("GET", "/api/v1/alarms/export?format=csv", nil)
 	wExport := httptest.NewRecorder()
 	handler.ServeHTTP(wExport, reqExport)
 

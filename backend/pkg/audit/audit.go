@@ -4,8 +4,10 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -63,11 +65,12 @@ func RedactSecrets(input string) string {
 
 // AuditCheckpoint represents a signed cryptographic snapshot in the linear audit chain
 type AuditCheckpoint struct {
-	Index       int       `json:"index"`
-	EntryID     string    `json:"entry_id"`
-	EntryHash   string    `json:"entry_hash"`
-	Timestamp   time.Time `json:"timestamp"`
-	HMACDigest  string    `json:"hmac_digest"`
+	Index      int       `json:"index"`
+	EntryID    string    `json:"entry_id"`
+	EntryHash  string    `json:"entry_hash"`
+	Timestamp  time.Time `json:"timestamp"`
+	HMACDigest string    `json:"hmac_digest"`
+	KeyID      string    `json:"key_id,omitempty"`
 }
 
 // Logger provides tamper-evident audit logging with cryptographic hash chaining, secret redaction & signed HMAC checkpoints
@@ -76,33 +79,141 @@ type Logger struct {
 	entries       []models.AuditLogEntry
 	checkpoints   []AuditCheckpoint
 	lastHash      string
+	keyFilePath   string
+	currentKeyID  string
 	checkpointKey []byte
+	keyRing       map[string][]byte
 }
 
+type persistedKeyStore struct {
+	CurrentKeyID string            `json:"current_key_id"`
+	Keys         map[string]string `json:"keys"` // keyID -> hex
+}
+
+// NewLogger initializes the audit logger with secure OS-backed key generation and persistence
 func NewLogger() *Logger {
+	l, err := NewLoggerWithKeyFile("sentinel_audit.key")
+	if err != nil {
+		panic(fmt.Sprintf("CRITICAL CRYPTOGRAPHIC FAILURE: Failed to initialize secure audit logger: %v", err))
+	}
+	return l
+}
+
+// NewLoggerWithKeyFile initializes audit logger with a specific key file path
+func NewLoggerWithKeyFile(keyFilePath string) (*Logger, error) {
+	l := &Logger{
+		entries:      make([]models.AuditLogEntry, 0),
+		checkpoints:  make([]AuditCheckpoint, 0),
+		lastHash:     "GENESIS_SENTINEL_ROOT",
+		keyFilePath:  keyFilePath,
+		keyRing:      make(map[string][]byte),
+		currentKeyID: "root-key-1",
+	}
+
+	if err := l.loadOrGenerateKey(); err != nil {
+		return nil, fmt.Errorf("secure audit key initialization failed: %w", err)
+	}
+
+	return l, nil
+}
+
+func (l *Logger) loadOrGenerateKey() error {
+	if _, err := os.Stat(l.keyFilePath); err == nil {
+		// Keyfile exists - load persisted keys
+		data, err := os.ReadFile(l.keyFilePath)
+		if err != nil {
+			return fmt.Errorf("failed to read persisted audit keyfile: %w", err)
+		}
+
+		var ks persistedKeyStore
+		if err := json.Unmarshal(data, &ks); err == nil && len(ks.Keys) > 0 {
+			l.currentKeyID = ks.CurrentKeyID
+			for kid, khex := range ks.Keys {
+				rawKey, err := hex.DecodeString(khex)
+				if err == nil && len(rawKey) >= 16 {
+					l.keyRing[kid] = rawKey
+				}
+			}
+			if active, ok := l.keyRing[l.currentKeyID]; ok {
+				l.checkpointKey = active
+				return nil
+			}
+		}
+
+		// Backward compatibility for raw 32-byte binary keyfile
+		if len(data) >= 32 {
+			l.checkpointKey = make([]byte, 32)
+			copy(l.checkpointKey, data[:32])
+			l.keyRing[l.currentKeyID] = l.checkpointKey
+			return nil
+		}
+	}
+
+	// Keyfile does not exist - generate fresh key from OS cryptographic random source
 	key := make([]byte, 32)
 	if _, err := rand.Read(key); err != nil {
-		// Fallback deterministic key derivation if crypto/rand fails
-		h := sha256.Sum256([]byte("CCTV_SENTINEL_DEFAULT_HMAC_KEY_ROOT"))
-		key = h[:]
+		// Fail securely: NEVER fallback to deterministic values
+		return fmt.Errorf("failed to generate cryptographic key from OS random source: %w", err)
 	}
-	return &Logger{
-		entries:       make([]models.AuditLogEntry, 0),
-		checkpoints:   make([]AuditCheckpoint, 0),
-		lastHash:      "GENESIS_SENTINEL_ROOT",
-		checkpointKey: key,
+
+	l.checkpointKey = key
+	l.keyRing[l.currentKeyID] = key
+
+	return l.persistKeys()
+}
+
+func (l *Logger) persistKeys() error {
+	ks := persistedKeyStore{
+		CurrentKeyID: l.currentKeyID,
+		Keys:         make(map[string]string),
 	}
+	for kid, kbytes := range l.keyRing {
+		ks.Keys[kid] = hex.EncodeToString(kbytes)
+	}
+
+	data, err := json.MarshalIndent(ks, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	// Persist with restrictive 0600 file permissions
+	return os.WriteFile(l.keyFilePath, data, 0600)
+}
+
+// RotateCheckpointKey generates a new active HMAC key while preserving prior keys for checkpoint verification
+func (l *Logger) RotateCheckpointKey() (string, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	newKey := make([]byte, 32)
+	if _, err := rand.Read(newKey); err != nil {
+		return "", fmt.Errorf("failed to generate cryptographic key for rotation: %w", err)
+	}
+
+	newKeyID := fmt.Sprintf("key-%d", time.Now().UTC().UnixNano())
+	l.keyRing[newKeyID] = newKey
+	l.currentKeyID = newKeyID
+	l.checkpointKey = newKey
+
+	if err := l.persistKeys(); err != nil {
+		return "", fmt.Errorf("failed to persist rotated audit keys: %w", err)
+	}
+
+	return newKeyID, nil
 }
 
 // SetCheckpointKey allows injecting an isolated, hardware-protected HMAC key
 func (l *Logger) SetCheckpointKey(key []byte) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
 	if len(key) < 16 {
 		return fmt.Errorf("HMAC key length must be at least 16 bytes")
 	}
 	l.checkpointKey = make([]byte, len(key))
 	copy(l.checkpointKey, key)
+	l.keyRing[l.currentKeyID] = l.checkpointKey
+	_ = l.persistKeys()
 	return nil
 }
 
@@ -164,6 +275,7 @@ func (l *Logger) createCheckpointInternal() AuditCheckpoint {
 		EntryHash:  entry.EntryHash,
 		Timestamp:  time.Now().UTC(),
 		HMACDigest: digest,
+		KeyID:      l.currentKeyID,
 	}
 	l.checkpoints = append(l.checkpoints, cp)
 	return cp
@@ -217,7 +329,7 @@ func (l *Logger) VerifyChainIntegrity() (bool, int, error) {
 		expectedPrev = calcHash
 	}
 
-	// Verify signed HMAC checkpoints
+	// Verify signed HMAC checkpoints across key ring history
 	for _, cp := range l.checkpoints {
 		if cp.Index >= len(l.entries) {
 			return false, cp.Index, fmt.Errorf("checkpoint index %d exceeds ledger size", cp.Index)
@@ -227,11 +339,22 @@ func (l *Logger) VerifyChainIntegrity() (bool, int, error) {
 			return false, cp.Index, fmt.Errorf("checkpoint hash mismatch at entry %d", cp.Index)
 		}
 
-		mac := hmac.New(sha256.New, l.checkpointKey)
+		// Select key from key ring corresponding to checkpoint key_id
+		verKey := l.checkpointKey
+		if cp.KeyID != "" {
+			if ringKey, exists := l.keyRing[cp.KeyID]; exists {
+				verKey = ringKey
+			} else {
+				return false, cp.Index, fmt.Errorf("checkpoint key ID %s not found in keyring", cp.KeyID)
+			}
+		}
+
+		mac := hmac.New(sha256.New, verKey)
 		macInput := fmt.Sprintf("%d|%s|%s|%s", cp.Index, entry.ID, entry.EntryHash, entry.Timestamp.Format(time.RFC3339Nano))
 		mac.Write([]byte(macInput))
 		expectedDigest := hex.EncodeToString(mac.Sum(nil))
-		if subtleConstantTimeCompare(expectedDigest, cp.HMACDigest) != 1 {
+
+		if subtle.ConstantTimeCompare([]byte(expectedDigest), []byte(cp.HMACDigest)) != 1 {
 			return false, cp.Index, fmt.Errorf("checkpoint HMAC signature forged or corrupted at index %d", cp.Index)
 		}
 	}
@@ -239,39 +362,104 @@ func (l *Logger) VerifyChainIntegrity() (bool, int, error) {
 	return true, len(l.entries), nil
 }
 
-func subtleConstantTimeCompare(a, b string) int {
-	if len(a) != len(b) {
-		return 0
-	}
-	var v byte
-	for i := 0; i < len(a); i++ {
-		v |= a[i] ^ b[i]
-	}
-	if v == 0 {
-		return 1
-	}
-	return 0
-}
-
-// ExportSignedLedger writes an authenticated, signed audit snapshot to an external file
+// ExportSignedLedger writes an authenticated, signed audit snapshot with HMAC integrity signature
 func (l *Logger) ExportSignedLedger(exportPath string) error {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
 	cleanPath := filepath.Clean(exportPath)
-	payload := map[string]interface{}{
+	content := map[string]interface{}{
 		"version":      "2.0",
 		"exported_at":  time.Now().UTC().Format(time.RFC3339),
 		"entry_count":  len(l.entries),
 		"entries":      l.entries,
 		"checkpoints":  l.checkpoints,
 		"head_hash":    l.lastHash,
+		"key_id":       l.currentKeyID,
 	}
 
-	data, err := json.MarshalIndent(payload, "", "  ")
+	rawJSON, err := json.MarshalIndent(content, "  ", "  ")
+	if err != nil {
+		return err
+	}
+
+	// Compute digital HMAC-SHA256 signature across entire ledger payload
+	mac := hmac.New(sha256.New, l.checkpointKey)
+	mac.Write(rawJSON)
+	signature := hex.EncodeToString(mac.Sum(nil))
+
+	exportPackage := struct {
+		Payload   json.RawMessage `json:"payload"`
+		Signature string          `json:"signature"`
+		KeyID     string          `json:"key_id"`
+	}{
+		Payload:   json.RawMessage(rawJSON),
+		Signature: signature,
+		KeyID:     l.currentKeyID,
+	}
+
+	data, err := json.MarshalIndent(exportPackage, "", "  ")
 	if err != nil {
 		return err
 	}
 
 	return os.WriteFile(cleanPath, data, 0600)
 }
+
+// VerifyExportedLedger cryptographically verifies an exported ledger archive
+func (l *Logger) VerifyExportedLedger(exportPath string) (bool, error) {
+	data, err := os.ReadFile(filepath.Clean(exportPath))
+	if err != nil {
+		return false, err
+	}
+
+	var pkg struct {
+		Payload   json.RawMessage `json:"payload"`
+		Signature string          `json:"signature"`
+		KeyID     string          `json:"key_id"`
+	}
+	if err := json.Unmarshal(data, &pkg); err != nil {
+		return false, errors.New("invalid export archive structure")
+	}
+
+	l.mu.RLock()
+	verKey, exists := l.keyRing[pkg.KeyID]
+	if !exists {
+		verKey = l.checkpointKey
+	}
+	l.mu.RUnlock()
+
+	mac := hmac.New(sha256.New, verKey)
+	mac.Write(pkg.Payload)
+	expectedSig := hex.EncodeToString(mac.Sum(nil))
+
+	if subtle.ConstantTimeCompare([]byte(expectedSig), []byte(pkg.Signature)) != 1 {
+		return false, errors.New("cryptographic signature mismatch: exported ledger has been tampered with")
+	}
+
+	return true, nil
+}
+
+// SignPayload creates an HMAC-SHA256 signature for arbitrary data using the active checkpoint key
+func (l *Logger) SignPayload(data []byte) (string, string) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	mac := hmac.New(sha256.New, l.checkpointKey)
+	mac.Write(data)
+	return hex.EncodeToString(mac.Sum(nil)), l.currentKeyID
+}
+
+// VerifyPayloadSignature verifies an HMAC-SHA256 signature against the keyring
+func (l *Logger) VerifyPayloadSignature(data []byte, sigHex, keyID string) bool {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	verKey, exists := l.keyRing[keyID]
+	if !exists {
+		verKey = l.checkpointKey
+	}
+	mac := hmac.New(sha256.New, verKey)
+	mac.Write(data)
+	expected := hex.EncodeToString(mac.Sum(nil))
+	return subtle.ConstantTimeCompare([]byte(expected), []byte(sigHex)) == 1
+}
+

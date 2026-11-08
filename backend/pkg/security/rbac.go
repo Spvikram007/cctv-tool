@@ -7,20 +7,27 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"golang.org/x/crypto/argon2"
 )
 
 var (
-	ErrUnauthorized   = errors.New("security: authentication required or invalid credentials")
-	ErrForbidden      = errors.New("security: role lacks required permission for this operation")
-	ErrUserNotFound   = errors.New("security: user account not found")
-	ErrUserDisabled   = errors.New("security: user account is deactivated")
-	ErrSessionExpired = errors.New("security: session token expired; re-authentication required")
+	ErrUnauthorized       = errors.New("security: authentication required or invalid credentials")
+	ErrForbidden          = errors.New("security: role lacks required permission for this operation")
+	ErrUserNotFound       = errors.New("security: user account not found")
+	ErrUserDisabled       = errors.New("security: user account is deactivated")
+	ErrSessionExpired     = errors.New("security: session token expired; re-authentication required")
+	ErrSetupDisabled      = errors.New("security: initial admin setup is disabled; system is already provisioned")
+	ErrSetupTokenExpired  = errors.New("security: initial setup token has expired")
+	ErrInvalidSetupToken  = errors.New("security: invalid setup token")
+	ErrWeakPassword       = errors.New("security: password does not meet enterprise complexity requirements")
+	ErrInvalidArgonParams = errors.New("security: stored Argon2id parameters exceed safe execution limits or are malformed")
 )
 
 type Role string
@@ -46,6 +53,10 @@ const (
 	PermRecorderManage  Permission = "RECORDER_MANAGE"
 	PermPlaybackView    Permission = "PLAYBACK_VIEW"
 	PermPlaybackExport  Permission = "PLAYBACK_EXPORT"
+	PermPTZControl      Permission = "PTZ_CONTROL"
+	PermPTZManage       Permission = "PTZ_MANAGE"
+	PermEventManage     Permission = "EVENT_MANAGE"
+	PermAlarmManage     Permission = "ALARM_MANAGE"
 )
 
 // RolePermissions maps roles to granted enterprise capabilities
@@ -62,6 +73,10 @@ var RolePermissions = map[Role][]Permission{
 		PermRecorderManage,
 		PermPlaybackView,
 		PermPlaybackExport,
+		PermPTZControl,
+		PermPTZManage,
+		PermEventManage,
+		PermAlarmManage,
 	},
 	RoleTechnician: {
 		PermViewLive,
@@ -72,17 +87,37 @@ var RolePermissions = map[Role][]Permission{
 		PermRecorderManage,
 		PermPlaybackView,
 		PermPlaybackExport,
+		PermPTZControl,
+		PermPTZManage,
+		PermEventManage,
+		PermAlarmManage,
 	},
 	RoleAuditor: {
 		PermViewLive,
 		PermAuditView,
 		PermPlaybackView,
+		PermPlaybackExport,
+		PermAlarmManage,
 	},
 	RoleViewer: {
 		PermViewLive,
 		PermPlaybackView,
 	},
 }
+
+// Argon2 Bounds for DoS and Resource Exhaustion Prevention
+const (
+	MinArgonMemory      = 16 * 1024  // 16 MB
+	MaxArgonMemory      = 512 * 1024 // 512 MB
+	MinArgonIterations  = 1
+	MaxArgonIterations  = 10
+	MinArgonParallelism = 1
+	MaxArgonParallelism = 16
+	MinSaltLength       = 16
+	MaxSaltLength       = 64
+	MinHashLength       = 16
+	MaxHashLength       = 64
+)
 
 // Argon2Params defines tunable memory-hard password hashing parameters (RFC 9106)
 type Argon2Params struct {
@@ -128,28 +163,147 @@ type Session struct {
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
-// RBACManager handles user authentication, role checks, and session tokens
+// RBACManager handles user authentication, role checks, session tokens, and first-run setup
 type RBACManager struct {
-	mu           sync.RWMutex
-	users        map[string]*UserAccount
-	sessions     map[string]*Session
-	argon2Config *Argon2Params
+	mu                 sync.RWMutex
+	users              map[string]*UserAccount
+	sessions           map[string]*Session
+	argon2Config       *Argon2Params
+	setupMode          bool
+	setupToken         string
+	setupTokenExpires  time.Time
+	setupTokenFilePath string
 }
 
-func NewRBACManager() *RBACManager {
-	mgr := &RBACManager{
-		users:        make(map[string]*UserAccount),
-		sessions:     make(map[string]*Session),
-		argon2Config: DefaultArgon2Params,
+// ValidatePasswordStrength enforces enterprise password complexity
+func ValidatePasswordStrength(password string) error {
+	if len(password) < 10 {
+		return fmt.Errorf("%w: password must be at least 10 characters long", ErrWeakPassword)
 	}
 
-	// Seed default enterprise operators with Argon2id
-	_ = mgr.CreateUser("admin", "Admin@Sentinel2026!", "System Administrator", RoleAdmin, "admin@techdefence.in", "default", "hq")
-	_ = mgr.CreateUser("technician", "Tech@Sentinel2026!", "Field Technician", RoleTechnician, "tech@techdefence.in", "default", "site-1")
-	_ = mgr.CreateUser("auditor", "Audit@Sentinel2026!", "Compliance Officer", RoleAuditor, "audit@techdefence.in", "default", "hq")
-	_ = mgr.CreateUser("viewer", "View@Sentinel2026!", "Control Room Operator", RoleViewer, "view@techdefence.in", "default", "site-1")
+	var hasUpper, hasLower, hasDigit, hasSpecial bool
+	for _, ch := range password {
+		switch {
+		case unicode.IsUpper(ch):
+			hasUpper = true
+		case unicode.IsLower(ch):
+			hasLower = true
+		case unicode.IsDigit(ch):
+			hasDigit = true
+		case unicode.IsPunct(ch) || unicode.IsSymbol(ch):
+			hasSpecial = true
+		}
+	}
+
+	if !hasUpper || !hasLower || !hasDigit || !hasSpecial {
+		return fmt.Errorf("%w: password must include uppercase, lowercase, number, and special character", ErrWeakPassword)
+	}
+	return nil
+}
+
+// NewRBACManager initializes the RBAC manager with zero hardcoded default credentials
+func NewRBACManager() *RBACManager {
+	mgr := &RBACManager{
+		users:              make(map[string]*UserAccount),
+		sessions:           make(map[string]*Session),
+		argon2Config:       DefaultArgon2Params,
+		setupTokenFilePath: "sentinel-setup.token",
+	}
+
+	// First-run setup initialization: NO HARDCODED DEFAULT CREDENTIALS
+	mgr.initSetupToken()
 
 	return mgr
+}
+
+// initSetupToken creates a cryptographically secure one-time token for first-run admin provisioning
+func (m *RBACManager) initSetupToken() {
+	tokBytes := make([]byte, 32)
+	if _, err := rand.Read(tokBytes); err != nil {
+		// Fail securely: panic rather than proceeding without genuine randomness
+		panic(fmt.Sprintf("CRITICAL CRYPTOGRAPHIC FAILURE: crypto/rand unavailable: %v", err))
+	}
+
+	m.setupMode = true
+	m.setupToken = fmt.Sprintf("sent-setup-%s", hex.EncodeToString(tokBytes))
+	m.setupTokenExpires = time.Now().UTC().Add(24 * time.Hour)
+
+	// Securely persist to local token file with restricted permissions (0600)
+	if err := os.WriteFile(m.setupTokenFilePath, []byte(m.setupToken+"\n"), 0600); err != nil {
+		fmt.Printf("[SECURITY] Notice: could not write setup token file (%v). Setup token: %s\n", err, m.setupToken)
+	}
+}
+
+// IsSetupRequired checks if initial administrator setup is still pending
+func (m *RBACManager) IsSetupRequired() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.setupMode && len(m.users) == 0
+}
+
+// GetSetupToken returns the current setup token (accessible only on local console/tests)
+func (m *RBACManager) GetSetupToken() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if !m.setupMode {
+		return ""
+	}
+	return m.setupToken
+}
+
+// CompleteSetup provisions the initial system administrator and permanently destroys the setup token
+func (m *RBACManager) CompleteSetup(token, username, password, fullName, email string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !m.setupMode || len(m.users) > 0 {
+		return ErrSetupDisabled
+	}
+
+	if time.Now().UTC().After(m.setupTokenExpires) {
+		return ErrSetupTokenExpired
+	}
+
+	if subtle.ConstantTimeCompare([]byte(token), []byte(m.setupToken)) != 1 {
+		return ErrInvalidSetupToken
+	}
+
+	if strings.TrimSpace(username) == "" {
+		return errors.New("username cannot be empty")
+	}
+
+	if err := ValidatePasswordStrength(password); err != nil {
+		return err
+	}
+
+	saltBytes := make([]byte, m.argon2Config.SaltLength)
+	if _, err := rand.Read(saltBytes); err != nil {
+		return fmt.Errorf("failed to generate cryptographic salt: %w", err)
+	}
+
+	argonHash := HashPasswordArgon2id(password, saltBytes, m.argon2Config)
+
+	u := &UserAccount{
+		Username:     username,
+		FullName:     fullName,
+		Role:         RoleAdmin,
+		Email:        email,
+		PasswordHash: argonHash,
+		Salt:         hex.EncodeToString(saltBytes),
+		TenantID:     "default",
+		SiteID:       "hq",
+		Active:       true,
+		CreatedAt:    time.Now().UTC(),
+	}
+
+	m.users[username] = u
+
+	// Permanently disable setup mode and erase token
+	m.setupMode = false
+	m.setupToken = ""
+	_ = os.Remove(m.setupTokenFilePath)
+
+	return nil
 }
 
 // SetArgon2Params updates the hashing parameters dynamically
@@ -181,19 +335,26 @@ func legacyHashPassword(password, salt string) string {
 
 // CreateUser registers a new operator with Argon2id password hashing
 func (m *RBACManager) CreateUser(username, password, fullName string, role Role, email, tenantID, siteID string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	if err := ValidatePasswordStrength(password); err != nil {
+		return err
+	}
 
+	m.mu.Lock()
 	if _, exists := m.users[username]; exists {
+		m.mu.Unlock()
 		return fmt.Errorf("user %s already exists", username)
 	}
 
-	saltBytes := make([]byte, m.argon2Config.SaltLength)
+	saltLength := m.argon2Config.SaltLength
+	argonConfig := *m.argon2Config
+	m.mu.Unlock()
+
+	saltBytes := make([]byte, saltLength)
 	if _, err := rand.Read(saltBytes); err != nil {
 		return fmt.Errorf("failed to generate cryptographic salt: %w", err)
 	}
 
-	argonHash := HashPasswordArgon2id(password, saltBytes, m.argon2Config)
+	argonHash := HashPasswordArgon2id(password, saltBytes, &argonConfig)
 
 	u := &UserAccount{
 		Username:     username,
@@ -208,66 +369,106 @@ func (m *RBACManager) CreateUser(username, password, fullName string, role Role,
 		CreatedAt:    time.Now().UTC(),
 	}
 
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.users[username] = u
+
+	// Disable setup mode if an admin was created
+	if role == RoleAdmin {
+		m.setupMode = false
+		m.setupToken = ""
+		_ = os.Remove(m.setupTokenFilePath)
+	}
+
 	return nil
 }
 
-// Authenticate verifies credentials with Argon2id and automatically rehashes legacy passwords
+// Authenticate verifies credentials with Argon2id and rehashes legacy passwords without holding global locks during computation
 func (m *RBACManager) Authenticate(username, password string, ttl time.Duration) (*Session, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
+	// 1. Read user record under Read Lock
+	m.mu.RLock()
 	user, exists := m.users[username]
 	if !exists {
+		m.mu.RUnlock()
 		return nil, ErrUnauthorized
 	}
 	if !user.Active {
+		m.mu.RUnlock()
 		return nil, ErrUserDisabled
 	}
 
-	authenticated := false
+	storedHash := user.PasswordHash
+	storedSalt := user.Salt
+	userRole := user.Role
+	tenantID := user.TenantID
+	siteID := user.SiteID
+	m.mu.RUnlock()
 
-	// Check if stored hash is Argon2id
-	if strings.HasPrefix(user.PasswordHash, "$argon2id$") {
-		parts := strings.Split(user.PasswordHash, "$")
-		// Format: ["", "argon2id", "v=19", "m=...,t=...,p=...", "saltHex", "hashHex"]
-		if len(parts) == 6 {
-			var mem, iter uint32
-			var par uint64
-			for _, param := range strings.Split(parts[3], ",") {
-				kv := strings.Split(param, "=")
-				if len(kv) == 2 {
-					switch kv[0] {
-					case "m":
-						v, _ := strconv.ParseUint(kv[1], 10, 32)
-						mem = uint32(v)
-					case "t":
-						v, _ := strconv.ParseUint(kv[1], 10, 32)
-						iter = uint32(v)
-					case "p":
-						par, _ = strconv.ParseUint(kv[1], 10, 8)
+	// 2. Perform expensive cryptographic hash calculation OUTSIDE the lock
+	authenticated := false
+	needsRehash := false
+	isArgon := strings.HasPrefix(storedHash, "$argon2id$")
+
+	if isArgon {
+		parts := strings.Split(storedHash, "$")
+		// Standard format: ["", "argon2id", "v=19", "m=...,t=...,p=...", "saltHex", "hashHex"]
+		if len(parts) != 6 || parts[1] != "argon2id" || parts[2] != "v=19" {
+			return nil, ErrInvalidArgonParams
+		}
+
+		var mem, iter uint32
+		var par uint64
+		for _, param := range strings.Split(parts[3], ",") {
+			kv := strings.Split(param, "=")
+			if len(kv) == 2 {
+				switch kv[0] {
+				case "m":
+					v, err := strconv.ParseUint(kv[1], 10, 32)
+					if err != nil {
+						return nil, ErrInvalidArgonParams
+					}
+					mem = uint32(v)
+				case "t":
+					v, err := strconv.ParseUint(kv[1], 10, 32)
+					if err != nil {
+						return nil, ErrInvalidArgonParams
+					}
+					iter = uint32(v)
+				case "p":
+					var err error
+					par, err = strconv.ParseUint(kv[1], 10, 8)
+					if err != nil {
+						return nil, ErrInvalidArgonParams
 					}
 				}
 			}
-			saltBytes, err1 := hex.DecodeString(parts[4])
-			expectedHashBytes, err2 := hex.DecodeString(parts[5])
-			if err1 == nil && err2 == nil {
-				calculatedHash := argon2.IDKey([]byte(password), saltBytes, iter, mem, uint8(par), uint32(len(expectedHashBytes)))
-				if subtle.ConstantTimeCompare(calculatedHash, expectedHashBytes) == 1 {
-					authenticated = true
-				}
-			}
+		}
+
+		// Enforce strict parameter bounds to prevent DoS / Memory exhaustion
+		if mem < MinArgonMemory || mem > MaxArgonMemory ||
+			iter < MinArgonIterations || iter > MaxArgonIterations ||
+			par < MinArgonParallelism || par > MaxArgonParallelism {
+			return nil, ErrInvalidArgonParams
+		}
+
+		saltBytes, err1 := hex.DecodeString(parts[4])
+		expectedHashBytes, err2 := hex.DecodeString(parts[5])
+		if err1 != nil || err2 != nil ||
+			len(saltBytes) < MinSaltLength || len(saltBytes) > MaxSaltLength ||
+			len(expectedHashBytes) < MinHashLength || len(expectedHashBytes) > MaxHashLength {
+			return nil, ErrInvalidArgonParams
+		}
+
+		calculatedHash := argon2.IDKey([]byte(password), saltBytes, iter, mem, uint8(par), uint32(len(expectedHashBytes)))
+		if subtle.ConstantTimeCompare(calculatedHash, expectedHashBytes) == 1 {
+			authenticated = true
 		}
 	} else {
 		// Legacy Salted SHA-256 verification
-		expectedHash := legacyHashPassword(password, user.Salt)
-		if subtle.ConstantTimeCompare([]byte(user.PasswordHash), []byte(expectedHash)) == 1 {
+		expectedHash := legacyHashPassword(password, storedSalt)
+		if subtle.ConstantTimeCompare([]byte(storedHash), []byte(expectedHash)) == 1 {
 			authenticated = true
-			// Rehash on login to Argon2id
-			saltBytes := make([]byte, m.argon2Config.SaltLength)
-			_, _ = rand.Read(saltBytes)
-			user.PasswordHash = HashPasswordArgon2id(password, saltBytes, m.argon2Config)
-			user.Salt = hex.EncodeToString(saltBytes)
+			needsRehash = true
 		}
 	}
 
@@ -275,23 +476,42 @@ func (m *RBACManager) Authenticate(username, password string, ttl time.Duration)
 		return nil, ErrUnauthorized
 	}
 
-	user.LastLogin = time.Now().UTC()
+	// 3. Acquire Write Lock briefly only to issue session and rehash if needed
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	currentUser, stillExists := m.users[username]
+	if !stillExists || !currentUser.Active {
+		return nil, ErrUnauthorized
+	}
+
+	if needsRehash {
+		saltBytes := make([]byte, m.argon2Config.SaltLength)
+		if _, err := rand.Read(saltBytes); err == nil {
+			currentUser.PasswordHash = HashPasswordArgon2id(password, saltBytes, m.argon2Config)
+			currentUser.Salt = hex.EncodeToString(saltBytes)
+		}
+	}
+
+	currentUser.LastLogin = time.Now().UTC()
 
 	if ttl <= 0 {
 		ttl = 8 * time.Hour
 	}
 
 	tokBytes := make([]byte, 24)
-	_, _ = rand.Read(tokBytes)
+	if _, err := rand.Read(tokBytes); err != nil {
+		return nil, fmt.Errorf("failed to generate secure session token: %w", err)
+	}
 	token := fmt.Sprintf("sent-sess-%s", hex.EncodeToString(tokBytes))
 
 	now := time.Now().UTC()
 	sess := &Session{
 		Token:     token,
-		Username:  user.Username,
-		Role:      user.Role,
-		TenantID:  user.TenantID,
-		SiteID:    user.SiteID,
+		Username:  username,
+		Role:      userRole,
+		TenantID:  tenantID,
+		SiteID:    siteID,
 		CreatedAt: now,
 		ExpiresAt: now.Add(ttl),
 	}
@@ -302,6 +522,10 @@ func (m *RBACManager) Authenticate(username, password string, ttl time.Duration)
 
 // ValidateSession inspects a bearer session token
 func (m *RBACManager) ValidateSession(token string) (*Session, error) {
+	if strings.TrimSpace(token) == "" {
+		return nil, ErrUnauthorized
+	}
+
 	m.mu.RLock()
 	sess, exists := m.sessions[token]
 	m.mu.RUnlock()
@@ -317,6 +541,13 @@ func (m *RBACManager) ValidateSession(token string) (*Session, error) {
 	}
 
 	return sess, nil
+}
+
+// RevokeSession explicitly invalidates an active session token
+func (m *RBACManager) RevokeSession(token string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.sessions, token)
 }
 
 // HasPermission checks if a given role is authorized for a specific permission
@@ -347,3 +578,56 @@ func (m *RBACManager) ListUsers() []UserAccount {
 	}
 	return res
 }
+
+// LoadExistingUsers loads pre-existing accounts from store during migration
+func (m *RBACManager) LoadExistingUsers(users []UserAccount) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	hasAdmin := false
+	for i := range users {
+		u := users[i]
+		m.users[u.Username] = &u
+		if u.Role == RoleAdmin && u.Active {
+			hasAdmin = true
+		}
+	}
+	if hasAdmin {
+		m.setupMode = false
+		m.setupToken = ""
+		_ = os.Remove(m.setupTokenFilePath)
+	}
+}
+
+// InjectUserWithHashForTest injects a user with a raw hash string for testing parameter validation
+func (m *RBACManager) InjectUserWithHashForTest(username, hash, salt string, role Role) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.users[username] = &UserAccount{
+		Username:     username,
+		FullName:     "Test User",
+		Role:         role,
+		Email:        username + "@test.local",
+		PasswordHash: hash,
+		Salt:         salt,
+		TenantID:     "default",
+		SiteID:       "hq",
+		Active:       true,
+		CreatedAt:    time.Now().UTC(),
+	}
+}
+
+// InjectSessionForTest creates an active session directly for test cases
+func (m *RBACManager) InjectSessionForTest(token, username string, role Role, tenantID, siteID string, ttl time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sessions[token] = &Session{
+		Token:     token,
+		Username:  username,
+		Role:      role,
+		TenantID:  tenantID,
+		SiteID:    siteID,
+		CreatedAt: time.Now().UTC(),
+		ExpiresAt: time.Now().UTC().Add(ttl),
+	}
+}
+

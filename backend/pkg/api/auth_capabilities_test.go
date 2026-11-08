@@ -16,10 +16,11 @@ import (
 	"cctv-sentinel/pkg/discovery"
 	"cctv-sentinel/pkg/licensing"
 	"cctv-sentinel/pkg/models"
+	"cctv-sentinel/pkg/security"
 	"cctv-sentinel/pkg/simulator"
 )
 
-func setupTestAPIServer(t *testing.T) (*httptest.Server, *database.Store, *simulator.MultiDeviceSimulator) {
+func setupTestAPIServer(t *testing.T) (*httptest.Server, *database.Store, *simulator.MultiDeviceSimulator, string) {
 	sim := simulator.NewSimulator()
 	if err := sim.Start(); err != nil {
 		t.Fatalf("failed to start simulator: %v", err)
@@ -37,14 +38,31 @@ func setupTestAPIServer(t *testing.T) (*httptest.Server, *database.Store, *simul
 
 	apiServer := api.NewServer(store, registry, cfgEngine, discEngine, licMgr, logger, nil, nil, nil, nil, nil)
 	ts := httptest.NewServer(apiServer.Handler())
+	token := apiServer.IssueSessionForTest(security.RoleAdmin, "default", "hq")
 
-	return ts, store, sim
+	return ts, store, sim, token
 }
 
 func TestDeviceAuthAndCapabilitiesAPI(t *testing.T) {
-	ts, store, sim := setupTestAPIServer(t)
+	ts, store, sim, token := setupTestAPIServer(t)
 	defer ts.Close()
 	defer sim.Stop()
+
+	authDo := func(method, urlStr string, body []byte) (*http.Response, error) {
+		var req *http.Request
+		var err error
+		if len(body) > 0 {
+			req, err = http.NewRequest(method, urlStr, bytes.NewBuffer(body))
+			req.Header.Set("Content-Type", "application/json")
+		} else {
+			req, err = http.NewRequest(method, urlStr, nil)
+		}
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		return http.DefaultClient.Do(req)
+	}
 
 	// Seed test Hikvision device
 	dev := models.Device{
@@ -62,9 +80,7 @@ func TestDeviceAuthAndCapabilitiesAPI(t *testing.T) {
 
 	// 1. Test POST /api/v1/devices/{id}/auth
 	authPayload := []byte(`{"username":"admin","password":"Admin@123"}`)
-	req, _ := http.NewRequest("POST", ts.URL+"/api/v1/devices/test-hik-dev/auth", bytes.NewBuffer(authPayload))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := authDo("POST", ts.URL+"/api/v1/devices/test-hik-dev/auth", authPayload)
 	if err != nil {
 		t.Fatalf("auth request failed: %v", err)
 	}
@@ -83,8 +99,7 @@ func TestDeviceAuthAndCapabilitiesAPI(t *testing.T) {
 	}
 
 	// 2. Test GET /api/v1/devices/{id}/capabilities
-	reqCap, _ := http.NewRequest("GET", ts.URL+"/api/v1/devices/test-hik-dev/capabilities", nil)
-	respCap, err := http.DefaultClient.Do(reqCap)
+	respCap, err := authDo("GET", ts.URL+"/api/v1/devices/test-hik-dev/capabilities", nil)
 	if err != nil {
 		t.Fatalf("capabilities request failed: %v", err)
 	}
@@ -115,9 +130,7 @@ func TestDeviceAuthAndCapabilitiesAPI(t *testing.T) {
 			"gateway": "192.168.1.1"
 		}
 	}`)
-	reqPrv, _ := http.NewRequest("POST", ts.URL+"/api/v1/devices/test-hik-dev/config/preview", bytes.NewBuffer(previewPayload))
-	reqPrv.Header.Set("Content-Type", "application/json")
-	respPrv, err := http.DefaultClient.Do(reqPrv)
+	respPrv, err := authDo("POST", ts.URL+"/api/v1/devices/test-hik-dev/config/preview", previewPayload)
 	if err != nil {
 		t.Fatalf("config preview request failed: %v", err)
 	}
@@ -140,9 +153,7 @@ func TestDeviceAuthAndCapabilitiesAPI(t *testing.T) {
 		"preview_token": previewRes.PreviewToken,
 		"rollback_key":  previewRes.RollbackKey,
 	})
-	reqApply, _ := http.NewRequest("POST", ts.URL+"/api/v1/devices/test-hik-dev/config/apply", bytes.NewBuffer(applyPayload))
-	reqApply.Header.Set("Content-Type", "application/json")
-	respApply, err := http.DefaultClient.Do(reqApply)
+	respApply, err := authDo("POST", ts.URL+"/api/v1/devices/test-hik-dev/config/apply", applyPayload)
 	if err != nil {
 		t.Fatalf("config apply request failed: %v", err)
 	}
@@ -167,9 +178,7 @@ func TestDeviceAuthAndCapabilitiesAPI(t *testing.T) {
 	rbPayload, _ := json.Marshal(map[string]string{
 		"rollback_key": applyRes.RollbackKey,
 	})
-	reqRb, _ := http.NewRequest("POST", ts.URL+"/api/v1/devices/test-hik-dev/config/rollback", bytes.NewBuffer(rbPayload))
-	reqRb.Header.Set("Content-Type", "application/json")
-	respRb, err := http.DefaultClient.Do(reqRb)
+	respRb, err := authDo("POST", ts.URL+"/api/v1/devices/test-hik-dev/config/rollback", rbPayload)
 	if err != nil {
 		t.Fatalf("rollback request failed: %v", err)
 	}

@@ -92,7 +92,7 @@ func TestRequestCorrelationPropagation(t *testing.T) {
 	_, handler := setupTestServer(t)
 
 	customID := "test-audit-req-12345678"
-	req := httptest.NewRequest("GET", "/api/v1/system/status", nil)
+	req := httptest.NewRequest("GET", "/api/v1/healthz", nil)
 	req.Header.Set("X-Request-ID", customID)
 	rec := httptest.NewRecorder()
 
@@ -105,9 +105,20 @@ func TestRequestCorrelationPropagation(t *testing.T) {
 }
 
 func TestStructuredErrorHandling(t *testing.T) {
-	_, handler := setupTestServer(t)
+	server, handler := setupTestServer(t)
 
+	// 1. Unauthenticated request must receive 401
+	unauthReq := httptest.NewRequest("GET", "/api/v1/devices/non-existent-device-id-99", nil)
+	unauthRec := httptest.NewRecorder()
+	handler.ServeHTTP(unauthRec, unauthReq)
+	if unauthRec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized for unauthenticated request, got %d", unauthRec.Code)
+	}
+
+	// 2. Authenticated request for missing device returns 404
+	token := server.IssueSessionForTest(security.RoleAdmin, "default", "hq")
 	req := httptest.NewRequest("GET", "/api/v1/devices/non-existent-device-id-99", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -146,9 +157,11 @@ func TestStructuredErrorHandling(t *testing.T) {
 
 func TestDiscoveryEndpoints(t *testing.T) {
 	server, handler := setupTestServer(t)
+	token := server.IssueSessionForTest(security.RoleAdmin, "default", "hq")
 
 	// 1. Test GET /api/v1/discovery/interfaces
 	reqIf := httptest.NewRequest("GET", "/api/v1/discovery/interfaces", nil)
+	reqIf.Header.Set("Authorization", "Bearer "+token)
 	recIf := httptest.NewRecorder()
 	handler.ServeHTTP(recIf, reqIf)
 	if recIf.Code != http.StatusOK {
@@ -158,6 +171,7 @@ func TestDiscoveryEndpoints(t *testing.T) {
 	// 2. Test POST /api/v1/devices/discover
 	body := strings.NewReader(`{"method":"TCP","cidr":"127.0.0.1/32","timeout_ms":50,"concurrency":4}`)
 	reqDisc := httptest.NewRequest("POST", "/api/v1/devices/discover", body)
+	reqDisc.Header.Set("Authorization", "Bearer "+token)
 	recDisc := httptest.NewRecorder()
 	handler.ServeHTTP(recDisc, reqDisc)
 
@@ -176,6 +190,7 @@ func TestDiscoveryEndpoints(t *testing.T) {
 
 	// 3. Test GET /api/v1/discovery/{id}
 	reqJob := httptest.NewRequest("GET", "/api/v1/discovery/"+jobID, nil)
+	reqJob.Header.Set("Authorization", "Bearer "+token)
 	recJob := httptest.NewRecorder()
 	handler.ServeHTTP(recJob, reqJob)
 	if recJob.Code != http.StatusOK {
@@ -184,6 +199,7 @@ func TestDiscoveryEndpoints(t *testing.T) {
 
 	// 4. Test GET /api/v1/discovery/{id}/results
 	reqRes := httptest.NewRequest("GET", "/api/v1/discovery/"+jobID+"/results", nil)
+	reqRes.Header.Set("Authorization", "Bearer "+token)
 	recRes := httptest.NewRecorder()
 	handler.ServeHTTP(recRes, reqRes)
 	if recRes.Code != http.StatusOK {
@@ -192,6 +208,7 @@ func TestDiscoveryEndpoints(t *testing.T) {
 
 	// 5. Test POST /api/v1/discovery/{id}/cancel
 	reqCancel := httptest.NewRequest("POST", "/api/v1/discovery/"+jobID+"/cancel", nil)
+	reqCancel.Header.Set("Authorization", "Bearer "+token)
 	recCancel := httptest.NewRecorder()
 	handler.ServeHTTP(recCancel, reqCancel)
 	if recCancel.Code != http.StatusOK {
@@ -205,6 +222,7 @@ func TestDiscoveryEndpoints(t *testing.T) {
 
 		// Identity endpoint
 		reqIden := httptest.NewRequest("GET", "/api/v1/devices/"+testDev.ID+"/identity", nil)
+		reqIden.Header.Set("Authorization", "Bearer "+token)
 		recIden := httptest.NewRecorder()
 		handler.ServeHTTP(recIden, reqIden)
 		if recIden.Code != http.StatusOK {
@@ -219,6 +237,7 @@ func TestDiscoveryEndpoints(t *testing.T) {
 
 		// Services endpoint
 		reqSvc := httptest.NewRequest("GET", "/api/v1/devices/"+testDev.ID+"/services", nil)
+		reqSvc.Header.Set("Authorization", "Bearer "+token)
 		recSvc := httptest.NewRecorder()
 		handler.ServeHTTP(recSvc, reqSvc)
 		if recSvc.Code != http.StatusOK {

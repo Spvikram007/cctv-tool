@@ -2,6 +2,7 @@ package streamhub
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -16,14 +17,17 @@ import (
 	"time"
 
 	"cctv-sentinel/pkg/adapters"
+	"cctv-sentinel/pkg/audit"
 	"cctv-sentinel/pkg/database"
 	"cctv-sentinel/pkg/media/snapshot"
+	"cctv-sentinel/pkg/security"
 )
 
 var (
-	ErrTokenExpired  = errors.New("stream access token is expired")
-	ErrTokenNotFound = errors.New("stream access token not found or invalid")
-	ErrDeviceOffline = errors.New("target camera stream is offline or unreachable")
+	ErrTokenExpired      = errors.New("stream access token is expired")
+	ErrTokenNotFound     = errors.New("stream access token not found or invalid")
+	ErrDeviceOffline     = errors.New("target camera stream is offline or unreachable")
+	ErrMaxStreamsReached = errors.New("maximum concurrent stream limit reached; stream denied for stability")
 )
 
 // StreamToken provides scoped, time-limited access to a camera video stream
@@ -70,6 +74,8 @@ type LiveSession struct {
 	viewers       int32
 	listeners     map[chan []byte]bool
 	stopChan      chan struct{}
+	ctx           context.Context
+	cancel        context.CancelFunc
 	running       bool
 }
 
@@ -165,7 +171,7 @@ func (h *Hub) GetTokenStats(tokenStr string) (*StreamStats, error) {
 	return &stats, nil
 }
 
-// GetOrCreateSession retrieves or initializes a live stream session
+// GetOrCreateSession retrieves or initializes a live stream session with concurrency limits and SSRF checks
 func (h *Hub) GetOrCreateSession(deviceID, streamType string) (*LiveSession, error) {
 	key := fmt.Sprintf("%s:%s", deviceID, streamType)
 
@@ -180,6 +186,32 @@ func (h *Hub) GetOrCreateSession(deviceID, streamType string) (*LiveSession, err
 	if !found {
 		h.mu.Unlock()
 		return nil, fmt.Errorf("device %s not found in store", deviceID)
+	}
+
+	// SSRF validation of destination camera
+	if err := security.ValidateSurveillanceTarget(dev.IP, true); err != nil {
+		h.mu.Unlock()
+		return nil, fmt.Errorf("SSRF Protection: destination camera IP blocked: %w", err)
+	}
+
+	// Enforce global and per-device stream concurrency bounds
+	activeSessions := 0
+	deviceSessions := 0
+	for _, s := range h.sessions {
+		if s.running {
+			activeSessions++
+			if s.DeviceID == deviceID {
+				deviceSessions++
+			}
+		}
+	}
+	if activeSessions >= 16 {
+		h.mu.Unlock()
+		return nil, ErrMaxStreamsReached
+	}
+	if deviceSessions >= 2 {
+		h.mu.Unlock()
+		return nil, fmt.Errorf("device %s already has %d active streams (limit: 2)", deviceID, deviceSessions)
 	}
 
 	adapter, err := h.registry.ResolveForDevice(&dev)
@@ -199,6 +231,7 @@ func (h *Hub) GetOrCreateSession(deviceID, streamType string) (*LiveSession, err
 		return nil, fmt.Errorf("failed to get stream URI: %w", err)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	sess = &LiveSession{
 		DeviceID:   deviceID,
 		StreamType: streamType,
@@ -209,6 +242,8 @@ func (h *Hub) GetOrCreateSession(deviceID, streamType string) (*LiveSession, err
 		status:     "CONNECTING",
 		listeners:  make(map[chan []byte]bool),
 		stopChan:   make(chan struct{}),
+		ctx:        ctx,
+		cancel:     cancel,
 		running:    true,
 	}
 
@@ -220,13 +255,13 @@ func (h *Hub) GetOrCreateSession(deviceID, streamType string) (*LiveSession, err
 	return sess, nil
 }
 
-// findFFmpegPath returns the path to FFmpeg
+// findFFmpegPath returns the path to FFmpeg from standard system paths
 func findFFmpegPath() string {
 	candidates := []string{
-		`C:\Program Files (x86)\Wondershare\Recoverit\ffmpeg.exe`,
-		`C:\Program Files\Wondershare\Recoverit\ffmpeg.exe`,
-		`C:\ffmpeg\bin\ffmpeg.exe`,
 		`./bin/ffmpeg.exe`,
+		`./ffmpeg.exe`,
+		`C:\ffmpeg\bin\ffmpeg.exe`,
+		`C:\tools\ffmpeg\bin\ffmpeg.exe`,
 	}
 	for _, c := range candidates {
 		if _, err := os.Stat(c); err == nil {
@@ -270,8 +305,8 @@ func (s *LiveSession) startWorker() {
 		s.status = "CONNECTING"
 		s.mu.Unlock()
 
-		// Isolated FFmpeg process converting RTSP stream to MJPEG pipe
-		cmd := exec.Command(ffmpegPath,
+		// Isolated FFmpeg process converting RTSP stream to MJPEG pipe with context cancellation
+		cmd := exec.CommandContext(s.ctx, ffmpegPath,
 			"-rtsp_transport", "tcp",
 			"-i", authenticatedURL,
 			"-f", "image2pipe",
@@ -281,11 +316,14 @@ func (s *LiveSession) startWorker() {
 			"pipe:1",
 		)
 
+		var stderrBuf bytes.Buffer
+		cmd.Stderr = &stderrBuf
+
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
 			s.mu.Lock()
 			s.status = "ERROR"
-			s.errorMsg = err.Error()
+			s.errorMsg = audit.RedactSecrets(err.Error())
 			s.mu.Unlock()
 			time.Sleep(3 * time.Second)
 			continue
@@ -294,7 +332,7 @@ func (s *LiveSession) startWorker() {
 		if err := cmd.Start(); err != nil {
 			s.mu.Lock()
 			s.status = "ERROR"
-			s.errorMsg = err.Error()
+			s.errorMsg = audit.RedactSecrets(err.Error())
 			s.mu.Unlock()
 			time.Sleep(3 * time.Second)
 			continue
@@ -421,12 +459,16 @@ func (s *LiveSession) UnregisterViewer(ch chan []byte) {
 	}
 }
 
-// Stop cleanly terminates the session
+// Stop cleanly terminates the session and kills child transcoder processes
 func (s *LiveSession) Stop() {
 	s.mu.Lock()
 	if s.running {
 		close(s.stopChan)
+		if s.cancel != nil {
+			s.cancel()
+		}
 		s.running = false
+		s.status = "OFFLINE"
 	}
 	s.mu.Unlock()
 }

@@ -1,7 +1,6 @@
 package api_test
 
 import (
-	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -23,7 +22,7 @@ import (
 	"cctv-sentinel/pkg/security"
 )
 
-func setupRecorderAPITestServer(t *testing.T) (*httptest.Server, *database.Store, *recorder.Engine) {
+func setupRecorderAPITestServer(t *testing.T) (*httptest.Server, *database.Store, *recorder.Engine, string) {
 	tempDir := t.TempDir()
 	store := database.NewStore(tempDir + "/sentinel_store.json")
 	logger := audit.NewLogger()
@@ -63,17 +62,30 @@ func setupRecorderAPITestServer(t *testing.T) (*httptest.Server, *database.Store
 
 	server := api.NewServer(store, registry, cfgEngine, discEngine, licMgr, logger, nil, nil, batchEng, firmwareEng, rbacMgr, recorderEng)
 	ts := httptest.NewServer(server.Handler())
-	return ts, store, recorderEng
+	token := server.IssueSessionForTest(security.RoleAdmin, "default", "hq")
+	return ts, store, recorderEng, token
 }
 
 func TestPhase6RecorderAPIE2E(t *testing.T) {
-	ts, _, _ := setupRecorderAPITestServer(t)
+	ts, _, _, token := setupRecorderAPITestServer(t)
 	defer ts.Close()
 
 	client := &http.Client{Timeout: 5 * time.Second}
 
+	authReq := func(method, urlStr string, body string) *http.Request {
+		var req *http.Request
+		if body != "" {
+			req, _ = http.NewRequest(method, urlStr, strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+		} else {
+			req, _ = http.NewRequest(method, urlStr, nil)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		return req
+	}
+
 	// 1. GET /api/v1/recorders
-	res, err := client.Get(ts.URL + "/api/v1/recorders")
+	res, err := client.Do(authReq("GET", ts.URL+"/api/v1/recorders", ""))
 	if err != nil {
 		t.Fatalf("GET /recorders failed: %v", err)
 	}
@@ -89,7 +101,7 @@ func TestPhase6RecorderAPIE2E(t *testing.T) {
 	}
 
 	// 2. GET /api/v1/recorders/test-xvr-5108/profile
-	res, err = client.Get(ts.URL + "/api/v1/recorders/test-xvr-5108/profile")
+	res, err = client.Do(authReq("GET", ts.URL+"/api/v1/recorders/test-xvr-5108/profile", ""))
 	if err != nil {
 		t.Fatalf("GET /profile failed: %v", err)
 	}
@@ -101,7 +113,7 @@ func TestPhase6RecorderAPIE2E(t *testing.T) {
 	}
 
 	// 3. GET /api/v1/recorders/test-xvr-5108/channels
-	res, err = client.Get(ts.URL + "/api/v1/recorders/test-xvr-5108/channels")
+	res, err = client.Do(authReq("GET", ts.URL+"/api/v1/recorders/test-xvr-5108/channels", ""))
 	if err != nil {
 		t.Fatalf("GET /channels failed: %v", err)
 	}
@@ -114,7 +126,7 @@ func TestPhase6RecorderAPIE2E(t *testing.T) {
 
 	// 4. POST /api/v1/recorders/test-xvr-5108/channels/1/analog-format
 	formatReq := `{"signal_format":"AHD"}`
-	res, err = client.Post(ts.URL+"/api/v1/recorders/test-xvr-5108/channels/1/analog-format", "application/json", strings.NewReader(formatReq))
+	res, err = client.Do(authReq("POST", ts.URL+"/api/v1/recorders/test-xvr-5108/channels/1/analog-format", formatReq))
 	if err != nil {
 		t.Fatalf("POST /analog-format failed: %v", err)
 	}
@@ -125,7 +137,7 @@ func TestPhase6RecorderAPIE2E(t *testing.T) {
 
 	// 5. POST /api/v1/recorders/test-xvr-5108/channels/1/coaxial-control
 	coaxReq := `{"command":"MENU_ENTER"}`
-	res, err = client.Post(ts.URL+"/api/v1/recorders/test-xvr-5108/channels/1/coaxial-control", "application/json", strings.NewReader(coaxReq))
+	res, err = client.Do(authReq("POST", ts.URL+"/api/v1/recorders/test-xvr-5108/channels/1/coaxial-control", coaxReq))
 	if err != nil {
 		t.Fatalf("POST /coaxial-control failed: %v", err)
 	}
@@ -136,7 +148,7 @@ func TestPhase6RecorderAPIE2E(t *testing.T) {
 
 	// 6. POST /api/v1/recorders/test-xvr-5108/channels/9/register-ip
 	ipReq := `{"ip":"192.168.31.107","port":80,"protocol":"ONVIF","username":"admin","password":"password"}`
-	res, err = client.Post(ts.URL+"/api/v1/recorders/test-xvr-5108/channels/9/register-ip", "application/json", strings.NewReader(ipReq))
+	res, err = client.Do(authReq("POST", ts.URL+"/api/v1/recorders/test-xvr-5108/channels/9/register-ip", ipReq))
 	if err != nil {
 		t.Fatalf("POST /register-ip failed: %v", err)
 	}
@@ -146,7 +158,7 @@ func TestPhase6RecorderAPIE2E(t *testing.T) {
 	}
 
 	// 7. GET /api/v1/recorders/test-xvr-5108/channels/1/schedule
-	res, err = client.Get(ts.URL + "/api/v1/recorders/test-xvr-5108/channels/1/schedule")
+	res, err = client.Do(authReq("GET", ts.URL+"/api/v1/recorders/test-xvr-5108/channels/1/schedule", ""))
 	if err != nil {
 		t.Fatalf("GET /schedule failed: %v", err)
 	}
@@ -156,7 +168,7 @@ func TestPhase6RecorderAPIE2E(t *testing.T) {
 	}
 
 	// 8. GET /api/v1/recorders/test-xvr-5108/recordings/search?channel_id=1
-	res, err = client.Get(ts.URL + "/api/v1/recorders/test-xvr-5108/recordings/search?channel_id=1")
+	res, err = client.Do(authReq("GET", ts.URL+"/api/v1/recorders/test-xvr-5108/recordings/search?channel_id=1", ""))
 	if err != nil {
 		t.Fatalf("GET /recordings/search failed: %v", err)
 	}
@@ -167,7 +179,7 @@ func TestPhase6RecorderAPIE2E(t *testing.T) {
 
 	// 9. POST /api/v1/recorders/test-xvr-5108/recordings/playback-session
 	playReq := `{"channel_id":1}`
-	res, err = client.Post(ts.URL+"/api/v1/recorders/test-xvr-5108/recordings/playback-session", "application/json", strings.NewReader(playReq))
+	res, err = client.Do(authReq("POST", ts.URL+"/api/v1/recorders/test-xvr-5108/recordings/playback-session", playReq))
 	if err != nil {
 		t.Fatalf("POST /playback-session failed: %v", err)
 	}
@@ -179,7 +191,7 @@ func TestPhase6RecorderAPIE2E(t *testing.T) {
 	}
 
 	// 10. GET /api/v1/recorders/test-xvr-5108/storage
-	res, err = client.Get(ts.URL + "/api/v1/recorders/test-xvr-5108/storage")
+	res, err = client.Do(authReq("GET", ts.URL+"/api/v1/recorders/test-xvr-5108/storage", ""))
 	if err != nil {
 		t.Fatalf("GET /storage failed: %v", err)
 	}
@@ -190,7 +202,7 @@ func TestPhase6RecorderAPIE2E(t *testing.T) {
 
 	// 11. POST /api/v1/recorders/test-xvr-5108/storage/format/preview & approve
 	fmtReq := `{"disk_index":1}`
-	res, err = client.Post(ts.URL+"/api/v1/recorders/test-xvr-5108/storage/format/preview", "application/json", strings.NewReader(fmtReq))
+	res, err = client.Do(authReq("POST", ts.URL+"/api/v1/recorders/test-xvr-5108/storage/format/preview", fmtReq))
 	if err != nil {
 		t.Fatalf("POST /format/preview failed: %v", err)
 	}
@@ -199,7 +211,7 @@ func TestPhase6RecorderAPIE2E(t *testing.T) {
 	_ = json.NewDecoder(res.Body).Decode(&fmtPrev)
 
 	appReq := `{"format_token":"` + fmtPrev.FormatToken + `"}`
-	res, err = client.Post(ts.URL+"/api/v1/recorders/test-xvr-5108/storage/format/approve", "application/json", bytes.NewReader([]byte(appReq)))
+	res, err = client.Do(authReq("POST", ts.URL+"/api/v1/recorders/test-xvr-5108/storage/format/approve", appReq))
 	if err != nil {
 		t.Fatalf("POST /format/approve failed: %v", err)
 	}

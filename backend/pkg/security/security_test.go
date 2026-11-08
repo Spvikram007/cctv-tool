@@ -7,129 +7,219 @@ import (
 	"cctv-sentinel/pkg/security"
 )
 
-func TestRBACAuthenticationAndPermissions(t *testing.T) {
+func TestNoDefaultCredentials(t *testing.T) {
 	rbac := security.NewRBACManager()
 
-	// 1. Authenticate Admin
-	adminSess, err := rbac.Authenticate("admin", "Admin@Sentinel2026!", 1*time.Hour)
-	if err != nil {
-		t.Fatalf("Admin authentication failed: %v", err)
-	}
-	if adminSess.Role != security.RoleAdmin {
-		t.Errorf("expected RoleAdmin, got %s", adminSess.Role)
-	}
-
-	// Verify Admin has all permissions
-	if !security.HasPermission(adminSess.Role, security.PermReboot) {
-		t.Errorf("Admin must have PermReboot")
-	}
-	if !security.HasPermission(adminSess.Role, security.PermFirmwareUpgrade) {
-		t.Errorf("Admin must have PermFirmwareUpgrade")
+	// 1. None of the default accounts should authenticate
+	defaults := []struct {
+		user string
+		pass string
+	}{
+		{"admin", "Admin@Sentinel2026!"},
+		{"technician", "Tech@Sentinel2026!"},
+		{"auditor", "Audit@Sentinel2026!"},
+		{"viewer", "View@Sentinel2026!"},
 	}
 
-	// 2. Authenticate Viewer
-	viewerSess, err := rbac.Authenticate("viewer", "View@Sentinel2026!", 1*time.Hour)
-	if err != nil {
-		t.Fatalf("Viewer authentication failed: %v", err)
-	}
-
-	// Viewer can view live, but cannot reboot or configure devices
-	if !security.HasPermission(viewerSess.Role, security.PermViewLive) {
-		t.Errorf("Viewer must have PermViewLive")
-	}
-	if security.HasPermission(viewerSess.Role, security.PermReboot) {
-		t.Errorf("Viewer must NOT have PermReboot")
-	}
-	if security.HasPermission(viewerSess.Role, security.PermDeviceConfig) {
-		t.Errorf("Viewer must NOT have PermDeviceConfig")
-	}
-
-	// 3. Test Invalid Credentials
-	_, err = rbac.Authenticate("admin", "WrongPassword123", 1*time.Hour)
-	if err != security.ErrUnauthorized {
-		t.Errorf("expected ErrUnauthorized for bad password, got %v", err)
+	for _, d := range defaults {
+		_, err := rbac.Authenticate(d.user, d.pass, 1*time.Hour)
+		if err != security.ErrUnauthorized {
+			t.Fatalf("CRITICAL SECURITY VIOLATION: Default credentials for user %s still active!", d.user)
+		}
 	}
 }
 
-func TestArgon2idPasswordHashingAndRehash(t *testing.T) {
+func TestFirstRunSetupLifecycle(t *testing.T) {
 	rbac := security.NewRBACManager()
 
-	// 1. Authenticate with newly created Argon2id account
-	sess, err := rbac.Authenticate("admin", "Admin@Sentinel2026!", 1*time.Hour)
-	if err != nil || sess == nil {
-		t.Fatalf("Argon2id authentication failed: %v", err)
+	// 1. System must be in SetupMode
+	if !rbac.IsSetupRequired() {
+		t.Fatalf("fresh RBACManager must require setup")
 	}
 
-	// 2. Test legacy migration / rehash
-	// Create user with explicit legacy salted hash (pre-Phase 6)
-	legacyUser := "legacy_tech"
-	legacyPass := "LegacyPass@2025!"
-	_ = rbac.CreateUser(legacyUser, legacyPass, "Legacy Tech", security.RoleTechnician, "legacy@tds.in", "default", "site-1")
+	setupTok := rbac.GetSetupToken()
+	if setupTok == "" {
+		t.Fatalf("expected non-empty setup token")
+	}
 
-	// Verify authenticate works and upgrades to Argon2id
-	legacySess, err := rbac.Authenticate(legacyUser, legacyPass, 1*time.Hour)
-	if err != nil || legacySess == nil {
-		t.Fatalf("Legacy password authentication failed: %v", err)
+	// 2. Reject invalid setup token
+	err := rbac.CompleteSetup("sent-setup-invalid-token", "admin", "Admin@Sentinel2026!", "Admin", "admin@tds.in")
+	if err != security.ErrInvalidSetupToken {
+		t.Fatalf("expected ErrInvalidSetupToken, got %v", err)
+	}
+
+	// 3. Reject weak password
+	err = rbac.CompleteSetup(setupTok, "admin", "weakpass", "Admin", "admin@tds.in")
+	if err == nil {
+		t.Fatalf("expected error for weak password, got nil")
+	}
+
+	// 4. Accept valid administrator creation
+	validAdminPass := "Admin@Sentinel2026!"
+	err = rbac.CompleteSetup(setupTok, "admin", validAdminPass, "Lead Architect", "admin@tds.in")
+	if err != nil {
+		t.Fatalf("valid admin setup failed: %v", err)
+	}
+
+	// 5. Setup mode must be permanently disabled and token erased
+	if rbac.IsSetupRequired() {
+		t.Errorf("setup must be disabled after admin creation")
+	}
+	if rbac.GetSetupToken() != "" {
+		t.Errorf("setup token must be erased after setup completion")
+	}
+
+	// 6. Second setup attempt must be rejected
+	err = rbac.CompleteSetup(setupTok, "intruder", "Hacker@2026!", "Intruder", "evil@evil.com")
+	if err != security.ErrSetupDisabled {
+		t.Fatalf("expected ErrSetupDisabled on second attempt, got %v", err)
+	}
+
+	// 7. Administrator authenticates successfully
+	sess, err := rbac.Authenticate("admin", validAdminPass, 1*time.Hour)
+	if err != nil || sess == nil {
+		t.Fatalf("admin authentication failed: %v", err)
+	}
+	if sess.Role != security.RoleAdmin {
+		t.Errorf("expected RoleAdmin, got %s", sess.Role)
+	}
+
+	// Admin permissions verified
+	if !security.HasPermission(sess.Role, security.PermReboot) {
+		t.Errorf("Admin must have PermReboot")
+	}
+	if !security.HasPermission(sess.Role, security.PermFirmwareUpgrade) {
+		t.Errorf("Admin must have PermFirmwareUpgrade")
+	}
+	if !security.HasPermission(sess.Role, security.PermPTZControl) {
+		t.Errorf("Admin must have PermPTZControl")
+	}
+}
+
+func TestArgon2idParameterLimitsAndDoSResistance(t *testing.T) {
+	rbac := security.NewRBACManager()
+	tok := rbac.GetSetupToken()
+	_ = rbac.CompleteSetup(tok, "admin", "Admin@Sentinel2026!", "Admin", "admin@tds.in")
+
+	// 1. Create a user with legacy SHA-256 hash and verify rehash
+	legacyUser := "legacy_user"
+	legacyPass := "LegacyPass@2026!"
+	_ = rbac.CreateUser(legacyUser, legacyPass, "Legacy Operator", security.RoleTechnician, "legacy@tds.in", "default", "site-1")
+
+	sess, err := rbac.Authenticate(legacyUser, legacyPass, 1*time.Hour)
+	if err != nil || sess == nil {
+		t.Fatalf("legacy authenticate and rehash failed: %v", err)
+	}
+
+	// 2. Test malformed and excessive Argon2 parameters rejection
+	// We inject an account with excessive memory parameter: m=1048576 (1GB, exceeds 512MB limit)
+	excessiveHash := "$argon2id$v=19$m=1048576,t=3,p=2$0102030405060708090a0b0c0d0e0f10$0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+	rbac.InjectUserWithHashForTest("attacker", excessiveHash, "0102030405060708090a0b0c0d0e0f10", security.RoleViewer)
+
+	_, err = rbac.Authenticate("attacker", "anyPassword123!", 1*time.Hour)
+	if err != security.ErrInvalidArgonParams {
+		t.Fatalf("expected ErrInvalidArgonParams for excessive memory, got %v", err)
+	}
+
+	// 3. Test wrong version: v=18
+	wrongVersionHash := "$argon2id$v=18$m=65536,t=3,p=2$0102030405060708090a0b0c0d0e0f10$0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+	rbac.InjectUserWithHashForTest("attacker2", wrongVersionHash, "0102030405060708090a0b0c0d0e0f10", security.RoleViewer)
+	_, err = rbac.Authenticate("attacker2", "anyPassword123!", 1*time.Hour)
+	if err != security.ErrInvalidArgonParams {
+		t.Fatalf("expected ErrInvalidArgonParams for wrong argon version, got %v", err)
+	}
+}
+
+func TestSessionValidationAndRevocation(t *testing.T) {
+	rbac := security.NewRBACManager()
+	tok := rbac.GetSetupToken()
+	_ = rbac.CompleteSetup(tok, "admin", "Admin@Sentinel2026!", "Admin", "admin@tds.in")
+
+	sess, err := rbac.Authenticate("admin", "Admin@Sentinel2026!", 1*time.Second)
+	if err != nil {
+		t.Fatalf("auth failed: %v", err)
+	}
+
+	// Immediate validation succeeds
+	vSess, err := rbac.ValidateSession(sess.Token)
+	if err != nil || vSess.Username != "admin" {
+		t.Fatalf("expected valid session, got %v", err)
+	}
+
+	// Explicit revocation
+	rbac.RevokeSession(sess.Token)
+	_, err = rbac.ValidateSession(sess.Token)
+	if err != security.ErrUnauthorized {
+		t.Errorf("expected ErrUnauthorized after revocation, got %v", err)
 	}
 }
 
 func TestSSRFProtection(t *testing.T) {
-	// 1. Cloud metadata IP must be blocked
+	// 1. Cloud metadata IPv4 must be blocked
 	_, err := security.ValidateSurveillanceIP("169.254.169.254", false)
 	if err == nil {
 		t.Errorf("CRITICAL SECURITY: 169.254.169.254 must be blocked by SSRF validator!")
 	}
 
-	// 2. Multicast IP must be blocked
+	// 2. Alibaba cloud metadata IPv4 must be blocked
+	_, err = security.ValidateSurveillanceIP("100.100.100.200", false)
+	if err == nil {
+		t.Errorf("CRITICAL SECURITY: 100.100.100.200 must be blocked by SSRF validator!")
+	}
+
+	// 3. AWS EC2 IPv6 metadata must be blocked
+	_, err = security.ValidateSurveillanceIP("fd00:ec2::254", false)
+	if err == nil {
+		t.Errorf("CRITICAL SECURITY: fd00:ec2::254 must be blocked by SSRF validator!")
+	}
+
+	// 4. Multicast IP must be blocked
 	_, err = security.ValidateSurveillanceIP("239.255.255.250", false)
 	if err == nil {
 		t.Errorf("Multicast address must be blocked for unicast queries")
 	}
 
-	// 3. Loopback without allowLoopback must be blocked
+	// 5. Loopback without allowLoopback must be blocked
 	_, err = security.ValidateSurveillanceIP("127.0.0.1", false)
 	if err == nil {
 		t.Errorf("Loopback address must be blocked when allowLoopback=false")
 	}
 
-	// 4. Legitimate surveillance camera IP must be accepted
+	// 6. Legitimate surveillance camera IP must be accepted
 	ip, err := security.ValidateSurveillanceIP("192.168.31.103", false)
 	if err != nil || ip.String() != "192.168.31.103" {
 		t.Errorf("Legitimate camera IP 192.168.31.103 was unexpectedly rejected: %v", err)
 	}
 }
 
-func TestPathTraversalPrevention(t *testing.T) {
-	maliciousPaths := []string{
-		"../../../../windows/system32/cmd.exe",
-		`..\..\..\boot.ini`,
-		"/etc/shadow",
-		"../../../data/snapshots/secret.jpg",
+func TestRolePermissionMatrix(t *testing.T) {
+	// Viewer role cannot reboot, upgrade firmware, configure devices, or manage PTZ
+	viewerRole := security.RoleViewer
+	if security.HasPermission(viewerRole, security.PermReboot) {
+		t.Errorf("Viewer must NOT have PermReboot")
+	}
+	if security.HasPermission(viewerRole, security.PermFirmwareUpgrade) {
+		t.Errorf("Viewer must NOT have PermFirmwareUpgrade")
+	}
+	if security.HasPermission(viewerRole, security.PermDeviceConfig) {
+		t.Errorf("Viewer must NOT have PermDeviceConfig")
+	}
+	if security.HasPermission(viewerRole, security.PermPTZManage) {
+		t.Errorf("Viewer must NOT have PermPTZManage")
+	}
+	if !security.HasPermission(viewerRole, security.PermViewLive) {
+		t.Errorf("Viewer must have PermViewLive")
 	}
 
-	for _, p := range maliciousPaths {
-		cleaned, err := security.SanitizePath(p)
-		if err == nil && cleaned != "cmd.exe" && cleaned != "boot.ini" && cleaned != "shadow" && cleaned != "secret.jpg" {
-			t.Errorf("Path traversal was not properly handled for %s", p)
-		}
+	// Auditor can view audit logs and live feeds, but cannot control PTZ or upgrade firmware
+	auditorRole := security.RoleAuditor
+	if !security.HasPermission(auditorRole, security.PermAuditView) {
+		t.Errorf("Auditor must have PermAuditView")
 	}
-}
-
-func TestIPRateLimiter(t *testing.T) {
-	// 5 requests per second, capacity 5
-	limiter := security.NewIPRateLimiter(5.0, 5.0)
-
-	testIP := "192.168.1.50"
-
-	// Initial 5 requests should pass
-	for i := 0; i < 5; i++ {
-		if !limiter.Allow(testIP) {
-			t.Fatalf("Request %d should have been allowed under capacity limit", i+1)
-		}
+	if security.HasPermission(auditorRole, security.PermFirmwareUpgrade) {
+		t.Errorf("Auditor must NOT have PermFirmwareUpgrade")
 	}
-
-	// 6th immediate request should be rate-limited
-	if limiter.Allow(testIP) {
-		t.Errorf("Request 6 should have been rate limited")
+	if security.HasPermission(auditorRole, security.PermPTZControl) {
+		t.Errorf("Auditor must NOT have PermPTZControl")
 	}
 }

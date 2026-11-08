@@ -2,10 +2,14 @@ package api
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -30,24 +34,25 @@ import (
 )
 
 type Server struct {
-	store        *database.Store
-	registry     *adapters.Registry
-	configEngine *configengine.Engine
-	discoveryEng *discovery.Engine
-	licenseMgr   *licensing.Manager
-	logger       *audit.Logger
-	snapshotEng  *snapshot.Engine
-	streamHub    *streamhub.Hub
-	batchEng     *batch.Engine
-	firmwareEng  *firmware.Engine
-	recorderEng  *recorder.Engine
-	rbacMgr      *security.RBACManager
-	ptzEng       *ptz.Engine
-	eventMgr     *events.EventManager
-	alarmEng     *alarms.Engine
-	rateLimiter  *security.IPRateLimiter
-	mux          *http.ServeMux
-	startTime    time.Time
+	store          *database.Store
+	registry       *adapters.Registry
+	configEngine   *configengine.Engine
+	discoveryEng   *discovery.Engine
+	licenseMgr     *licensing.Manager
+	logger         *audit.Logger
+	snapshotEng    *snapshot.Engine
+	streamHub      *streamhub.Hub
+	batchEng       *batch.Engine
+	firmwareEng    *firmware.Engine
+	recorderEng    *recorder.Engine
+	rbacMgr        *security.RBACManager
+	ptzEng         *ptz.Engine
+	eventMgr       *events.EventManager
+	alarmEng       *alarms.Engine
+	rateLimiter    *security.IPRateLimiter
+	allowedOrigins map[string]bool
+	mux            *http.ServeMux
+	startTime      time.Time
 }
 
 func NewServer(
@@ -103,12 +108,18 @@ func NewServer(
 		firmwareEng:  firmwareEng,
 		recorderEng:  recorderEng,
 		rbacMgr:      rbacMgr,
-		ptzEng:       ptzEng,
-		eventMgr:     eventMgr,
-		alarmEng:     alarmEng,
-		rateLimiter:  security.NewIPRateLimiter(50.0, 100.0),
-		mux:          http.NewServeMux(),
-		startTime:    time.Now().UTC(),
+		ptzEng:         ptzEng,
+		eventMgr:       eventMgr,
+		alarmEng:       alarmEng,
+		rateLimiter:    security.NewIPRateLimiter(50.0, 100.0),
+		allowedOrigins: map[string]bool{
+			"http://localhost:5173": true,
+			"http://127.0.0.1:5173": true,
+			"http://localhost:8080": true,
+			"http://127.0.0.1:8080": true,
+		},
+		mux:       http.NewServeMux(),
+		startTime: time.Now().UTC(),
 	}
 	s.registerRoutes()
 	return s
@@ -126,11 +137,27 @@ func (s *Server) Handler() http.Handler {
 			return
 		}
 
-		// Enable CORS for frontend desktop and web
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		// Comprehensive HTTP Security Headers
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-XSS-Protection", "1; mode=block")
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ws: wss:;")
+
+		// Enforce strict CORS allowlist (deny wildcard credentialed access)
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			if s.allowedOrigins != nil && s.allowedOrigins[origin] {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Access-Control-Allow-Credentials", "true")
+				w.Header().Set("Vary", "Origin")
+			}
+		}
+
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, X-Request-ID")
 		w.Header().Set("Access-Control-Expose-Headers", "X-Request-ID")
+		w.Header().Set("Access-Control-Max-Age", "86400")
 
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusOK)
@@ -140,6 +167,277 @@ func (s *Server) Handler() http.Handler {
 		s.mux.ServeHTTP(w, r)
 	})
 	return RequestCorrelationMiddleware(corsHandler)
+}
+
+const sessionContextKey contextKey = "sentinel.session"
+
+func getSession(r *http.Request) *security.Session {
+	if val := r.Context().Value(sessionContextKey); val != nil {
+		if sess, ok := val.(*security.Session); ok {
+			return sess
+		}
+	}
+	return nil
+}
+
+func checkTenantAccess(sess *security.Session, tenantID, siteID string) bool {
+	if sess == nil {
+		return false
+	}
+	// Super-admins in "default" or empty tenant have global fleet access
+	if sess.Role == security.RoleAdmin && (sess.TenantID == "" || sess.TenantID == "default") {
+		return true
+	}
+	if sess.TenantID != "" && sess.TenantID != "default" && tenantID != "" && sess.TenantID != tenantID {
+		return false
+	}
+	if sess.SiteID != "" && sess.SiteID != "default" && siteID != "" && sess.SiteID != siteID {
+		return false
+	}
+	return true
+}
+
+func (s *Server) checkPermission(r *http.Request, perm security.Permission) bool {
+	sess := getSession(r)
+	if sess == nil {
+		return false
+	}
+	return security.HasPermission(sess.Role, perm)
+}
+
+func (s *Server) requireAuth(perm security.Permission, handler http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := ""
+		authHeader := r.Header.Get("Authorization")
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			token = strings.TrimPrefix(authHeader, "Bearer ")
+		} else if strings.HasPrefix(authHeader, "bearer ") {
+			token = strings.TrimPrefix(authHeader, "bearer ")
+		} else {
+			token = r.URL.Query().Get("token")
+		}
+
+		if token == "" {
+			writeError(w, r, http.StatusUnauthorized, "UNAUTHORIZED", "Authentication required: missing Bearer session token")
+			return
+		}
+
+		sess, err := s.rbacMgr.ValidateSession(token)
+		if err != nil {
+			if errors.Is(err, security.ErrSessionExpired) {
+				writeError(w, r, http.StatusUnauthorized, "SESSION_EXPIRED", "Session token expired; re-authentication required")
+				return
+			}
+			writeError(w, r, http.StatusUnauthorized, "UNAUTHORIZED", "Invalid or terminated session token")
+			return
+		}
+
+		if !security.HasPermission(sess.Role, perm) {
+			s.logger.Log(sess.Username, "SYSTEM", r.RemoteAddr, "ACCESS_DENIED", "SECURITY", "FORBIDDEN",
+				fmt.Sprintf("Role %s lacks permission %s for route %s", sess.Role, perm, r.URL.Path), "")
+			writeError(w, r, http.StatusForbidden, "FORBIDDEN", fmt.Sprintf("Role %s lacks required permission: %s", sess.Role, perm))
+			return
+		}
+
+		ctx := context.WithValue(r.Context(), sessionContextKey, sess)
+		handler(w, r.WithContext(ctx))
+	}
+}
+
+// IssueSessionForTest generates an active session token for unit test execution
+func (s *Server) IssueSessionForTest(role security.Role, tenantID, siteID string) string {
+	tokBytes := make([]byte, 24)
+	if _, err := rand.Read(tokBytes); err != nil {
+		tokBytes = []byte("test-session-bytes-123456789012")
+	}
+	tok := fmt.Sprintf("test-sess-%s", hex.EncodeToString(tokBytes))
+	s.rbacMgr.InjectSessionForTest(tok, "test-operator", role, tenantID, siteID, 24*time.Hour)
+	return tok
+}
+
+// GetRBACManager returns the underlying RBACManager instance
+func (s *Server) GetRBACManager() *security.RBACManager {
+	return s.rbacMgr
+}
+
+// SetAllowedOrigins dynamically overrides the allowed CORS origins
+func (s *Server) SetAllowedOrigins(origins []string) {
+	newMap := make(map[string]bool)
+	for _, o := range origins {
+		newMap[o] = true
+	}
+	s.allowedOrigins = newMap
+}
+
+func (s *Server) handleAuthSetupStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"setup_required": s.rbacMgr.IsSetupRequired(),
+		"users_count":    len(s.rbacMgr.ListUsers()),
+	})
+}
+
+func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	var req struct {
+		SetupToken string `json:"setup_token"`
+		Username   string `json:"username"`
+		Password   string `json:"password"`
+		FullName   string `json:"full_name"`
+		Email      string `json:"email"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, r, http.StatusBadRequest, "BAD_REQUEST", "Invalid setup JSON payload")
+		return
+	}
+
+	if err := s.rbacMgr.CompleteSetup(req.SetupToken, req.Username, req.Password, req.FullName, req.Email); err != nil {
+		s.logger.Log(req.Username, "SYSTEM", r.RemoteAddr, "FIRST_RUN_SETUP", "SECURITY", "FAILED", err.Error(), "")
+		if errors.Is(err, security.ErrSetupDisabled) {
+			writeError(w, r, http.StatusForbidden, "SETUP_DISABLED", err.Error())
+			return
+		}
+		if errors.Is(err, security.ErrInvalidSetupToken) || errors.Is(err, security.ErrSetupTokenExpired) {
+			writeError(w, r, http.StatusUnauthorized, "INVALID_TOKEN", err.Error())
+			return
+		}
+		writeError(w, r, http.StatusBadRequest, "SETUP_FAILED", err.Error())
+		return
+	}
+
+	s.logger.Log(req.Username, "SYSTEM", r.RemoteAddr, "FIRST_RUN_SETUP", "SECURITY", "SUCCESS", "Initial administrator provisioned; setup token destroyed", "")
+	writeJSON(w, http.StatusCreated, map[string]interface{}{
+		"success":  true,
+		"message":  "Administrator account provisioned successfully. Initial setup permanently completed.",
+		"username": req.Username,
+	})
+}
+
+func (s *Server) handleAuditRotateKey(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	newKeyID, err := s.logger.RotateCheckpointKey()
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "KEY_ROTATION_FAILED", err.Error())
+		return
+	}
+	s.logger.Log("Admin", "SYSTEM", r.RemoteAddr, "ROTATE_AUDIT_KEY", "SECURITY", "SUCCESS", fmt.Sprintf("Rotated HMAC checkpoint key to %s", newKeyID), "")
+	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "new_key_id": newKeyID})
+}
+
+func (s *Server) handleAuditExportSigned(w http.ResponseWriter, r *http.Request) {
+	exportFile := "./data/audit_export_signed.json"
+	_ = os.MkdirAll("./data", 0755)
+	if err := s.logger.ExportSignedLedger(exportFile); err != nil {
+		writeError(w, r, http.StatusInternalServerError, "EXPORT_FAILED", err.Error())
+		return
+	}
+	data, err := os.ReadFile(exportFile)
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "READ_FAILED", err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Disposition", "attachment; filename=\"audit_ledger_signed.json\"")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
+func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
+	sess := getSession(r)
+	if r.Method == "GET" {
+		devs := s.store.ListDevices()
+		filtered := make([]models.Device, 0, len(devs))
+		for _, d := range devs {
+			if checkTenantAccess(sess, d.TenantID, d.SiteID) {
+				filtered = append(filtered, d)
+			}
+		}
+		writeJSON(w, http.StatusOK, filtered)
+		return
+	}
+	if r.Method == "POST" {
+		if !s.checkPermission(r, security.PermDeviceConfig) {
+			writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Device creation requires DEVICE_CONFIG permission")
+			return
+		}
+		var dev models.Device
+		if err := json.NewDecoder(r.Body).Decode(&dev); err != nil {
+			writeSimpleError(w, r, http.StatusBadRequest, "Invalid device payload")
+			return
+		}
+		if dev.ID == "" {
+			dev.ID = fmt.Sprintf("dev-%d", time.Now().UnixNano())
+		}
+		if sess != nil && sess.TenantID != "" && dev.TenantID == "" {
+			dev.TenantID = sess.TenantID
+		}
+		if sess != nil && sess.SiteID != "" && dev.SiteID == "" {
+			dev.SiteID = sess.SiteID
+		}
+		s.store.UpsertDevice(dev)
+		userName := "Operator"
+		if sess != nil {
+			userName = sess.Username
+		}
+		s.logger.Log(userName, dev.ID, dev.IP, "ADD_DEVICE", "DEVICE", "SUCCESS", fmt.Sprintf("Added %s (%s)", dev.Name, dev.Manufacturer), "")
+		writeJSON(w, http.StatusCreated, dev)
+		return
+	}
+	writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
+}
+
+func (s *Server) handleTechnicianReport(w http.ResponseWriter, r *http.Request) {
+	devs := s.store.ListDevices()
+	lic := s.licenseMgr.GetLicense()
+	logs := s.logger.GetEntries()
+
+	onlineCount := 0
+	offlineCount := 0
+	unknownCount := 0
+	now := time.Now().UTC()
+
+	for _, d := range devs {
+		statusLower := strings.ToLower(d.Status)
+		switch statusLower {
+		case "online", "authenticated":
+			if !d.LastSeen.IsZero() && now.Sub(d.LastSeen) > 10*time.Minute {
+				offlineCount++
+			} else {
+				onlineCount++
+			}
+		case "offline":
+			offlineCount++
+		default:
+			unknownCount++
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"report_title":           "CCTV SENTINEL UNIVERSAL - COMMISSIONING & AUDIT REPORT",
+		"generated_at":           now.Format(time.RFC3339),
+		"measurement_timestamp": now.Format(time.RFC3339),
+		"issued_by":              "Tech Defence Solutions",
+		"licensee":               lic.OwnerName,
+		"tier":                   lic.Tier,
+		"total_devices":          len(devs),
+		"online_devices":         onlineCount,
+		"offline_devices":        offlineCount,
+		"unknown_devices":        unknownCount,
+		"device_inventory":       devs,
+		"audit_trail_count":      len(logs),
+		"recent_actions":         logs,
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
@@ -184,7 +482,7 @@ func (s *Server) registerRoutes() {
 		fs.ServeHTTP(w, r)
 	})
 
-	// 0. Liveness & Readiness endpoints
+	// 0. Public Liveness, Readiness & Setup endpoints
 	s.mux.HandleFunc("/api/v1/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"status":     "UP",
@@ -232,8 +530,13 @@ func (s *Server) registerRoutes() {
 		})
 	})
 
+	s.mux.HandleFunc("/api/v1/auth/setup/status", s.handleAuthSetupStatus)
+	s.mux.HandleFunc("/api/v1/auth/setup", s.handleAuthSetup)
+	s.mux.HandleFunc("/api/v1/auth/login", s.handleSecurityLogin)
+	s.mux.HandleFunc("/api/v1/security/login", s.handleSecurityLogin)
+
 	// 1. System status
-	s.mux.HandleFunc("/api/v1/system/status", func(w http.ResponseWriter, r *http.Request) {
+	s.mux.HandleFunc("/api/v1/system/status", s.requireAuth(security.PermViewLive, func(w http.ResponseWriter, r *http.Request) {
 		lic := s.licenseMgr.GetLicense()
 		devices := s.store.ListDevices()
 		writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -247,49 +550,28 @@ func (s *Server) registerRoutes() {
 			"max_allowed":  lic.MaxDevices,
 			"status":       "HEALTHY",
 		})
-	})
+	}))
 
 	// 2. Devices endpoints
-	s.mux.HandleFunc("/api/v1/devices", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "GET" {
-			devs := s.store.ListDevices()
-			writeJSON(w, http.StatusOK, devs)
-			return
-		}
-		if r.Method == "POST" {
-			var dev models.Device
-			if err := json.NewDecoder(r.Body).Decode(&dev); err != nil {
-				writeSimpleError(w, r, http.StatusBadRequest, "Invalid device payload")
-				return
-			}
-			if dev.ID == "" {
-				dev.ID = fmt.Sprintf("dev-%d", time.Now().UnixNano())
-			}
-			s.store.UpsertDevice(dev)
-			s.logger.Log("Technician", dev.ID, dev.IP, "ADD_DEVICE", "DEVICE", "SUCCESS", fmt.Sprintf("Added %s (%s)", dev.Name, dev.Manufacturer), "")
-			writeJSON(w, http.StatusCreated, dev)
-			return
-		}
-		writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
-	})
+	s.mux.HandleFunc("/api/v1/devices", s.requireAuth(security.PermViewLive, s.handleDevices))
 
 	// 3. Network Discovery
-	s.mux.HandleFunc("/api/v1/devices/discover", s.handleStartDiscovery)
-	s.mux.HandleFunc("/api/v1/devices/discover/progress", func(w http.ResponseWriter, r *http.Request) {
+	s.mux.HandleFunc("/api/v1/devices/discover", s.requireAuth(security.PermDeviceConfig, s.handleStartDiscovery))
+	s.mux.HandleFunc("/api/v1/devices/discover/progress", s.requireAuth(security.PermViewLive, func(w http.ResponseWriter, r *http.Request) {
 		prog := s.discoveryEng.GetProgress()
 		writeJSON(w, http.StatusOK, prog)
-	})
-	s.mux.HandleFunc("/api/v1/discovery/interfaces", s.handleDiscoveryInterfaces)
-	s.mux.HandleFunc("/api/v1/discovery/", s.handleDiscoverySubroutes)
+	}))
+	s.mux.HandleFunc("/api/v1/discovery/interfaces", s.requireAuth(security.PermDeviceConfig, s.handleDiscoveryInterfaces))
+	s.mux.HandleFunc("/api/v1/discovery/", s.requireAuth(security.PermViewLive, s.handleDiscoverySubroutes))
 
 	// 4. Device specific routes dispatcher: /api/v1/devices/
-	s.mux.HandleFunc("/api/v1/devices/", s.handleDeviceSubroutes)
+	s.mux.HandleFunc("/api/v1/devices/", s.requireAuth(security.PermViewLive, s.handleDeviceSubroutes))
 
 	// 4.1 Live Streaming Hub routes: /api/v1/streams/
 	s.mux.HandleFunc("/api/v1/streams/", s.handleStreamSubroutes)
 
 	// 5. Diagnostics
-	s.mux.HandleFunc("/api/v1/diagnostics/run", func(w http.ResponseWriter, r *http.Request) {
+	s.mux.HandleFunc("/api/v1/diagnostics/run", s.requireAuth(security.PermViewLive, func(w http.ResponseWriter, r *http.Request) {
 		ip := r.URL.Query().Get("ip")
 		if ip == "" {
 			ip = "127.0.0.1"
@@ -304,9 +586,9 @@ func (s *Server) registerRoutes() {
 		}
 		report := diagnostics.RunDiagnostics(ip, rPort, hPort)
 		writeJSON(w, http.StatusOK, report)
-	})
+	}))
 
-	s.mux.HandleFunc("/api/v1/diagnostics/subnet", func(w http.ResponseWriter, r *http.Request) {
+	s.mux.HandleFunc("/api/v1/diagnostics/subnet", s.requireAuth(security.PermViewLive, func(w http.ResponseWriter, r *http.Request) {
 		cidr := r.URL.Query().Get("cidr")
 		if cidr == "" {
 			cidr = "192.168.1.0/24"
@@ -317,9 +599,9 @@ func (s *Server) registerRoutes() {
 			return
 		}
 		writeJSON(w, http.StatusOK, calc)
-	})
+	}))
 
-	s.mux.HandleFunc("/api/v1/diagnostics/hdd", func(w http.ResponseWriter, r *http.Request) {
+	s.mux.HandleFunc("/api/v1/diagnostics/hdd", s.requireAuth(security.PermViewLive, func(w http.ResponseWriter, r *http.Request) {
 		cams, _ := strconv.Atoi(r.URL.Query().Get("cameras"))
 		if cams <= 0 {
 			cams = 8
@@ -336,9 +618,9 @@ func (s *Server) registerRoutes() {
 		}
 		calc := diagnostics.CalculateHDD(cams, codec, res, 0, days, hours)
 		writeJSON(w, http.StatusOK, calc)
-	})
+	}))
 
-	s.mux.HandleFunc("/api/v1/diagnostics/bandwidth", func(w http.ResponseWriter, r *http.Request) {
+	s.mux.HandleFunc("/api/v1/diagnostics/bandwidth", s.requireAuth(security.PermViewLive, func(w http.ResponseWriter, r *http.Request) {
 		cams, _ := strconv.Atoi(r.URL.Query().Get("cameras"))
 		if cams <= 0 {
 			cams = 8
@@ -353,20 +635,20 @@ func (s *Server) registerRoutes() {
 		}
 		calc := diagnostics.CalculateBandwidth(cams, mainB, subB)
 		writeJSON(w, http.StatusOK, calc)
-	})
+	}))
 
-	s.mux.HandleFunc("/api/v1/diagnostics/capacity", s.handleCapacityCalculator)
+	s.mux.HandleFunc("/api/v1/diagnostics/capacity", s.requireAuth(security.PermViewLive, s.handleCapacityCalculator))
 
 	// 6. Licensing
-	s.mux.HandleFunc("/api/v1/licensing", func(w http.ResponseWriter, r *http.Request) {
+	s.mux.HandleFunc("/api/v1/licensing", s.requireAuth(security.PermLicenseManage, func(w http.ResponseWriter, r *http.Request) {
 		lic := s.licenseMgr.GetLicense()
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"license":      lic,
 			"machine_hash": s.licenseMgr.GetMachineHash(),
 		})
-	})
+	}))
 
-	s.mux.HandleFunc("/api/v1/licensing/activate", func(w http.ResponseWriter, r *http.Request) {
+	s.mux.HandleFunc("/api/v1/licensing/activate", s.requireAuth(security.PermLicenseManage, func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Key     string `json:"key"`
 			Company string `json:"company"`
@@ -386,9 +668,9 @@ func (s *Server) registerRoutes() {
 			"message": "License activated successfully",
 			"license": s.licenseMgr.GetLicense(),
 		})
-	})
+	}))
 
-	s.mux.HandleFunc("/api/v1/licensing/gst-invoice", func(w http.ResponseWriter, r *http.Request) {
+	s.mux.HandleFunc("/api/v1/licensing/gst-invoice", s.requireAuth(security.PermLicenseManage, func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			CustomerName string `json:"customer_name"`
 			CustomerGST  string `json:"customer_gst"`
@@ -398,27 +680,37 @@ func (s *Server) registerRoutes() {
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		inv := s.licenseMgr.GenerateGSTInvoice(req.CustomerName, req.CustomerGST, req.State, req.Tier)
 		writeJSON(w, http.StatusOK, inv)
-	})
+	}))
 
-	// 7. Audit logs
-	s.mux.HandleFunc("/api/v1/audit/logs", func(w http.ResponseWriter, r *http.Request) {
+	// 7. Audit logs & verification
+	s.mux.HandleFunc("/api/v1/audit/logs", s.requireAuth(security.PermAuditView, func(w http.ResponseWriter, r *http.Request) {
 		logs := s.logger.GetEntries()
 		writeJSON(w, http.StatusOK, logs)
-	})
+	}))
+	s.mux.HandleFunc("/api/v1/audit/checkpoints", s.requireAuth(security.PermAuditView, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, s.logger.GetCheckpoints())
+	}))
+	s.mux.HandleFunc("/api/v1/audit/verify", s.requireAuth(security.PermAuditView, s.handleAuditVerifyChain))
+	s.mux.HandleFunc("/api/v1/audit/rotate-key", s.requireAuth(security.PermUserManagement, s.handleAuditRotateKey))
+	s.mux.HandleFunc("/api/v1/audit/export/signed", s.requireAuth(security.PermAuditView, s.handleAuditExportSigned))
 
 	// 8. Compatibility database
-	s.mux.HandleFunc("/api/v1/compatibility", func(w http.ResponseWriter, r *http.Request) {
+	s.mux.HandleFunc("/api/v1/compatibility", s.requireAuth(security.PermAuditView, func(w http.ResponseWriter, r *http.Request) {
 		matrix := s.store.GetCompatibility()
 		writeJSON(w, http.StatusOK, matrix)
-	})
+	}))
 
 	// 9. Sites
-	s.mux.HandleFunc("/api/v1/sites", func(w http.ResponseWriter, r *http.Request) {
+	s.mux.HandleFunc("/api/v1/sites", s.requireAuth(security.PermViewLive, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "GET" {
 			writeJSON(w, http.StatusOK, s.store.ListSites())
 			return
 		}
 		if r.Method == "POST" {
+			if !s.checkPermission(r, security.PermDeviceConfig) {
+				writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Site creation requires DEVICE_CONFIG permission")
+				return
+			}
 			var site database.Site
 			_ = json.NewDecoder(r.Body).Decode(&site)
 			if site.ID == "" {
@@ -429,73 +721,56 @@ func (s *Server) registerRoutes() {
 			writeJSON(w, http.StatusCreated, site)
 			return
 		}
-	})
+	}))
 
 	// 10. Phase 5 Enterprise Batch Engine routes
-	s.mux.HandleFunc("/api/v1/batch/preview", s.handleBatchPreview)
-	s.mux.HandleFunc("/api/v1/batch/execute", s.handleBatchExecute)
-	s.mux.HandleFunc("/api/v1/batch/jobs", s.handleBatchListJobs)
-	s.mux.HandleFunc("/api/v1/batch/jobs/", s.handleBatchJobSubroutes)
-	s.mux.HandleFunc("/api/v1/batch/compare", s.handleBatchCompare)
-	s.mux.HandleFunc("/api/v1/batch/export", s.handleBatchExport)
-	s.mux.HandleFunc("/api/v1/batch/import", s.handleBatchImport)
-	s.mux.HandleFunc("/api/v1/batch", s.handleBatchLegacyFallback)
+	s.mux.HandleFunc("/api/v1/batch/preview", s.requireAuth(security.PermBatchExecute, s.handleBatchPreview))
+	s.mux.HandleFunc("/api/v1/batch/execute", s.requireAuth(security.PermBatchExecute, s.handleBatchExecute))
+	s.mux.HandleFunc("/api/v1/batch/jobs", s.requireAuth(security.PermViewLive, s.handleBatchListJobs))
+	s.mux.HandleFunc("/api/v1/batch/jobs/", s.requireAuth(security.PermViewLive, s.handleBatchJobSubroutes))
+	s.mux.HandleFunc("/api/v1/batch/compare", s.requireAuth(security.PermViewLive, s.handleBatchCompare))
+	s.mux.HandleFunc("/api/v1/batch/export", s.requireAuth(security.PermBatchExecute, s.handleBatchExport))
+	s.mux.HandleFunc("/api/v1/batch/import", s.requireAuth(security.PermBatchExecute, s.handleBatchImport))
+	s.mux.HandleFunc("/api/v1/batch", s.requireAuth(security.PermBatchExecute, s.handleBatchLegacyFallback))
 
 	// 11. Phase 5 Secure Firmware Management routes
-	s.mux.HandleFunc("/api/v1/firmware/inventory", s.handleFirmwareInventory)
-	s.mux.HandleFunc("/api/v1/firmware/check-compatibility", s.handleFirmwareCheckCompatibility)
-	s.mux.HandleFunc("/api/v1/firmware/compatibility", s.handleFirmwareCheckCompatibility)
-	s.mux.HandleFunc("/api/v1/firmware/preview", s.handleFirmwarePreview)
-	s.mux.HandleFunc("/api/v1/firmware/stage", s.handleFirmwarePreview)
-	s.mux.HandleFunc("/api/v1/firmware/approve-update", s.handleFirmwareApproveUpdate)
-	s.mux.HandleFunc("/api/v1/firmware/approve", s.handleFirmwareApproveUpdate)
-	s.mux.HandleFunc("/api/v1/firmware/jobs/", s.handleFirmwareJobSubroutes)
+	s.mux.HandleFunc("/api/v1/firmware/inventory", s.requireAuth(security.PermViewLive, s.handleFirmwareInventory))
+	s.mux.HandleFunc("/api/v1/firmware/check-compatibility", s.requireAuth(security.PermViewLive, s.handleFirmwareCheckCompatibility))
+	s.mux.HandleFunc("/api/v1/firmware/compatibility", s.requireAuth(security.PermViewLive, s.handleFirmwareCheckCompatibility))
+	s.mux.HandleFunc("/api/v1/firmware/preview", s.requireAuth(security.PermFirmwareUpgrade, s.handleFirmwarePreview))
+	s.mux.HandleFunc("/api/v1/firmware/stage", s.requireAuth(security.PermFirmwareUpgrade, s.handleFirmwarePreview))
+	s.mux.HandleFunc("/api/v1/firmware/approve-update", s.requireAuth(security.PermFirmwareUpgrade, s.handleFirmwareApproveUpdate))
+	s.mux.HandleFunc("/api/v1/firmware/approve", s.requireAuth(security.PermFirmwareUpgrade, s.handleFirmwareApproveUpdate))
+	s.mux.HandleFunc("/api/v1/firmware/jobs/", s.requireAuth(security.PermFirmwareUpgrade, s.handleFirmwareJobSubroutes))
 
 	// 12. Phase 5 Security, RBAC & Audit Verification routes
-	s.mux.HandleFunc("/api/v1/security/login", s.handleSecurityLogin)
-	s.mux.HandleFunc("/api/v1/security/users", s.handleSecurityUsers)
-	s.mux.HandleFunc("/api/v1/security/vault/status", s.handleVaultStatus)
-	s.mux.HandleFunc("/api/v1/security/vault", s.handleVaultStatus)
-	s.mux.HandleFunc("/api/v1/audit/verify", s.handleAuditVerifyChain)
+	s.mux.HandleFunc("/api/v1/security/users", s.requireAuth(security.PermUserManagement, s.handleSecurityUsers))
+	s.mux.HandleFunc("/api/v1/security/vault/status", s.requireAuth(security.PermUserManagement, s.handleVaultStatus))
+	s.mux.HandleFunc("/api/v1/security/vault", s.requireAuth(security.PermUserManagement, s.handleVaultStatus))
 
 	// 13. Phase 6 Recorder, Channel, Recording & Playback routes
-	s.mux.HandleFunc("/api/v1/recorders", s.handleRecordersList)
-	s.mux.HandleFunc("/api/v1/recorders/", s.handleRecorderSubroutes)
+	s.mux.HandleFunc("/api/v1/recorders", s.requireAuth(security.PermViewLive, s.handleRecordersList))
+	s.mux.HandleFunc("/api/v1/recorders/", s.requireAuth(security.PermViewLive, s.handleRecorderSubroutes))
 
 	// 14. Phase 7 Real-Time Telemetry & Event Subscriptions
-	s.mux.HandleFunc("/api/v1/events/subscriptions", s.handleEventsListSubscriptions)
-	s.mux.HandleFunc("/api/v1/events/subscriptions/", s.handleEventsCancelSubscription)
-	s.mux.HandleFunc("/api/v1/events/live", s.handleEventsLive)
+	s.mux.HandleFunc("/api/v1/events/subscriptions", s.requireAuth(security.PermViewLive, s.handleEventsListSubscriptions))
+	s.mux.HandleFunc("/api/v1/events/subscriptions/", s.requireAuth(security.PermEventManage, s.handleEventsCancelSubscription))
+	s.mux.HandleFunc("/api/v1/events/live", s.requireAuth(security.PermViewLive, s.handleEventsLive))
 
 	// 15. Phase 7 Unified Alarms & Rule Automation routes
-	s.mux.HandleFunc("/api/v1/alarms", s.handleAlarms)
-	s.mux.HandleFunc("/api/v1/alarms/stats", s.handleAlarmsStats)
-	s.mux.HandleFunc("/api/v1/alarms/rules", s.handleAlarmsRules)
-	s.mux.HandleFunc("/api/v1/alarms/rules/", s.handleAlarmsRulesDelete)
-	s.mux.HandleFunc("/api/v1/alarms/export", s.handleAlarmsExport)
-	s.mux.HandleFunc("/api/v1/alarms/stream", s.handleAlarmsStream)
-	s.mux.HandleFunc("/api/v1/alarms/ws", s.handleAlarmsStream)
-	s.mux.HandleFunc("/api/v1/alarms/", s.handleAlarmSubroutes)
+	s.mux.HandleFunc("/api/v1/alarms", s.requireAuth(security.PermViewLive, s.handleAlarms))
+	s.mux.HandleFunc("/api/v1/alarms/stats", s.requireAuth(security.PermViewLive, s.handleAlarmsStats))
+	s.mux.HandleFunc("/api/v1/alarms/rules", s.requireAuth(security.PermViewLive, s.handleAlarmsRules))
+	s.mux.HandleFunc("/api/v1/alarms/rules/", s.requireAuth(security.PermEventManage, s.handleAlarmsRulesDelete))
+	s.mux.HandleFunc("/api/v1/alarms/export", s.requireAuth(security.PermPlaybackExport, s.handleAlarmsExport))
+	s.mux.HandleFunc("/api/v1/alarms/stream", s.requireAuth(security.PermViewLive, s.handleAlarmsStream))
+	s.mux.HandleFunc("/api/v1/alarms/ws", s.requireAuth(security.PermViewLive, s.handleAlarmsStream))
+	s.mux.HandleFunc("/api/v1/alarms/", s.requireAuth(security.PermViewLive, s.handleAlarmSubroutes))
 
-	// 11. Technician Report
-	s.mux.HandleFunc("/api/v1/reports/technician", func(w http.ResponseWriter, r *http.Request) {
-		devs := s.store.ListDevices()
-		lic := s.licenseMgr.GetLicense()
-		logs := s.logger.GetEntries()
-		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"report_title":      "CCTV SENTINEL UNIVERSAL - COMMISSIONING & AUDIT REPORT",
-			"generated_at":      time.Now().UTC().Format(time.RFC3339),
-			"issued_by":         "Tech Defence Solutions",
-			"licensee":          lic.OwnerName,
-			"tier":              lic.Tier,
-			"total_devices":     len(devs),
-			"online_devices":    len(devs),
-			"device_inventory":  devs,
-			"audit_trail_count": len(logs),
-			"recent_actions":    logs,
-		})
-	})
+	// 16. Technician Report
+	s.mux.HandleFunc("/api/v1/reports/technician", s.requireAuth(security.PermAuditView, s.handleTechnicianReport))
 }
+
 
 func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/v1/devices/")
@@ -508,9 +783,19 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Route: GET /api/v1/devices/:id
+	sess := getSession(r)
+	if !checkTenantAccess(sess, dev.TenantID, dev.SiteID) {
+		writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Access denied: device belongs to an isolated tenant or site")
+		return
+	}
+
+	// Route: GET /api/v1/devices/:id or DELETE
 	if len(parts) == 1 {
 		if r.Method == "DELETE" {
+			if !s.checkPermission(r, security.PermDeviceConfig) {
+				writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Device deletion requires DEVICE_CONFIG permission")
+				return
+			}
 			s.store.DeleteDevice(deviceID)
 			s.logger.Log("Technician", dev.ID, dev.IP, "DELETE_DEVICE", "DEVICE", "SUCCESS", fmt.Sprintf("Removed %s", dev.Name), "")
 			writeJSON(w, http.StatusOK, map[string]bool{"success": true})
@@ -533,6 +818,16 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 		s.handleDevicePTZ(w, r, &dev, parts)
 		return
 	}
+	if sub == "reboot" {
+		if r.Method != "POST" {
+			writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
+			return
+		}
+		if !s.checkPermission(r, security.PermReboot) {
+			writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Device reboot requires REBOOT permission")
+			return
+		}
+	}
 
 	adapter, err := s.registry.ResolveForDevice(&dev)
 	if err != nil {
@@ -543,6 +838,10 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 	case "auth":
 		if r.Method != "POST" {
 			writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
+			return
+		}
+		if !s.checkPermission(r, security.PermDeviceConfig) {
+			writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Device credential configuration requires DEVICE_CONFIG permission")
 			return
 		}
 		var authReq struct {
@@ -584,6 +883,10 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 		return
 
 	case "config":
+		if !s.checkPermission(r, security.PermDeviceConfig) {
+			writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Configuration operations require DEVICE_CONFIG permission")
+			return
+		}
 		if len(parts) > 2 {
 			switch parts[2] {
 			case "preview":
@@ -646,6 +949,12 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 		return
 
 	case "network":
+		if len(parts) > 2 && (parts[2] == "preview" || parts[2] == "apply") {
+			if !s.checkPermission(r, security.PermDeviceConfig) {
+				writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Network configuration operations require DEVICE_CONFIG permission")
+				return
+			}
+		}
 		if len(parts) > 2 && parts[2] == "preview" {
 			var body json.RawMessage
 			_ = json.NewDecoder(r.Body).Decode(&body)
@@ -685,6 +994,12 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, cfg)
 
 	case "image":
+		if len(parts) > 2 && (parts[2] == "preview" || parts[2] == "apply") {
+			if !s.checkPermission(r, security.PermDeviceConfig) {
+				writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Image configuration operations require DEVICE_CONFIG permission")
+				return
+			}
+		}
 		if len(parts) > 2 && parts[2] == "preview" {
 			var body json.RawMessage
 			_ = json.NewDecoder(r.Body).Decode(&body)
@@ -846,6 +1161,27 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, chans)
+
+	case "reboot":
+		if r.Method != "POST" {
+			writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
+			return
+		}
+		if !s.checkPermission(r, security.PermReboot) {
+			writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Device reboot requires REBOOT permission")
+			return
+		}
+		if _, err := adapter.GetCapabilities(&dev); err != nil && err != adapters.ErrUnsupportedOperation {
+			writeError(w, r, http.StatusBadGateway, "REBOOT_FAILED", "Device unreachable or rejected command: "+err.Error())
+			return
+		}
+		userName := "Technician"
+		if sess := getSession(r); sess != nil {
+			userName = sess.Username
+		}
+		s.logger.Log(userName, dev.ID, dev.IP, "REBOOT_DEVICE", "DEVICE", "SUCCESS", "Reboot sequence initiated", "")
+		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "message": "Reboot command accepted"})
+		return
 
 	default:
 		writeSimpleError(w, r, http.StatusNotFound, "Unknown device subresource")
@@ -1262,12 +1598,22 @@ func (s *Server) handleBatchCompare(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleBatchExport(w http.ResponseWriter, r *http.Request) {
 	devs := s.store.ListDevices()
+	rawJSON, err := json.Marshal(devs)
+	if err != nil {
+		writeError(w, r, http.StatusInternalServerError, "MARSHAL_ERROR", err.Error())
+		return
+	}
+
+	sig, keyID := s.logger.SignPayload(rawJSON)
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"exported_at":     time.Now().UTC().Format(time.RFC3339),
-		"version":         "1.0.0-PROD",
-		"device_count":    len(devs),
-		"inventory":       devs,
-		"hash_signature":  "FLEET_ARCHIVE_VERIFIED_OK",
+		"exported_at":       time.Now().UTC().Format(time.RFC3339),
+		"version":           "2.0.0-PROD",
+		"device_count":      len(devs),
+		"inventory":         devs,
+		"digital_signature": sig,
+		"signature_key_id":  keyID,
+		"hash_signature":    "HMAC-SHA256:" + sig,
 	})
 }
 
@@ -1278,10 +1624,35 @@ func (s *Server) handleBatchImport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Inventory []models.Device `json:"inventory"`
+		Inventory        []models.Device `json:"inventory"`
+		DigitalSignature string          `json:"digital_signature"`
+		SignatureKeyID   string          `json:"signature_key_id"`
+		HashSignature    string          `json:"hash_signature"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeSimpleError(w, r, http.StatusBadRequest, "Invalid import payload")
+		return
+	}
+
+	sig := req.DigitalSignature
+	if sig == "" && strings.HasPrefix(req.HashSignature, "HMAC-SHA256:") {
+		sig = strings.TrimPrefix(req.HashSignature, "HMAC-SHA256:")
+	}
+
+	if sig == "" {
+		writeError(w, r, http.StatusBadRequest, "SIGNATURE_REQUIRED", "Export archive must contain a cryptographic digital signature")
+		return
+	}
+
+	rawJSON, err := json.Marshal(req.Inventory)
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "BAD_PAYLOAD", err.Error())
+		return
+	}
+
+	if !s.logger.VerifyPayloadSignature(rawJSON, sig, req.SignatureKeyID) {
+		s.logger.Log("System", "FLEET", r.RemoteAddr, "IMPORT_CONFIG", "SECURITY", "TAMPER_DETECTED", "Import archive signature mismatch or corrupted data", "")
+		writeError(w, r, http.StatusBadRequest, "TAMPER_DETECTED", "Cryptographic signature verification failed: archive corrupted or altered")
 		return
 	}
 
@@ -1293,8 +1664,8 @@ func (s *Server) handleBatchImport(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	s.logger.Log("Technician", "FLEET", "127.0.0.1", "IMPORT_CONFIG", "BATCH", "SUCCESS", fmt.Sprintf("Imported %d devices", count), "")
-	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "imported_count": count})
+	s.logger.Log("Technician", "FLEET", r.RemoteAddr, "IMPORT_CONFIG", "BATCH", "SUCCESS", fmt.Sprintf("Imported and verified %d devices", count), "")
+	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "imported_count": count, "verified": true})
 }
 
 func (s *Server) handleBatchLegacyFallback(w http.ResponseWriter, r *http.Request) {
@@ -1541,6 +1912,15 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 
 	deviceID := parts[0]
 
+	dev, ok := s.store.GetDevice(deviceID)
+	if ok {
+		sess := getSession(r)
+		if !checkTenantAccess(sess, dev.TenantID, dev.SiteID) {
+			writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Access denied: recorder belongs to an isolated tenant or site")
+			return
+		}
+	}
+
 	// Route: GET /api/v1/recorders/:id
 	if len(parts) == 1 {
 		prof, err := s.recorderEng.GetRecorderProfile(deviceID)
@@ -1563,6 +1943,10 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusOK, prof)
 
 	case "analog-format":
+		if !s.checkPermission(r, security.PermRecorderManage) {
+			writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Analog format configuration requires RECORDER_MANAGE permission")
+			return
+		}
 		var req struct {
 			ChannelID    int                   `json:"channel_id"`
 			Format       recorder.AnalogFormat `json:"format"`
@@ -1585,6 +1969,10 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 		return
 
 	case "coaxial-control":
+		if !s.checkPermission(r, security.PermPTZControl) {
+			writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Coaxial UTC control requires PTZ_CONTROL permission")
+			return
+		}
 		var req struct {
 			ChannelID int    `json:"channel_id"`
 			Command   string `json:"command"`
@@ -1601,6 +1989,10 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 		return
 
 	case "ip-registration":
+		if !s.checkPermission(r, security.PermRecorderManage) {
+			writeError(w, r, http.StatusForbidden, "FORBIDDEN", "IP camera registration requires RECORDER_MANAGE permission")
+			return
+		}
 		var req recorder.IPRegistrationReq
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeSimpleError(w, r, http.StatusBadRequest, "Invalid request: "+err.Error())
@@ -1628,6 +2020,10 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 			writeJSON(w, http.StatusOK, sched)
 			return
 		}
+		if !s.checkPermission(r, security.PermRecorderManage) {
+			writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Updating recording schedules requires RECORDER_MANAGE permission")
+			return
+		}
 		var sched recorder.RecordingSchedule
 		if err := json.NewDecoder(r.Body).Decode(&sched); err != nil {
 			writeSimpleError(w, r, http.StatusBadRequest, "Invalid schedule payload: "+err.Error())
@@ -1642,6 +2038,10 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 		return
 
 	case "search-recordings":
+		if !s.checkPermission(r, security.PermPlaybackView) {
+			writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Searching recordings requires PLAYBACK_VIEW permission")
+			return
+		}
 		chID, _ := strconv.Atoi(r.URL.Query().Get("channel_id"))
 		if chID <= 0 {
 			chID = 1
@@ -1668,6 +2068,10 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 		return
 
 	case "playback-session":
+		if !s.checkPermission(r, security.PermPlaybackView) {
+			writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Creating playback sessions requires PLAYBACK_VIEW permission")
+			return
+		}
 		var req struct {
 			ChannelID int       `json:"channel_id"`
 			StartTime time.Time `json:"start_time"`
@@ -1693,6 +2097,10 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 		return
 
 	case "export":
+		if !s.checkPermission(r, security.PermPlaybackExport) {
+			writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Exporting recordings requires PLAYBACK_EXPORT permission")
+			return
+		}
 		var req struct {
 			ChannelID  int    `json:"channel_id"`
 			SegmentID  string `json:"segment_id"`
@@ -1881,6 +2289,12 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 			subFmt := parts[2]
 			if subFmt == "format" && len(parts) >= 4 {
 				subFmt = parts[3]
+			}
+			if subFmt == "preview" || subFmt == "format-preview" || subFmt == "approve" || subFmt == "format-approve" {
+				if !s.checkPermission(r, security.PermReboot) {
+					writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Disk formatting requires REBOOT or ADMIN permission")
+					return
+				}
 			}
 			switch subFmt {
 			case "preview", "format-preview":
@@ -2392,6 +2806,12 @@ func (s *Server) handleAlarmSubroutes(w http.ResponseWriter, r *http.Request) {
 	}
 
 	action := parts[1]
+	if action == "acknowledge" || action == "assign" || action == "resolve" || action == "dismiss" {
+		if !s.checkPermission(r, security.PermAlarmManage) {
+			writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Alarm triage operations require ALARM_MANAGE permission")
+			return
+		}
+	}
 	switch action {
 	case "acknowledge":
 		ack, err := s.alarmEng.Acknowledge(alarmID, "Technician")

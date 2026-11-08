@@ -12,6 +12,10 @@ build/
 *.db
 *.sqlite
 coverage/
+playwright-report/
+test-results/
+frontend/test-results/
+frontend/playwright-report/
 tmp/
 .tools/
 sentinel-server.exe~
@@ -24,3 +28,8 @@ sentinel_store.json
 *.key
 *.bak
 *.tmp
+*.token
+test_*_store.json
+test_store*.json
+backend/pkg/api/data/
+backend/pkg/recorder/002/

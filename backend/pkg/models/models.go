@@ -70,6 +70,7 @@ type Device struct {
 	Password       string         `json:"-"` // Never serialized in JSON
 	LastSeen       time.Time      `json:"last_seen"`
 	SiteID         string         `json:"site_id,omitempty"`
+	TenantID       string         `json:"tenant_id,omitempty"`
 }
 
 // NetworkConfig models device network configuration

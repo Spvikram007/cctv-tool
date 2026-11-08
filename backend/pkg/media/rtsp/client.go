@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"cctv-sentinel/pkg/adapters/httpauth"
+	"cctv-sentinel/pkg/security"
 )
 
 var (
@@ -79,14 +80,26 @@ func (c *Client) Connect() error {
 	}
 
 	host := u.Host
-	if !strings.Contains(host, ":") {
-		host = host + ":554"
+	port := "554"
+	if strings.Contains(host, ":") {
+		h, p, err := net.SplitHostPort(host)
+		if err == nil {
+			host = h
+			port = p
+		}
 	}
 
-	d := net.Dialer{Timeout: c.Timeout}
-	conn, err := d.Dial("tcp", host)
+	// Validate host against SSRF policy and resolve safely
+	safeIP, err := security.ResolveAndValidateHost(host, true)
 	if err != nil {
-		return fmt.Errorf("failed to dial RTSP host %s: %w", host, err)
+		return fmt.Errorf("SSRF Protection: RTSP target blocked: %w", err)
+	}
+
+	targetAddr := net.JoinHostPort(safeIP.String(), port)
+	d := net.Dialer{Timeout: c.Timeout}
+	conn, err := d.Dial("tcp", targetAddr)
+	if err != nil {
+		return fmt.Errorf("failed to dial RTSP host %s (%s): %w", host, targetAddr, err)
 	}
 
 	c.conn = conn
