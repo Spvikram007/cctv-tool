@@ -34,6 +34,9 @@ func setupFullMatrixTestServer(t *testing.T) (*api.Server, http.Handler, *databa
 	rbacMgr := security.NewRBACManager()
 
 	srv := api.NewServer(store, registry, cfgEngine, discEngine, licMgr, logger, nil, nil, nil, nil, rbacMgr)
+	t.Cleanup(func() {
+		rbacMgr.RevokeSetupToken()
+	})
 	return srv, srv.Handler(), store, rbacMgr
 }
 
@@ -167,14 +170,14 @@ func TestAuthMatrix_CookieSessionAndRevocation(t *testing.T) {
 		t.Fatalf("expected 403 CSRF_UNTRUSTED_ORIGIN for untrusted Origin, got %d: %s", recUntrusted.Code, recUntrusted.Body.String())
 	}
 
-	// 3. Desktop client (X-Client-Type: desktop) without Origin succeeds
+	// 3. Spoofed desktop client (X-Client-Type: desktop) on browser login without Origin MUST BE REJECTED (403 CSRF_MISSING_ORIGIN)
 	loginDesktop := httptest.NewRequest("POST", "/api/v1/security/login", strings.NewReader(loginBody))
 	loginDesktop.Header.Set("Content-Type", "application/json")
 	loginDesktop.Header.Set("X-Client-Type", "desktop")
 	recDesktop := httptest.NewRecorder()
 	handler.ServeHTTP(recDesktop, loginDesktop)
-	if recDesktop.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK for desktop login without Origin, got %d: %s", recDesktop.Code, recDesktop.Body.String())
+	if recDesktop.Code != http.StatusForbidden || !strings.Contains(recDesktop.Body.String(), "CSRF_MISSING_ORIGIN") {
+		t.Fatalf("expected 403 CSRF_MISSING_ORIGIN for spoofed desktop header without Origin, got %d: %s", recDesktop.Code, recDesktop.Body.String())
 	}
 
 	// 4. Authenticate via /api/v1/security/login with trusted Origin

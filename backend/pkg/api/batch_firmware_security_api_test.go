@@ -70,36 +70,60 @@ func TestPhase5BatchFirmwareSecurityAPIE2E(t *testing.T) {
 	if err := rbacMgr.CompleteSetup(setupToken, "admin", "TestOperator#Pass2026!", "Administrator", "admin@sentinel.internal"); err != nil {
 		t.Fatalf("failed to complete setup: %v", err)
 	}
+	t.Cleanup(func() {
+		rbacMgr.RevokeSetupToken()
+	})
 
-	// 1. Test Security Login (RBAC)
+	// 1. Test Native Desktop Authentication (Challenge-Response + RBAC)
+	dev, devKey, err := server.DesktopAuthManager().RegisterDevice("batch-test-client", "Batch Workstation")
+	if err != nil {
+		t.Fatalf("failed to register desktop device: %v", err)
+	}
+
+	// 1a. Request Challenge
+	chPayload, _ := json.Marshal(map[string]string{"client_id": dev.ClientID})
+	reqCh, _ := http.NewRequest("POST", ts.URL+"/api/v1/security/desktop/challenge", bytes.NewReader(chPayload))
+	reqCh.Header.Set("Content-Type", "application/json")
+	respCh, err := client.Do(reqCh)
+	if err != nil || respCh.StatusCode != http.StatusOK {
+		t.Fatalf("challenge request failed: %v, status: %d", err, respCh.StatusCode)
+	}
+	var chResp struct {
+		Challenge string `json:"challenge"`
+	}
+	_ = json.NewDecoder(respCh.Body).Decode(&chResp)
+	respCh.Body.Close()
+
+	// 1b. Compute Proof and Authenticate Desktop Session
+	proof := security.ComputeProofHelper(devKey, chResp.Challenge)
 	loginReq := map[string]string{
-		"username": "admin",
-		"password": "TestOperator#Pass2026!",
+		"client_id":    dev.ClientID,
+		"challenge":    chResp.Challenge,
+		"client_proof": proof,
+		"username":     "admin",
+		"password":     "TestOperator#Pass2026!",
 	}
 	b, _ := json.Marshal(loginReq)
-	reqLogin, _ := http.NewRequest("POST", ts.URL+"/api/v1/security/login", bytes.NewReader(b))
+	reqLogin, _ := http.NewRequest("POST", ts.URL+"/api/v1/security/desktop/login", bytes.NewReader(b))
 	reqLogin.Header.Set("Content-Type", "application/json")
-	reqLogin.Header.Set("X-Client-Type", "desktop")
 	resp, err := client.Do(reqLogin)
 	if err != nil {
-		t.Fatalf("failed to call security login: %v", err)
+		t.Fatalf("failed to call security desktop login: %v", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 OK for login, got %d", resp.StatusCode)
+		t.Fatalf("expected 200 OK for desktop login, got %d", resp.StatusCode)
 	}
-	var loginResp map[string]interface{}
+	var loginResp struct {
+		Success bool   `json:"success"`
+		Token   string `json:"token"`
+	}
 	_ = json.NewDecoder(resp.Body).Decode(&loginResp)
 	resp.Body.Close()
 
-	if loginResp["success"] != true {
-		t.Fatalf("expected login success, got %+v", loginResp)
+	if !loginResp.Success || loginResp.Token == "" {
+		t.Fatalf("expected desktop login success and token, got %+v", loginResp)
 	}
-
-	sessMap, ok := loginResp["session"].(map[string]interface{})
-	if !ok || sessMap["token"] == nil {
-		t.Fatalf("expected session token in login response: %+v", loginResp)
-	}
-	token := sessMap["token"].(string)
+	token := loginResp.Token
 
 	authReq := func(method, urlStr string, body []byte) *http.Request {
 		var r *http.Request

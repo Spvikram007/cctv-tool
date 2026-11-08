@@ -49,6 +49,7 @@ type Server struct {
 	firmwareEng    *firmware.Engine
 	recorderEng    *recorder.Engine
 	rbacMgr        *security.RBACManager
+	desktopAuthMgr *security.DesktopAuthManager
 	ptzEng         *ptz.Engine
 	eventMgr       *events.EventManager
 	alarmEng       *alarms.Engine
@@ -73,6 +74,21 @@ func NewServer(
 	rbacMgr *security.RBACManager,
 	recorderEngOpt ...*recorder.Engine,
 ) *Server {
+	if logger == nil {
+		logger = audit.NewLogger()
+	}
+	if licenseMgr == nil {
+		licenseMgr = licensing.NewManager()
+	}
+	if registry == nil {
+		registry = adapters.NewRegistry()
+	}
+	if configEngine == nil {
+		configEngine = configengine.NewEngine(registry, store, logger)
+	}
+	if discoveryEng == nil {
+		discoveryEng = discovery.NewEngine(registry)
+	}
 	if snapshotEng == nil {
 		snapshotEng = snapshot.NewEngine(store, registry, "./data/snapshots")
 	}
@@ -98,40 +114,63 @@ func NewServer(
 	ptzEng := ptz.NewEngine(store, registry, logger)
 	eventMgr := events.NewEventManager(store, logger)
 	alarmEng := alarms.NewEngine(store, logger, snapshotEng, eventMgr)
+	desktopAuthMgr := security.NewDesktopAuthManager()
+
+	// Initial origin allowlist
+	allowedOrigins := make(map[string]bool)
+	if envOrigins := os.Getenv("SENTINEL_ALLOWED_ORIGINS"); envOrigins != "" {
+		for _, o := range strings.Split(envOrigins, ",") {
+			if trimmed := strings.TrimSpace(o); trimmed != "" {
+				allowedOrigins[trimmed] = true
+			}
+		}
+	} else if os.Getenv("SENTINEL_ENV") != "production" {
+		// Safe local development defaults (HTTP mode only)
+		allowedOrigins["http://localhost:5173"] = true
+		allowedOrigins["http://127.0.0.1:5173"] = true
+		allowedOrigins["http://localhost:8080"] = true
+		allowedOrigins["http://127.0.0.1:8080"] = true
+	}
 
 	s := &Server{
-		store:        store,
-		registry:     registry,
-		configEngine: configEngine,
-		discoveryEng: discoveryEng,
-		licenseMgr:   licenseMgr,
-		logger:       logger,
-		snapshotEng:  snapshotEng,
-		streamHub:    streamHub,
-		batchEng:     batchEng,
-		firmwareEng:  firmwareEng,
-		recorderEng:  recorderEng,
-		rbacMgr:      rbacMgr,
+		store:          store,
+		registry:       registry,
+		configEngine:   configEngine,
+		discoveryEng:   discoveryEng,
+		licenseMgr:     licenseMgr,
+		logger:         logger,
+		snapshotEng:    snapshotEng,
+		streamHub:      streamHub,
+		batchEng:       batchEng,
+		firmwareEng:    firmwareEng,
+		recorderEng:    recorderEng,
+		rbacMgr:        rbacMgr,
+		desktopAuthMgr: desktopAuthMgr,
 		ptzEng:         ptzEng,
 		eventMgr:       eventMgr,
 		alarmEng:       alarmEng,
 		rateLimiter:    security.NewIPRateLimiter(50.0, 100.0),
-		allowedOrigins: map[string]bool{
-			"http://localhost:5173": true,
-			"http://127.0.0.1:5173": true,
-			"http://localhost:8080": true,
-			"http://127.0.0.1:8080": true,
-		},
-		cookieConfig: DefaultCookieConfig,
-		mux:          http.NewServeMux(),
-		startTime:    time.Now().UTC(),
+		allowedOrigins: allowedOrigins,
+		cookieConfig:   DefaultCookieConfig,
+		mux:            http.NewServeMux(),
+		startTime:      time.Now().UTC(),
+	}
+
+	// Production environment defaults
+	if os.Getenv("SENTINEL_ENV") == "production" {
+		s.cookieConfig.SecureCookies = true
+		s.cookieConfig.UseHostPrefix = true
 	}
 
 	if os.Getenv("SENTINEL_SECURE_COOKIES") == "true" || os.Getenv("SENTINEL_SECURE_COOKIES") == "1" {
 		s.cookieConfig.SecureCookies = true
+	} else if os.Getenv("SENTINEL_SECURE_COOKIES") == "false" || os.Getenv("SENTINEL_SECURE_COOKIES") == "0" {
+		s.cookieConfig.SecureCookies = false
 	}
 	if os.Getenv("SENTINEL_COOKIE_HOST_PREFIX") == "true" || os.Getenv("SENTINEL_COOKIE_HOST_PREFIX") == "1" {
 		s.cookieConfig.UseHostPrefix = true
+	} else if os.Getenv("SENTINEL_COOKIE_HOST_PREFIX") == "false" || os.Getenv("SENTINEL_COOKIE_HOST_PREFIX") == "0" {
+		s.cookieConfig.UseHostPrefix = false
 	}
 	if envProxies := os.Getenv("SENTINEL_TRUSTED_PROXIES"); envProxies != "" {
 		parts := strings.Split(envProxies, ",")
@@ -264,6 +303,11 @@ func (s *Server) isOriginAllowed(origin string) bool {
 		return false
 	}
 	return s.allowedOrigins[origin]
+}
+
+// DesktopAuthManager exposes the native desktop client manager
+func (s *Server) DesktopAuthManager() *security.DesktopAuthManager {
+	return s.desktopAuthMgr
 }
 
 func (s *Server) checkPermission(r *http.Request, perm security.Permission) bool {
@@ -633,6 +677,30 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/security/logout", s.handleSecurityLogout)
 	s.mux.HandleFunc("/api/v1/auth/csrf", s.handleSecurityCSRFToken)
 	s.mux.HandleFunc("/api/v1/security/csrf", s.handleSecurityCSRFToken)
+
+	// Native Desktop Client Authentication Routes (Challenge-Response Device Proof)
+	s.mux.HandleFunc("/api/v1/auth/desktop/challenge", s.handleDesktopChallenge)
+	s.mux.HandleFunc("/api/v1/auth/desktop/login", s.handleDesktopLogin)
+	s.mux.HandleFunc("/api/v1/security/desktop/challenge", s.handleDesktopChallenge)
+	s.mux.HandleFunc("/api/v1/security/desktop/login", s.handleDesktopLogin)
+	s.mux.HandleFunc("/api/v1/auth/desktop/devices", s.requireAuth(security.PermUserManagement, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			s.handleDesktopRegisterDevice(w, r)
+		} else if r.Method == "GET" {
+			s.handleDesktopListDevices(w, r)
+		} else {
+			writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
+		}
+	}))
+	s.mux.HandleFunc("/api/v1/security/desktop/devices", s.requireAuth(security.PermUserManagement, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			s.handleDesktopRegisterDevice(w, r)
+		} else if r.Method == "GET" {
+			s.handleDesktopListDevices(w, r)
+		} else {
+			writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
+		}
+	}))
 
 	// 1. System status
 	s.mux.HandleFunc("/api/v1/system/status", s.requireAuth(security.PermViewLive, func(w http.ResponseWriter, r *http.Request) {
@@ -2032,21 +2100,11 @@ func (s *Server) handleSecurityLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	origin := r.Header.Get("Origin")
-	clientType := r.Header.Get("X-Client-Type")
-
-	// Login Origin Policy:
-	// 1. Native desktop and CLI clients (X-Client-Type: desktop) are exempt from requiring Origin.
-	// 2. Browser login requests MUST supply an actual HTTP Origin header matching trusted origins to prevent Login CSRF.
-	if clientType != "desktop" {
-		if origin == "" {
-			writeError(w, r, http.StatusForbidden, "CSRF_MISSING_ORIGIN", "Origin header required for browser login")
-			return
-		}
-		if !s.isOriginAllowed(origin) {
-			writeError(w, r, http.StatusForbidden, "CSRF_UNTRUSTED_ORIGIN", "Cross-origin login rejected from untrusted origin")
-			return
-		}
-	} else if origin != "" && !s.isOriginAllowed(origin) {
+	if origin == "" {
+		writeError(w, r, http.StatusForbidden, "CSRF_MISSING_ORIGIN", "Origin header required for browser login")
+		return
+	}
+	if !s.isOriginAllowed(origin) {
 		writeError(w, r, http.StatusForbidden, "CSRF_UNTRUSTED_ORIGIN", "Cross-origin login rejected from untrusted origin")
 		return
 	}
@@ -2087,12 +2145,6 @@ func (s *Server) handleSecurityLogin(w http.ResponseWriter, r *http.Request) {
 		"session":     safeSess,
 		"csrf_token":  sess.CSRFToken,
 		"permissions": security.RolePermissions[sess.Role],
-	}
-
-	// Preserve native desktop authentication token via OS credential store
-	if r.Header.Get("X-Client-Type") == "desktop" {
-		safeSess["token"] = sess.Token
-		resp["desktop_token"] = sess.Token
 	}
 
 	writeJSON(w, http.StatusOK, resp)

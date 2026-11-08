@@ -276,8 +276,50 @@ func (m *RBACManager) initSetupToken() {
 
 	// Securely persist to local token file with restricted permissions (0600)
 	if err := os.WriteFile(m.setupTokenFilePath, []byte(m.setupToken+"\n"), 0600); err != nil {
-		fmt.Printf("[SECURITY] Notice: could not write setup token file (%v). Setup token: %s\n", err, m.setupToken)
+		fmt.Printf("[SECURITY] Notice: could not write setup token file (%v)\n", err)
 	}
+}
+
+// RevokeSetupToken immediately invalidates any active setup token and purges the token file
+func (m *RBACManager) RevokeSetupToken() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.setupToken = ""
+	m.setupTokenExpires = time.Time{}
+	if m.setupTokenFilePath != "" {
+		_ = os.Remove(m.setupTokenFilePath)
+	}
+}
+
+// RegenerateSetupToken invalidates any existing setup token and issues a new cryptographically random single-use token
+func (m *RBACManager) RegenerateSetupToken() (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !m.setupMode || len(m.users) > 0 {
+		return "", ErrSetupDisabled
+	}
+
+	tokBytes := make([]byte, 32)
+	if _, err := rand.Read(tokBytes); err != nil {
+		return "", fmt.Errorf("cryptographic failure: crypto/rand unavailable: %w", err)
+	}
+
+	m.setupToken = fmt.Sprintf("sent-setup-%s", hex.EncodeToString(tokBytes))
+	m.setupTokenExpires = time.Now().UTC().Add(24 * time.Hour)
+
+	if err := os.WriteFile(m.setupTokenFilePath, []byte(m.setupToken+"\n"), 0600); err != nil {
+		return "", fmt.Errorf("failed to write setup token file: %w", err)
+	}
+
+	return m.setupToken, nil
+}
+
+// SetSetupTokenFilePath allows configuring the token file destination for isolated tests
+func (m *RBACManager) SetSetupTokenFilePath(path string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.setupTokenFilePath = path
 }
 
 // IsSetupRequired checks if initial administrator setup is still pending
@@ -306,12 +348,12 @@ func (m *RBACManager) CompleteSetup(token, username, password, fullName, email s
 		return ErrSetupDisabled
 	}
 
-	if time.Now().UTC().After(m.setupTokenExpires) {
-		return ErrSetupTokenExpired
+	if m.setupToken == "" || subtle.ConstantTimeCompare([]byte(token), []byte(m.setupToken)) != 1 {
+		return ErrInvalidSetupToken
 	}
 
-	if subtle.ConstantTimeCompare([]byte(token), []byte(m.setupToken)) != 1 {
-		return ErrInvalidSetupToken
+	if time.Now().UTC().After(m.setupTokenExpires) {
+		return ErrSetupTokenExpired
 	}
 
 	if strings.TrimSpace(username) == "" {

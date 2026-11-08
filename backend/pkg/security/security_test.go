@@ -96,6 +96,49 @@ func TestFirstRunSetupLifecycle(t *testing.T) {
 	}
 }
 
+func TestSetupToken_RevocationAndRegeneration(t *testing.T) {
+	rbac := security.NewRBACManager()
+	defer rbac.RevokeSetupToken()
+
+	tok1 := rbac.GetSetupToken()
+	if tok1 == "" {
+		t.Fatalf("expected non-empty initial setup token")
+	}
+
+	// 1. Revoke active setup token
+	rbac.RevokeSetupToken()
+	if rbac.GetSetupToken() != "" {
+		t.Errorf("revoked setup token must return empty string")
+	}
+
+	// Attempting to use the revoked token must fail
+	err := rbac.CompleteSetup(tok1, "admin", "TestOperator#Pass2026!", "Admin", "admin@tds.in")
+	if err != security.ErrInvalidSetupToken {
+		t.Errorf("expected ErrInvalidSetupToken for revoked token, got %v", err)
+	}
+
+	// 2. Regenerate replacement setup token
+	tok2, err := rbac.RegenerateSetupToken()
+	if err != nil {
+		t.Fatalf("failed to regenerate setup token: %v", err)
+	}
+	if tok2 == "" || tok2 == tok1 {
+		t.Errorf("new setup token must be unique, non-empty and distinct from old token")
+	}
+
+	// 3. Complete setup using the regenerated replacement token
+	err = rbac.CompleteSetup(tok2, "admin", "TestOperator#Pass2026!", "Admin", "admin@tds.in")
+	if err != nil {
+		t.Fatalf("failed to complete setup with regenerated token: %v", err)
+	}
+
+	// 4. Once setup is completed, regenerating must fail closed
+	_, err = rbac.RegenerateSetupToken()
+	if err != security.ErrSetupDisabled {
+		t.Errorf("expected ErrSetupDisabled once users exist, got %v", err)
+	}
+}
+
 func TestArgon2idParameterLimitsAndDoSResistance(t *testing.T) {
 	rbac := security.NewRBACManager()
 	tok := rbac.GetSetupToken()

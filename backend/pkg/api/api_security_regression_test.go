@@ -30,6 +30,9 @@ func setupSecurityTestServer(t *testing.T) (*api.Server, http.Handler, *database
 	rbacMgr := security.NewRBACManager()
 
 	srv := api.NewServer(store, registry, cfgEngine, discEngine, licMgr, logger, nil, nil, nil, nil, rbacMgr)
+	t.Cleanup(func() {
+		rbacMgr.RevokeSetupToken()
+	})
 	return srv, srv.Handler(), store, rbacMgr
 }
 
