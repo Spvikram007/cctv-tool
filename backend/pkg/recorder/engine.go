@@ -552,7 +552,9 @@ func (e *Engine) CreatePlaybackSession(deviceID string, channelID int, start, en
 	}
 
 	tokBytes := make([]byte, 16)
-	_, _ = rand.Read(tokBytes)
+	if _, err := rand.Read(tokBytes); err != nil {
+		return nil, fmt.Errorf("cryptographic failure generating playback token: %w", err)
+	}
 	token := fmt.Sprintf("rec-play-%s", hex.EncodeToString(tokBytes))
 
 	sess := &PlaybackSession{
@@ -712,7 +714,9 @@ func (e *Engine) StageFormatDiskPreview(deviceID string, diskIndex int, operator
 	}
 
 	tokBytes := make([]byte, 16)
-	_, _ = rand.Read(tokBytes)
+	if _, err := rand.Read(tokBytes); err != nil {
+		return nil, fmt.Errorf("cryptographic failure generating format confirmation token: %w", err)
+	}
 	token := fmt.Sprintf("fmtprv-%s", hex.EncodeToString(tokBytes))
 
 	preview := &DiskFormatPreview{

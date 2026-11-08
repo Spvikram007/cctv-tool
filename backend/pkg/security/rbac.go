@@ -717,10 +717,15 @@ func (m *RBACManager) CreateGlobalAdminUser(username, password, fullName, email 
 	return nil
 }
 
-// InjectSessionForTest creates an active session directly for test cases
+// InjectSessionForTest creates an active session directly for test cases.
+// Fails securely: never substitutes deterministic or predictable randomness.
 func (m *RBACManager) InjectSessionForTest(token, username string, role Role, tenantID, siteID string, ttl time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	csrfBytes := make([]byte, 16)
+	if _, err := rand.Read(csrfBytes); err != nil {
+		panic(fmt.Sprintf("CRITICAL CRYPTOGRAPHIC FAILURE: crypto/rand unavailable in InjectSessionForTest: %v", err))
+	}
 	m.sessions[token] = &Session{
 		Token:         token,
 		Username:      username,
@@ -728,16 +733,21 @@ func (m *RBACManager) InjectSessionForTest(token, username string, role Role, te
 		TenantID:      tenantID,
 		SiteID:        siteID,
 		IsGlobalAdmin: false,
-		CSRFToken:     "test-csrf-" + token,
+		CSRFToken:     fmt.Sprintf("test-csrf-%s", hex.EncodeToString(csrfBytes)),
 		CreatedAt:     time.Now().UTC(),
 		ExpiresAt:     time.Now().UTC().Add(ttl),
 	}
 }
 
-// InjectGlobalAdminSessionForTest creates an active global super-admin session directly for tests
+// InjectGlobalAdminSessionForTest creates an active global super-admin session directly for tests.
+// Fails securely: never substitutes deterministic or predictable randomness.
 func (m *RBACManager) InjectGlobalAdminSessionForTest(token, username string, ttl time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	csrfBytes := make([]byte, 16)
+	if _, err := rand.Read(csrfBytes); err != nil {
+		panic(fmt.Sprintf("CRITICAL CRYPTOGRAPHIC FAILURE: crypto/rand unavailable in InjectGlobalAdminSessionForTest: %v", err))
+	}
 	m.sessions[token] = &Session{
 		Token:         token,
 		Username:      username,
@@ -746,7 +756,7 @@ func (m *RBACManager) InjectGlobalAdminSessionForTest(token, username string, tt
 		SiteID:        "global",
 		IsGlobalAdmin: true,
 		Scopes:        []string{ScopeGlobalAdmin},
-		CSRFToken:     "test-csrf-" + token,
+		CSRFToken:     fmt.Sprintf("test-csrf-%s", hex.EncodeToString(csrfBytes)),
 		CreatedAt:     time.Now().UTC(),
 		ExpiresAt:     time.Now().UTC().Add(ttl),
 	}

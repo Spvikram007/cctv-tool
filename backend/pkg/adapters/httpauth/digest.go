@@ -177,17 +177,15 @@ func ComputeDigestResponse(c *Challenge, username, password, method, uriStr stri
 	return authHeader.String(), nil
 }
 
-// GenerateCNonce generates a cryptographically random client nonce
+// GenerateCNonce generates a cryptographically random client nonce.
+// Fails securely: never substitutes deterministic or predictable nonces.
 func GenerateCNonce() string {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
-		// Fallback to time-based hex if rand fails
-		return fmt.Sprintf("%016x", atomic.AddUint64(&globalNonceCounter, 1))
+		panic(fmt.Sprintf("CRITICAL CRYPTOGRAPHIC FAILURE: crypto/rand unavailable for cnonce: %v", err))
 	}
 	return hex.EncodeToString(b)
 }
-
-var globalNonceCounter uint64
 
 // DigestTransport handles automatic challenge-response Digest and Basic HTTP authentication
 type DigestTransport struct {

@@ -172,6 +172,7 @@ func TestAuthMatrix_CookieSessionAndRevocation(t *testing.T) {
 	// 2.2 Logout revokes session server-side and clears cookie
 	logoutReq := httptest.NewRequest("POST", "/api/v1/security/logout", nil)
 	logoutReq.AddCookie(sessCookie)
+	logoutReq.Header.Set("Origin", "http://localhost:5173")
 	logoutRec := httptest.NewRecorder()
 	handler.ServeHTTP(logoutRec, logoutReq)
 
@@ -729,31 +730,21 @@ func TestAuthMatrix_CSRFProtection(t *testing.T) {
 
 	bodyRule := `{"name":"CSRF Test Rule","event_type":"MotionDetection","action":"LOG"}`
 
-	// 9.1 Cookie auth with state-changing POST and missing CSRF header returns 403 CSRF_TOKEN_INVALID
-	reqNoCSRF := httptest.NewRequest("POST", "/api/v1/alarms/rules", strings.NewReader(bodyRule))
-	reqNoCSRF.AddCookie(&http.Cookie{Name: "sentinel_session", Value: token})
-	recNoCSRF := httptest.NewRecorder()
-	handler.ServeHTTP(recNoCSRF, reqNoCSRF)
+	// 9.1 Cookie auth with state-changing POST and missing Origin header returns 403 CSRF_MISSING_ORIGIN
+	reqMissingOrigin := httptest.NewRequest("POST", "/api/v1/alarms/rules", strings.NewReader(bodyRule))
+	reqMissingOrigin.AddCookie(&http.Cookie{Name: "sentinel_session", Value: token})
+	reqMissingOrigin.Header.Set("X-CSRF-Token", csrfToken)
+	recMissingOrigin := httptest.NewRecorder()
+	handler.ServeHTTP(recMissingOrigin, reqMissingOrigin)
 
-	if recNoCSRF.Code != http.StatusForbidden {
-		t.Errorf("Cookie POST without CSRF token must return 403 Forbidden, got %d", recNoCSRF.Code)
+	if recMissingOrigin.Code != http.StatusForbidden {
+		t.Errorf("Cookie POST without Origin must return 403 Forbidden, got %d", recMissingOrigin.Code)
 	}
-	if !strings.Contains(recNoCSRF.Body.String(), "CSRF_TOKEN_INVALID") {
-		t.Errorf("Expected CSRF_TOKEN_INVALID, got %s", recNoCSRF.Body.String())
-	}
-
-	// 9.2 Cookie auth with invalid CSRF header returns 403 CSRF_TOKEN_INVALID
-	reqBadCSRF := httptest.NewRequest("POST", "/api/v1/alarms/rules", strings.NewReader(bodyRule))
-	reqBadCSRF.AddCookie(&http.Cookie{Name: "sentinel_session", Value: token})
-	reqBadCSRF.Header.Set("X-CSRF-Token", "forged-csrf-token-123456")
-	recBadCSRF := httptest.NewRecorder()
-	handler.ServeHTTP(recBadCSRF, reqBadCSRF)
-
-	if recBadCSRF.Code != http.StatusForbidden {
-		t.Errorf("Cookie POST with invalid CSRF token must return 403 Forbidden, got %d", recBadCSRF.Code)
+	if !strings.Contains(recMissingOrigin.Body.String(), "CSRF_MISSING_ORIGIN") {
+		t.Errorf("Expected CSRF_MISSING_ORIGIN, got %s", recMissingOrigin.Body.String())
 	}
 
-	// 9.3 Cookie auth with untrusted Origin returns 403 CSRF_UNTRUSTED_ORIGIN
+	// 9.2 Cookie auth with untrusted Origin returns 403 CSRF_UNTRUSTED_ORIGIN
 	reqBadOrigin := httptest.NewRequest("POST", "/api/v1/alarms/rules", strings.NewReader(bodyRule))
 	reqBadOrigin.AddCookie(&http.Cookie{Name: "sentinel_session", Value: token})
 	reqBadOrigin.Header.Set("Origin", "https://attacker-origin.evil.com")
@@ -768,7 +759,36 @@ func TestAuthMatrix_CSRFProtection(t *testing.T) {
 		t.Errorf("Expected CSRF_UNTRUSTED_ORIGIN, got %s", recBadOrigin.Body.String())
 	}
 
-	// 9.4 Cookie auth with trusted Origin and valid CSRF token succeeds (200 OK)
+	// 9.3 Cookie auth with trusted Origin and missing CSRF header returns 403 CSRF_TOKEN_INVALID
+	reqNoCSRF := httptest.NewRequest("POST", "/api/v1/alarms/rules", strings.NewReader(bodyRule))
+	reqNoCSRF.AddCookie(&http.Cookie{Name: "sentinel_session", Value: token})
+	reqNoCSRF.Header.Set("Origin", "http://localhost:5173")
+	recNoCSRF := httptest.NewRecorder()
+	handler.ServeHTTP(recNoCSRF, reqNoCSRF)
+
+	if recNoCSRF.Code != http.StatusForbidden {
+		t.Errorf("Cookie POST without CSRF token must return 403 Forbidden, got %d", recNoCSRF.Code)
+	}
+	if !strings.Contains(recNoCSRF.Body.String(), "CSRF_TOKEN_INVALID") {
+		t.Errorf("Expected CSRF_TOKEN_INVALID, got %s", recNoCSRF.Body.String())
+	}
+
+	// 9.4 Cookie auth with trusted Origin and invalid CSRF header returns 403 CSRF_TOKEN_INVALID
+	reqBadCSRF := httptest.NewRequest("POST", "/api/v1/alarms/rules", strings.NewReader(bodyRule))
+	reqBadCSRF.AddCookie(&http.Cookie{Name: "sentinel_session", Value: token})
+	reqBadCSRF.Header.Set("Origin", "http://localhost:5173")
+	reqBadCSRF.Header.Set("X-CSRF-Token", "forged-csrf-token-123456")
+	recBadCSRF := httptest.NewRecorder()
+	handler.ServeHTTP(recBadCSRF, reqBadCSRF)
+
+	if recBadCSRF.Code != http.StatusForbidden {
+		t.Errorf("Cookie POST with invalid CSRF token must return 403 Forbidden, got %d", recBadCSRF.Code)
+	}
+	if !strings.Contains(recBadCSRF.Body.String(), "CSRF_TOKEN_INVALID") {
+		t.Errorf("Expected CSRF_TOKEN_INVALID, got %s", recBadCSRF.Body.String())
+	}
+
+	// 9.5 Cookie auth with trusted Origin and valid CSRF token succeeds (200 OK)
 	reqValid := httptest.NewRequest("POST", "/api/v1/alarms/rules", strings.NewReader(bodyRule))
 	reqValid.AddCookie(&http.Cookie{Name: "sentinel_session", Value: token})
 	reqValid.Header.Set("Origin", "http://localhost:5173")
@@ -780,7 +800,7 @@ func TestAuthMatrix_CSRFProtection(t *testing.T) {
 		t.Errorf("Cookie POST with valid CSRF token and trusted Origin must succeed (200), got %d: %s", recValid.Code, recValid.Body.String())
 	}
 
-	// 9.5 Alternative header X-Sentinel-CSRF is also accepted
+	// 9.6 Alternative header X-Sentinel-CSRF is also accepted
 	reqAlt := httptest.NewRequest("POST", "/api/v1/alarms/rules", strings.NewReader(bodyRule))
 	reqAlt.AddCookie(&http.Cookie{Name: "sentinel_session", Value: token})
 	reqAlt.Header.Set("Origin", "http://localhost:5173")
@@ -792,7 +812,41 @@ func TestAuthMatrix_CSRFProtection(t *testing.T) {
 		t.Errorf("Cookie POST with X-Sentinel-CSRF must succeed (200), got %d: %s", recAlt.Code, recAlt.Body.String())
 	}
 
-	// 9.6 Native Desktop Client via Bearer token (no cookie) does not require CSRF token
+	// 9.7 Comprehensive Method Matrix: POST, PUT, PATCH, DELETE require Origin and CSRF
+	stateMethods := []struct {
+		method string
+		target string
+	}{
+		{"POST", "/api/v1/alarms/rules"},
+		{"PUT", "/api/v1/devices/cam-csrf-device"},
+		{"PATCH", "/api/v1/devices/cam-csrf-device"},
+		{"DELETE", "/api/v1/alarms/rules?id=nonexistent"},
+	}
+
+	for _, sm := range stateMethods {
+		// Missing Origin must be rejected
+		mReq := httptest.NewRequest(sm.method, sm.target, strings.NewReader(`{}`))
+		mReq.AddCookie(&http.Cookie{Name: "sentinel_session", Value: token})
+		mReq.Header.Set("X-CSRF-Token", csrfToken)
+		mRec := httptest.NewRecorder()
+		handler.ServeHTTP(mRec, mReq)
+		if mRec.Code != http.StatusForbidden || !strings.Contains(mRec.Body.String(), "CSRF_MISSING_ORIGIN") {
+			t.Errorf("Method %s without Origin must return 403 CSRF_MISSING_ORIGIN, got %d: %s", sm.method, mRec.Code, mRec.Body.String())
+		}
+
+		// Untrusted Origin must be rejected
+		uReq := httptest.NewRequest(sm.method, sm.target, strings.NewReader(`{}`))
+		uReq.AddCookie(&http.Cookie{Name: "sentinel_session", Value: token})
+		uReq.Header.Set("Origin", "http://evil-attacker.com")
+		uReq.Header.Set("X-CSRF-Token", csrfToken)
+		uRec := httptest.NewRecorder()
+		handler.ServeHTTP(uRec, uReq)
+		if uRec.Code != http.StatusForbidden || !strings.Contains(uRec.Body.String(), "CSRF_UNTRUSTED_ORIGIN") {
+			t.Errorf("Method %s with untrusted Origin must return 403 CSRF_UNTRUSTED_ORIGIN, got %d: %s", sm.method, uRec.Code, uRec.Body.String())
+		}
+	}
+
+	// 9.8 Native Desktop Client via Bearer token (no cookie) does not require CSRF or Origin
 	reqDesktop := httptest.NewRequest("POST", "/api/v1/alarms/rules", strings.NewReader(bodyRule))
 	reqDesktop.Header.Set("Authorization", "Bearer "+token)
 	reqDesktop.Header.Set("X-Client-Type", "desktop")
@@ -801,6 +855,48 @@ func TestAuthMatrix_CSRFProtection(t *testing.T) {
 
 	if recDesktop.Code != http.StatusOK {
 		t.Errorf("Desktop client with Bearer token must succeed without CSRF header, got %d: %s", recDesktop.Code, recDesktop.Body.String())
+	}
+
+	// 9.9 Cookie-authenticated Logout enforces Origin check
+	// Missing Origin on cookie logout
+	logoutNoOrigin := httptest.NewRequest("POST", "/api/v1/security/logout", nil)
+	logoutNoOrigin.AddCookie(&http.Cookie{Name: "sentinel_session", Value: token})
+	recLogoutNoOrigin := httptest.NewRecorder()
+	handler.ServeHTTP(recLogoutNoOrigin, logoutNoOrigin)
+	if recLogoutNoOrigin.Code != http.StatusForbidden || !strings.Contains(recLogoutNoOrigin.Body.String(), "CSRF_MISSING_ORIGIN") {
+		t.Errorf("Logout without Origin must return 403 CSRF_MISSING_ORIGIN, got %d: %s", recLogoutNoOrigin.Code, recLogoutNoOrigin.Body.String())
+	}
+
+	// Untrusted Origin on cookie logout
+	logoutBadOrigin := httptest.NewRequest("POST", "/api/v1/security/logout", nil)
+	logoutBadOrigin.AddCookie(&http.Cookie{Name: "sentinel_session", Value: token})
+	logoutBadOrigin.Header.Set("Origin", "http://malicious.org")
+	recLogoutBadOrigin := httptest.NewRecorder()
+	handler.ServeHTTP(recLogoutBadOrigin, logoutBadOrigin)
+	if recLogoutBadOrigin.Code != http.StatusForbidden || !strings.Contains(recLogoutBadOrigin.Body.String(), "CSRF_UNTRUSTED_ORIGIN") {
+		t.Errorf("Logout with untrusted Origin must return 403 CSRF_UNTRUSTED_ORIGIN, got %d: %s", recLogoutBadOrigin.Code, recLogoutBadOrigin.Body.String())
+	}
+
+	// Trusted Origin on cookie logout succeeds and clears cookies
+	logoutValid := httptest.NewRequest("POST", "/api/v1/security/logout", nil)
+	logoutValid.AddCookie(&http.Cookie{Name: "sentinel_session", Value: token})
+	logoutValid.Header.Set("Origin", "http://localhost:5173")
+	recLogoutValid := httptest.NewRecorder()
+	handler.ServeHTTP(recLogoutValid, logoutValid)
+	if recLogoutValid.Code != http.StatusOK {
+		t.Errorf("Logout with trusted Origin must return 200 OK, got %d: %s", recLogoutValid.Code, recLogoutValid.Body.String())
+	}
+	// Check that Set-Cookie headers clear the session
+	cookies := recLogoutValid.Result().Cookies()
+	sessionCleared := false
+	for _, c := range cookies {
+		if c.Name == "sentinel_session" && (c.MaxAge < 0 || c.Value == "") {
+			sessionCleared = true
+			break
+		}
+	}
+	if !sessionCleared {
+		t.Errorf("Expected sentinel_session cookie to be cleared upon logout, cookies: %+v", cookies)
 	}
 }
 

@@ -287,7 +287,9 @@ func (e *Engine) GenerateBatchPreview(
 	}
 
 	b := make([]byte, 16)
-	_, _ = rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		return nil, fmt.Errorf("cryptographic failure generating batch preview token: %w", err)
+	}
 	token := fmt.Sprintf("bprv-%s", hex.EncodeToString(b))
 
 	preview := &BatchPreview{

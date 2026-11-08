@@ -106,7 +106,9 @@ func (h *Hub) GenerateToken(deviceID, streamType, user string, ttl time.Duration
 	}
 
 	b := make([]byte, 16)
-	_, _ = rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		return nil, fmt.Errorf("cryptographic failure generating stream session token: %w", err)
+	}
 	tokenStr := fmt.Sprintf("stk-%s", hex.EncodeToString(b))
 
 	now := time.Now().UTC()

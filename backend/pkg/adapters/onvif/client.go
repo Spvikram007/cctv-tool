@@ -71,11 +71,10 @@ func (c *Client) GenerateWSSecurity() string {
 		return ""
 	}
 
-	// 1. Generate 16 bytes cryptographically secure random nonce
+	// 1. Generate 16 bytes cryptographically secure random nonce (fails securely if rand unavailable)
 	nonceRaw := make([]byte, 16)
 	if _, err := rand.Read(nonceRaw); err != nil {
-		// Fallback to high-resolution time bytes if rand fails
-		nonceRaw = []byte(fmt.Sprintf("%016d", time.Now().UnixNano()))
+		return ""
 	}
 	nonceB64 := base64.StdEncoding.EncodeToString(nonceRaw)
 

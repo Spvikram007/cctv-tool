@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -31,11 +32,12 @@ type ErrorResponse struct {
 	Error   APIErrorDetail `json:"error"`
 }
 
-// GenerateRequestID generates a collision-resistant 16-character hex request ID
+// GenerateRequestID generates a collision-resistant 16-character hex request ID.
+// Fails securely: never substitutes deterministic fallback strings.
 func GenerateRequestID() string {
 	bytes := make([]byte, 8)
 	if _, err := rand.Read(bytes); err != nil {
-		return "req-fallback"
+		panic(fmt.Sprintf("CRITICAL CRYPTOGRAPHIC FAILURE: crypto/rand unavailable for request ID: %v", err))
 	}
 	return "req-" + hex.EncodeToString(bytes)
 }

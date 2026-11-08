@@ -54,6 +54,7 @@ type Server struct {
 	alarmEng       *alarms.Engine
 	rateLimiter    *security.IPRateLimiter
 	allowedOrigins map[string]bool
+	cookieConfig   CookieConfig
 	mux            *http.ServeMux
 	startTime      time.Time
 }
@@ -121,9 +122,30 @@ func NewServer(
 			"http://localhost:8080": true,
 			"http://127.0.0.1:8080": true,
 		},
-		mux:       http.NewServeMux(),
-		startTime: time.Now().UTC(),
+		cookieConfig: DefaultCookieConfig,
+		mux:          http.NewServeMux(),
+		startTime:    time.Now().UTC(),
 	}
+
+	if os.Getenv("SENTINEL_SECURE_COOKIES") == "true" || os.Getenv("SENTINEL_SECURE_COOKIES") == "1" {
+		s.cookieConfig.SecureCookies = true
+	}
+	if os.Getenv("SENTINEL_COOKIE_HOST_PREFIX") == "true" || os.Getenv("SENTINEL_COOKIE_HOST_PREFIX") == "1" {
+		s.cookieConfig.UseHostPrefix = true
+	}
+	if envProxies := os.Getenv("SENTINEL_TRUSTED_PROXIES"); envProxies != "" {
+		parts := strings.Split(envProxies, ",")
+		var cleaned []string
+		for _, p := range parts {
+			if trimmed := strings.TrimSpace(p); trimmed != "" {
+				cleaned = append(cleaned, trimmed)
+			}
+		}
+		if len(cleaned) > 0 {
+			s.cookieConfig.TrustedProxies = cleaned
+		}
+	}
+
 	s.registerRoutes()
 	return s
 }
@@ -254,17 +276,7 @@ func (s *Server) checkPermission(r *http.Request, perm security.Permission) bool
 
 func (s *Server) requireAuth(perm security.Permission, handler http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		token := ""
-		fromCookie := false
-		authHeader := r.Header.Get("Authorization")
-		if strings.HasPrefix(authHeader, "Bearer ") {
-			token = strings.TrimPrefix(authHeader, "Bearer ")
-		} else if strings.HasPrefix(authHeader, "bearer ") {
-			token = strings.TrimPrefix(authHeader, "bearer ")
-		} else if cookie, err := r.Cookie("sentinel_session"); err == nil && cookie.Value != "" {
-			token = cookie.Value
-			fromCookie = true
-		}
+		token, fromCookie := s.extractSessionToken(r)
 
 		// Security: Do NOT accept authentication credentials through URL query parameters
 		if token == "" {
@@ -282,14 +294,16 @@ func (s *Server) requireAuth(perm security.Permission, handler http.HandlerFunc)
 			return
 		}
 
-		// CSRF & Origin Protection for cookie-authenticated state-changing requests
+		// CSRF & Strict Origin Protection for cookie-authenticated state-changing requests
 		if fromCookie && (r.Method == "POST" || r.Method == "PUT" || r.Method == "DELETE" || r.Method == "PATCH") {
 			origin := r.Header.Get("Origin")
-			if origin != "" {
-				if !s.isOriginAllowed(origin) {
-					writeError(w, r, http.StatusForbidden, "CSRF_UNTRUSTED_ORIGIN", "Cross-origin request rejected: untrusted origin")
-					return
-				}
+			if origin == "" {
+				writeError(w, r, http.StatusForbidden, "CSRF_MISSING_ORIGIN", "Origin header required for cookie-authenticated state-changing requests")
+				return
+			}
+			if !s.isOriginAllowed(origin) {
+				writeError(w, r, http.StatusForbidden, "CSRF_UNTRUSTED_ORIGIN", "Cross-origin request rejected: untrusted origin")
+				return
 			}
 
 			csrfHeader := r.Header.Get("X-CSRF-Token")
@@ -312,28 +326,6 @@ func (s *Server) requireAuth(perm security.Permission, handler http.HandlerFunc)
 		ctx := context.WithValue(r.Context(), sessionContextKey, sess)
 		handler(w, r.WithContext(ctx))
 	}
-}
-
-// IssueSessionForTest generates an active tenant-scoped session token for unit test execution
-func (s *Server) IssueSessionForTest(role security.Role, tenantID, siteID string) string {
-	tokBytes := make([]byte, 24)
-	if _, err := rand.Read(tokBytes); err != nil {
-		tokBytes = []byte("test-session-bytes-123456789012")
-	}
-	tok := fmt.Sprintf("test-sess-%s", hex.EncodeToString(tokBytes))
-	s.rbacMgr.InjectSessionForTest(tok, "test-operator", role, tenantID, siteID, 24*time.Hour)
-	return tok
-}
-
-// IssueGlobalAdminSessionForTest generates an active global super-admin session for test execution
-func (s *Server) IssueGlobalAdminSessionForTest() string {
-	tokBytes := make([]byte, 24)
-	if _, err := rand.Read(tokBytes); err != nil {
-		tokBytes = []byte("test-global-admin-bytes-123456")
-	}
-	tok := fmt.Sprintf("test-sess-global-%s", hex.EncodeToString(tokBytes))
-	s.rbacMgr.InjectGlobalAdminSessionForTest(tok, "super-admin", 24*time.Hour)
-	return tok
 }
 
 // GetRBACManager returns the underlying RBACManager instance
@@ -2058,27 +2050,9 @@ func (s *Server) handleSecurityLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. Session Cookie (HttpOnly - never accessible to JavaScript)
-	http.SetCookie(w, &http.Cookie{
-		Name:     "sentinel_session",
-		Value:    sess.Token,
-		Path:     "/",
-		Expires:  sess.ExpiresAt,
-		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
-		Secure:   r.TLS != nil,
-	})
-
-	// 2. CSRF Cookie (Not HttpOnly - readable by JavaScript to set X-CSRF-Token header)
-	http.SetCookie(w, &http.Cookie{
-		Name:     "sentinel_csrf",
-		Value:    sess.CSRFToken,
-		Path:     "/",
-		Expires:  sess.ExpiresAt,
-		HttpOnly: false,
-		SameSite: http.SameSiteStrictMode,
-		Secure:   r.TLS != nil,
-	})
+	// Set production cookies via configured cookie security policy
+	s.setSessionCookie(w, r, sess.Token, sess.ExpiresAt)
+	s.setCSRFCookie(w, r, sess.CSRFToken, sess.ExpiresAt)
 
 	s.logger.Log(req.Username, "SYSTEM", r.RemoteAddr, "LOGIN", "SECURITY", "SUCCESS", fmt.Sprintf("Operator authenticated (Role: %s)", sess.Role), "")
 
@@ -2116,14 +2090,19 @@ func (s *Server) handleSecurityLogout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token := ""
-	authHeader := r.Header.Get("Authorization")
-	if strings.HasPrefix(authHeader, "Bearer ") {
-		token = strings.TrimPrefix(authHeader, "Bearer ")
-	} else if strings.HasPrefix(authHeader, "bearer ") {
-		token = strings.TrimPrefix(authHeader, "bearer ")
-	} else if cookie, err := r.Cookie("sentinel_session"); err == nil && cookie.Value != "" {
-		token = cookie.Value
+	token, fromCookie := s.extractSessionToken(r)
+
+	// Origin protection for cookie-authenticated logout to prevent Logout CSRF
+	if fromCookie {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			writeError(w, r, http.StatusForbidden, "CSRF_MISSING_ORIGIN", "Origin header required for cookie-authenticated logout")
+			return
+		}
+		if !s.isOriginAllowed(origin) {
+			writeError(w, r, http.StatusForbidden, "CSRF_UNTRUSTED_ORIGIN", "Cross-origin logout rejected: untrusted origin")
+			return
+		}
 	}
 
 	sess := getSession(r)
@@ -2136,27 +2115,8 @@ func (s *Server) handleSecurityLogout(w http.ResponseWriter, r *http.Request) {
 		s.rbacMgr.RevokeSession(token)
 	}
 
-	http.SetCookie(w, &http.Cookie{
-		Name:     "sentinel_session",
-		Value:    "",
-		Path:     "/",
-		Expires:  time.Unix(0, 0),
-		MaxAge:   -1,
-		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
-		Secure:   r.TLS != nil,
-	})
-
-	http.SetCookie(w, &http.Cookie{
-		Name:     "sentinel_csrf",
-		Value:    "",
-		Path:     "/",
-		Expires:  time.Unix(0, 0),
-		MaxAge:   -1,
-		HttpOnly: false,
-		SameSite: http.SameSiteStrictMode,
-		Secure:   r.TLS != nil,
-	})
+	// Clear all session and CSRF cookie variants with secure attributes
+	s.clearAuthCookies(w, r)
 
 	s.logger.Log(userName, "SYSTEM", r.RemoteAddr, "LOGOUT", "SECURITY", "SUCCESS", "Session terminated and revoked server-side", "")
 	writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -2175,22 +2135,18 @@ func (s *Server) handleSecurityCSRFToken(w http.ResponseWriter, r *http.Request)
 	csrfToken := ""
 	if sess != nil && sess.CSRFToken != "" {
 		csrfToken = sess.CSRFToken
-	} else if c, err := r.Cookie("sentinel_csrf"); err == nil && c.Value != "" {
-		csrfToken = c.Value
+	} else if cVal := s.extractCSRFTokenFromCookie(r); cVal != "" {
+		csrfToken = cVal
 	} else {
 		raw := make([]byte, 24)
-		_, _ = rand.Read(raw)
+		if _, err := rand.Read(raw); err != nil {
+			writeError(w, r, http.StatusInternalServerError, "INTERNAL_ERROR", "Cryptographic randomness failure generating CSRF token")
+			return
+		}
 		csrfToken = fmt.Sprintf("sent-csrf-%s", hex.EncodeToString(raw))
 	}
 
-	http.SetCookie(w, &http.Cookie{
-		Name:     "sentinel_csrf",
-		Value:    csrfToken,
-		Path:     "/",
-		HttpOnly: false,
-		SameSite: http.SameSiteStrictMode,
-		Secure:   r.TLS != nil,
-	})
+	s.setCSRFCookie(w, r, csrfToken, time.Now().UTC().Add(8*time.Hour))
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"csrf_token": csrfToken,

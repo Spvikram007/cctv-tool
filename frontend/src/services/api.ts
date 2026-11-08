@@ -25,7 +25,7 @@ function getCsrfToken(): string {
     return memoryCsrfToken;
   }
   if (typeof document !== 'undefined' && document.cookie) {
-    const match = document.cookie.match(/(?:^|;\s*)sentinel_csrf=([^;]+)/);
+    const match = document.cookie.match(/(?:^|;\s*)(?:__Host-)?sentinel_csrf=([^;]+)/);
     if (match && match[1]) {
       memoryCsrfToken = decodeURIComponent(match[1]);
       return memoryCsrfToken;

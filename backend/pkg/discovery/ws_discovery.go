@@ -42,10 +42,13 @@ type WSDiscoveryOptions struct {
 	Timeout       time.Duration
 }
 
-// GenerateMessageID generates a standard UUID-based WS-Addressing MessageID
+// GenerateMessageID generates a standard UUID-based WS-Addressing MessageID.
+// Fails securely: never substitutes deterministic values.
 func GenerateMessageID() string {
 	b := make([]byte, 16)
-	_, _ = rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		panic(fmt.Sprintf("CRITICAL CRYPTOGRAPHIC FAILURE: crypto/rand unavailable for WS-Discovery UUID: %v", err))
+	}
 	b[6] = (b[6] & 0x0f) | 0x40 // Version 4
 	b[8] = (b[8] & 0x3f) | 0x80 // Variant RFC 4122
 	return fmt.Sprintf("urn:uuid:%08x-%04x-%04x-%04x-%012x",

@@ -95,7 +95,9 @@ func NewEngine(registry *adapters.Registry, store *database.Store, logger *audit
 
 func generateToken(prefix string) string {
 	b := make([]byte, 16)
-	_, _ = rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		panic(fmt.Sprintf("CRITICAL CRYPTOGRAPHIC FAILURE: crypto/rand unavailable: %v", err))
+	}
 	return fmt.Sprintf("%s-%s", prefix, hex.EncodeToString(b))
 }
 

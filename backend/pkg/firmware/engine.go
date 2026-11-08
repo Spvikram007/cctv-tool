@@ -288,7 +288,9 @@ func (e *Engine) StageFirmwarePreview(deviceID, packageID, operator string) (*Fi
 	e.mu.RUnlock()
 
 	b := make([]byte, 16)
-	_, _ = rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		return nil, fmt.Errorf("cryptographic failure generating firmware preview token: %w", err)
+	}
 	token := fmt.Sprintf("fwprv-%s", hex.EncodeToString(b))
 
 	preview := &FirmwareUpdatePreview{
