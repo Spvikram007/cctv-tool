@@ -423,6 +423,7 @@ export const PTZControl: React.FC<PTZControlProps> = ({
         name: newRuleName,
         enabled: true,
         match_categories: [newRuleCategory],
+        event_categories: [newRuleCategory],
         match_device_ids: [],
         severity_override: 'MAJOR',
         cooldown_sec: newRuleCooldown,
@@ -1036,7 +1037,7 @@ export const PTZControl: React.FC<PTZControlProps> = ({
                   <div>
                     <h4 className="text-sm font-bold text-slate-200">{p.name}</h4>
                     <p className="text-[11px] text-slate-500">
-                      Coordinates: Pan: {p.pan.toFixed(2)} | Tilt: {p.tilt.toFixed(2)} | Zoom: {p.zoom.toFixed(2)}
+                      Coordinates: Pan: {(p.pan ?? 0).toFixed(2)} | Tilt: {(p.tilt ?? 0).toFixed(2)} | Zoom: {(p.zoom ?? 0).toFixed(2)}
                     </p>
                   </div>
 
@@ -1799,7 +1800,7 @@ export const PTZControl: React.FC<PTZControlProps> = ({
                         <div className="flex items-center space-x-2">
                           <span className="text-xs font-bold text-slate-200">{rule.name}</span>
                           <span className="px-1.5 py-0.5 rounded text-[10px] bg-emerald-500/20 text-emerald-400">
-                            {rule.match_categories.join(', ')}
+                            {(rule.match_categories || rule.event_categories || []).join(', ')}
                           </span>
                         </div>
                         <div className="text-[11px] text-slate-400">

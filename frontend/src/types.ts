@@ -836,15 +836,18 @@ export interface AlarmRule {
   id: string;
   name: string;
   enabled: boolean;
-  match_categories: string[];
-  match_device_ids: string[];
-  severity_override: AlarmSeverity;
+  match_categories?: string[];
+  event_categories?: string[];
+  match_device_ids?: string[];
+  device_ids?: string[];
+  severity_override?: AlarmSeverity;
+  severity?: AlarmSeverity;
   cooldown_sec: number;
   capture_snapshot: boolean;
-  assign_technician: string;
-  webhook_url: string;
-  email_recipients: string[];
-  suppress_duplicates: boolean;
+  assign_technician?: string;
+  webhook_url?: string;
+  email_recipients?: string[];
+  suppress_duplicates?: boolean;
 }
 
 export interface AlarmStats {
