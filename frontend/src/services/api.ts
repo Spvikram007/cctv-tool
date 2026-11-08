@@ -10,7 +10,9 @@ import {
   FirmwareUpdateJob, UserAccount, Session, AuditChainVerification,
   VaultStatus, RecorderProfile, RecorderChannelInfo, AnalogFormatResult,
   IPRegistrationReq, RecordingSchedule, RecordingSegment, PlaybackSession,
-  StorageHealthReport, DiskFormatPreview
+  StorageHealthReport, DiskFormatPreview,
+  PTZCapabilities, Preset, PatrolTour, MoveRequest, FocusIrisRequest,
+  EventSubscription, SurveillanceEvent, Alarm, AlarmRule, AlarmStats
 } from '../types';
 
 const BASE_URL = 'http://127.0.0.1:8080/api/v1';
@@ -251,4 +253,124 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ format_token: formatToken, confirmation })
     }),
+
+  // PTZ Control Engine (Phase 7)
+  getPTZCapabilities: (deviceId: string) => request<PTZCapabilities>(`/devices/${deviceId}/ptz/capabilities`),
+  ptzMove: (deviceId: string, req: MoveRequest) =>
+    request<{ status: string; command: string }>(`/devices/${deviceId}/ptz/move`, {
+      method: 'POST',
+      body: JSON.stringify(req),
+    }),
+  ptzStop: (deviceId: string) =>
+    request<{ status: string; stopped: boolean }>(`/devices/${deviceId}/ptz/stop`, {
+      method: 'POST',
+    }),
+  ptzFocusIris: (deviceId: string, req: FocusIrisRequest) =>
+    request<{ status: string; action: string }>(`/devices/${deviceId}/ptz/focus-iris`, {
+      method: 'POST',
+      body: JSON.stringify(req),
+    }),
+  getPTZPresets: (deviceId: string) => request<Preset[]>(`/devices/${deviceId}/ptz/presets`),
+  createPTZPreset: (deviceId: string, number: number, name: string) =>
+    request<Preset>(`/devices/${deviceId}/ptz/presets`, {
+      method: 'POST',
+      body: JSON.stringify({ number, name }),
+    }),
+  gotoPTZPreset: (deviceId: string, number: number) =>
+    request<{ status: string; preset_number: number }>(`/devices/${deviceId}/ptz/presets/${number}/goto`, {
+      method: 'POST',
+    }),
+  renamePTZPreset: (deviceId: string, number: number, name: string) =>
+    request<Preset>(`/devices/${deviceId}/ptz/presets/${number}`, {
+      method: 'PUT',
+      body: JSON.stringify({ name }),
+    }),
+  deletePTZPreset: (deviceId: string, number: number) =>
+    request<{ status: string; deleted: number }>(`/devices/${deviceId}/ptz/presets/${number}`, {
+      method: 'DELETE',
+    }),
+  getPTZPatrols: (deviceId: string) => request<PatrolTour[]>(`/devices/${deviceId}/ptz/patrols`),
+  createPTZPatrol: (deviceId: string, tour: Partial<PatrolTour>) =>
+    request<PatrolTour>(`/devices/${deviceId}/ptz/patrols`, {
+      method: 'POST',
+      body: JSON.stringify(tour),
+    }),
+  runPTZPatrol: (deviceId: string, tourNumber: number) =>
+    request<{ status: string; tour_number: number }>(`/devices/${deviceId}/ptz/patrols/${tourNumber}/run`, {
+      method: 'POST',
+    }),
+  stopPTZPatrol: (deviceId: string, tourNumber: number) =>
+    request<{ status: string; tour_number: number }>(`/devices/${deviceId}/ptz/patrols/${tourNumber}/stop`, {
+      method: 'POST',
+    }),
+  ptzHome: (deviceId: string) =>
+    request<{ status: string; action: string }>(`/devices/${deviceId}/ptz/home`, {
+      method: 'POST',
+    }),
+  ptzAutoScan: (deviceId: string, speed: number = 0.5) =>
+    request<{ status: string; action: string }>(`/devices/${deviceId}/ptz/auto-scan`, {
+      method: 'POST',
+      body: JSON.stringify({ speed }),
+    }),
+
+  // Events & Subscriptions (Phase 7)
+  getEventSubscriptions: () => request<EventSubscription[]>('/events/subscriptions'),
+  createEventSubscription: (deviceId: string, protocol?: string) =>
+    request<EventSubscription>('/events/subscriptions', {
+      method: 'POST',
+      body: JSON.stringify({ device_id: deviceId, protocol: protocol || 'ONVIF' }),
+    }),
+  cancelEventSubscription: (subId: string) =>
+    request<{ status: string; subscription_id: string }>(`/events/subscriptions/${subId}`, {
+      method: 'DELETE',
+    }),
+  getLiveEvents: (limit: number = 50, category?: string) => {
+    const q = new URLSearchParams({ limit: limit.toString() });
+    if (category) q.set('category', category);
+    return request<SurveillanceEvent[]>(`/events/live?${q.toString()}`);
+  },
+
+  // Alarms & Rules (Phase 7)
+  getAlarms: (filters?: { device_id?: string; category?: string; severity?: string; state?: string; limit?: number }) => {
+    const q = new URLSearchParams();
+    if (filters?.device_id) q.set('device_id', filters.device_id);
+    if (filters?.category) q.set('category', filters.category);
+    if (filters?.severity) q.set('severity', filters.severity);
+    if (filters?.state) q.set('state', filters.state);
+    if (filters?.limit) q.set('limit', filters.limit.toString());
+    return request<Alarm[]>(`/alarms?${q.toString()}`);
+  },
+  getAlarmStats: () => request<AlarmStats>('/alarms/stats'),
+  acknowledgeAlarm: (alarmId: string, technician: string) =>
+    request<Alarm>(`/alarms/${alarmId}/acknowledge`, {
+      method: 'POST',
+      body: JSON.stringify({ technician }),
+    }),
+  assignAlarm: (alarmId: string, technician: string) =>
+    request<Alarm>(`/alarms/${alarmId}/assign`, {
+      method: 'POST',
+      body: JSON.stringify({ technician }),
+    }),
+  resolveAlarm: (alarmId: string, resolutionNotes: string, technician: string) =>
+    request<Alarm>(`/alarms/${alarmId}/resolve`, {
+      method: 'POST',
+      body: JSON.stringify({ resolution_notes: resolutionNotes, technician }),
+    }),
+  dismissAlarm: (alarmId: string, reason: string) =>
+    request<Alarm>(`/alarms/${alarmId}/dismiss`, {
+      method: 'POST',
+      body: JSON.stringify({ reason }),
+    }),
+  getAlarmRules: () => request<AlarmRule[]>('/alarms/rules'),
+  createAlarmRule: (rule: Partial<AlarmRule>) =>
+    request<AlarmRule>('/alarms/rules', {
+      method: 'POST',
+      body: JSON.stringify(rule),
+    }),
+  deleteAlarmRule: (ruleId: string) =>
+    request<{ status: string; rule_id: string }>(`/alarms/rules/${ruleId}`, {
+      method: 'DELETE',
+    }),
+  exportAlarmsURL: (format: 'csv' | 'json' = 'csv') => `${BASE_URL}/alarms/export?format=${format}`,
+  getAlarmsStreamURL: () => `${BASE_URL}/alarms/stream`,
 };

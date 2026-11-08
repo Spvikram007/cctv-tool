@@ -149,26 +149,26 @@ func main() {
 		log.Println("[SETUP] Seeded 3 verified hardware units into fleet inventory.")
 	}
 
-		store.UpsertDevice(models.Device{
-			ID:           "dahua-127-0-0-1-18082",
-			Name:         "Dahua WizSense XVR5108HS-4KL-I3",
-			IP:           "127.0.0.1",
-			Port:         18082,
-			RTSPPort:     18554,
-			ONVIFPort:    18082,
-			Manufacturer: models.VendorDahua,
-			Model:        "DHI-XVR5108HS-4KL-I3",
-			Firmware:     "4.001.0000001.0",
-			SerialNumber: "9A038E8PAG10082",
-			Category:     models.CategoryXVR,
-			Status:       "online",
-			Protocols:    []models.ProtocolType{models.ProtocolDahuaCGI, models.ProtocolONVIF, models.ProtocolRTSP},
-			Capabilities: []string{"CGI_CONFIG", "STREAMING", "IMAGE_SETTINGS", "ENCODING", "HDCVI_UTC", "PTZ", "SNAPSHOT"},
-			ChannelCount: 16,
-			Username:     "admin",
-			Password:     "Admin@123",
-			LastSeen:     time.Now().UTC(),
-		})
+	store.UpsertDevice(models.Device{
+		ID:           "dahua-127-0-0-1-18082",
+		Name:         "Dahua WizSense XVR5108HS-4KL-I3",
+		IP:           "127.0.0.1",
+		Port:         18082,
+		RTSPPort:     18554,
+		ONVIFPort:    18082,
+		Manufacturer: models.VendorDahua,
+		Model:        "DHI-XVR5108HS-4KL-I3",
+		Firmware:     "4.001.0000001.0",
+		SerialNumber: "9A038E8PAG10082",
+		Category:     models.CategoryXVR,
+		Status:       "online",
+		Protocols:    []models.ProtocolType{models.ProtocolDahuaCGI, models.ProtocolONVIF, models.ProtocolRTSP},
+		Capabilities: []string{"CGI_CONFIG", "STREAMING", "IMAGE_SETTINGS", "ENCODING", "HDCVI_UTC", "PTZ", "SNAPSHOT"},
+		ChannelCount: 16,
+		Username:     "admin",
+		Password:     "Admin@123",
+		LastSeen:     time.Now().UTC(),
+	})
 
 	// 5. Media, Batch, Firmware, Recorder & Security Engines
 	snapshotEng := snapshot.NewEngine(store, registry, "./data/snapshots")

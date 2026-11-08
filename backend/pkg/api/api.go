@@ -11,17 +11,20 @@ import (
 	"time"
 
 	"cctv-sentinel/pkg/adapters"
+	"cctv-sentinel/pkg/alarms"
 	"cctv-sentinel/pkg/audit"
 	"cctv-sentinel/pkg/batch"
 	"cctv-sentinel/pkg/configengine"
 	"cctv-sentinel/pkg/database"
 	"cctv-sentinel/pkg/diagnostics"
 	"cctv-sentinel/pkg/discovery"
+	"cctv-sentinel/pkg/events"
 	"cctv-sentinel/pkg/firmware"
 	"cctv-sentinel/pkg/licensing"
 	"cctv-sentinel/pkg/media/snapshot"
 	"cctv-sentinel/pkg/media/streamhub"
 	"cctv-sentinel/pkg/models"
+	"cctv-sentinel/pkg/ptz"
 	"cctv-sentinel/pkg/recorder"
 	"cctv-sentinel/pkg/security"
 )
@@ -39,6 +42,9 @@ type Server struct {
 	firmwareEng  *firmware.Engine
 	recorderEng  *recorder.Engine
 	rbacMgr      *security.RBACManager
+	ptzEng       *ptz.Engine
+	eventMgr     *events.EventManager
+	alarmEng     *alarms.Engine
 	rateLimiter  *security.IPRateLimiter
 	mux          *http.ServeMux
 	startTime    time.Time
@@ -79,6 +85,11 @@ func NewServer(
 	} else {
 		recorderEng = recorder.NewEngine(store, logger)
 	}
+
+	ptzEng := ptz.NewEngine(store, registry, logger)
+	eventMgr := events.NewEventManager(store, logger)
+	alarmEng := alarms.NewEngine(store, logger, snapshotEng, eventMgr)
+
 	s := &Server{
 		store:        store,
 		registry:     registry,
@@ -92,6 +103,9 @@ func NewServer(
 		firmwareEng:  firmwareEng,
 		recorderEng:  recorderEng,
 		rbacMgr:      rbacMgr,
+		ptzEng:       ptzEng,
+		eventMgr:     eventMgr,
+		alarmEng:     alarmEng,
 		rateLimiter:  security.NewIPRateLimiter(50.0, 100.0),
 		mux:          http.NewServeMux(),
 		startTime:    time.Now().UTC(),
@@ -448,6 +462,21 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/recorders", s.handleRecordersList)
 	s.mux.HandleFunc("/api/v1/recorders/", s.handleRecorderSubroutes)
 
+	// 14. Phase 7 Real-Time Telemetry & Event Subscriptions
+	s.mux.HandleFunc("/api/v1/events/subscriptions", s.handleEventsListSubscriptions)
+	s.mux.HandleFunc("/api/v1/events/subscriptions/", s.handleEventsCancelSubscription)
+	s.mux.HandleFunc("/api/v1/events/live", s.handleEventsLive)
+
+	// 15. Phase 7 Unified Alarms & Rule Automation routes
+	s.mux.HandleFunc("/api/v1/alarms", s.handleAlarms)
+	s.mux.HandleFunc("/api/v1/alarms/stats", s.handleAlarmsStats)
+	s.mux.HandleFunc("/api/v1/alarms/rules", s.handleAlarmsRules)
+	s.mux.HandleFunc("/api/v1/alarms/rules/", s.handleAlarmsRulesDelete)
+	s.mux.HandleFunc("/api/v1/alarms/export", s.handleAlarmsExport)
+	s.mux.HandleFunc("/api/v1/alarms/stream", s.handleAlarmsStream)
+	s.mux.HandleFunc("/api/v1/alarms/ws", s.handleAlarmsStream)
+	s.mux.HandleFunc("/api/v1/alarms/", s.handleAlarmSubroutes)
+
 	// 11. Technician Report
 	s.mux.HandleFunc("/api/v1/reports/technician", func(w http.ResponseWriter, r *http.Request) {
 		devs := s.store.ListDevices()
@@ -498,6 +527,10 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 	}
 	if sub == "services" {
 		s.handleDeviceServices(w, r, &dev)
+		return
+	}
+	if sub == "ptz" {
+		s.handleDevicePTZ(w, r, &dev, parts)
 		return
 	}
 
@@ -699,14 +732,8 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, cfgs)
 
 	case "ptz":
-		var action models.PTZAction
-		_ = json.NewDecoder(r.Body).Decode(&action)
-		action.DeviceID = dev.ID
-		if err := adapter.SendPTZ(&dev, action); err != nil {
-			writeSimpleError(w, r, http.StatusInternalServerError, err.Error())
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "command": action.Command})
+		s.handleDevicePTZ(w, r, &dev, parts)
+		return
 
 	case "stream":
 		if len(parts) > 2 && parts[2] == "token" {
@@ -1906,5 +1933,524 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 
 	default:
 		writeSimpleError(w, r, http.StatusNotFound, "Unknown recorder subresource")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Phase 7 PTZ Robotic Position & Preset Management Handlers
+// -----------------------------------------------------------------------------
+
+func (s *Server) handleDevicePTZ(w http.ResponseWriter, r *http.Request, dev *models.Device, parts []string) {
+	// Route: GET /api/v1/devices/{id}/ptz or /api/v1/devices/{id}/ptz/capabilities
+	if (r.Method == "GET" && len(parts) == 2) || (len(parts) >= 3 && parts[2] == "capabilities") {
+		caps, err := s.ptzEng.GetCapabilities(dev.ID)
+		if err != nil {
+			writeSimpleError(w, r, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, caps)
+		return
+	}
+
+	if len(parts) >= 3 {
+		subAction := parts[2]
+		switch subAction {
+		case "move":
+			var req ptz.MoveRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				writeSimpleError(w, r, http.StatusBadRequest, "Invalid move request payload: "+err.Error())
+				return
+			}
+			switch req.MovementType {
+			case ptz.MovementRelative:
+				if err := s.ptzEng.RelativeMove(dev.ID, req.Pan, req.Tilt, req.Zoom, req.Speed, "Technician"); err != nil {
+					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
+					return
+				}
+			case ptz.MovementAbsolute:
+				if err := s.ptzEng.AbsoluteMove(dev.ID, req.Pan, req.Tilt, req.Zoom, req.Speed, "Technician"); err != nil {
+					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
+					return
+				}
+			default:
+				if err := s.ptzEng.ContinuousMove(dev.ID, req.Pan, req.Tilt, req.Zoom, req.Speed, req.TimeoutSec, "Technician"); err != nil {
+					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
+					return
+				}
+			}
+			writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "status": "MOVING", "movement_type": req.MovementType})
+			return
+
+		case "stop":
+			if err := s.ptzEng.Stop(dev.ID, "Technician"); err != nil {
+				writeSimpleError(w, r, http.StatusInternalServerError, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "status": "STOPPED"})
+			return
+
+		case "focus-iris":
+			var req ptz.FocusIrisRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				writeSimpleError(w, r, http.StatusBadRequest, "Invalid focus/iris request: "+err.Error())
+				return
+			}
+			if err := s.ptzEng.FocusIris(dev.ID, req, "Technician"); err != nil {
+				writeSimpleError(w, r, http.StatusBadRequest, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "command": req.Command})
+			return
+
+		case "presets":
+			if r.Method == "GET" && len(parts) == 3 {
+				presets, err := s.ptzEng.GetPresets(dev.ID)
+				if err != nil {
+					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
+					return
+				}
+				writeJSON(w, http.StatusOK, presets)
+				return
+			}
+
+			// Subroute: POST /api/v1/devices/{id}/ptz/presets/{presetId}/goto
+			if len(parts) >= 5 && parts[4] == "goto" {
+				pID, _ := strconv.Atoi(parts[3])
+				var speedReq struct {
+					Speed float64 `json:"speed"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&speedReq)
+				if err := s.ptzEng.GotoPreset(dev.ID, pID, speedReq.Speed, "Technician"); err != nil {
+					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
+					return
+				}
+				writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "preset_id": pID, "status": "NAVIGATING"})
+				return
+			}
+
+			// Subroute: PUT /api/v1/devices/{id}/ptz/presets/{presetId} (Rename)
+			if r.Method == "PUT" && len(parts) >= 4 {
+				pID, _ := strconv.Atoi(parts[3])
+				var renameReq struct {
+					Name string `json:"name"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&renameReq)
+				renamed, err := s.ptzEng.RenamePreset(dev.ID, pID, renameReq.Name, "Technician")
+				if err != nil {
+					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
+					return
+				}
+				writeJSON(w, http.StatusOK, renamed)
+				return
+			}
+
+			// Subroute: DELETE /api/v1/devices/{id}/ptz/presets/{presetId}
+			if r.Method == "DELETE" && len(parts) >= 4 {
+				pID, _ := strconv.Atoi(parts[3])
+				if err := s.ptzEng.DeletePreset(dev.ID, pID, "Technician"); err != nil {
+					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
+					return
+				}
+				writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "deleted_id": pID})
+				return
+			}
+
+			// Create preset: POST /api/v1/devices/{id}/ptz/presets
+			if r.Method == "POST" {
+				var createReq struct {
+					ID   int    `json:"id"`
+					Name string `json:"name"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&createReq)
+				p, err := s.ptzEng.CreatePreset(dev.ID, createReq.ID, createReq.Name, "Technician")
+				if err != nil {
+					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
+					return
+				}
+				writeJSON(w, http.StatusOK, p)
+				return
+			}
+
+		case "patrols":
+			if r.Method == "GET" && len(parts) == 3 {
+				patrols, err := s.ptzEng.GetPatrols(dev.ID)
+				if err != nil {
+					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
+					return
+				}
+				writeJSON(w, http.StatusOK, patrols)
+				return
+			}
+
+			// Subroute: POST /api/v1/devices/{id}/ptz/patrols/{tourId}/run
+			if len(parts) >= 5 && parts[4] == "run" {
+				tID, _ := strconv.Atoi(parts[3])
+				if err := s.ptzEng.RunPatrol(dev.ID, tID, "Technician"); err != nil {
+					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
+					return
+				}
+				writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "tour_id": tID, "status": "RUNNING"})
+				return
+			}
+
+			// Subroute: POST /api/v1/devices/{id}/ptz/patrols/{tourId}/stop
+			if len(parts) >= 5 && parts[4] == "stop" {
+				tID, _ := strconv.Atoi(parts[3])
+				if err := s.ptzEng.StopPatrol(dev.ID, tID, "Technician"); err != nil {
+					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
+					return
+				}
+				writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "tour_id": tID, "status": "STOPPED"})
+				return
+			}
+
+			// Create patrol: POST /api/v1/devices/{id}/ptz/patrols
+			if r.Method == "POST" {
+				var tour ptz.PatrolTour
+				if err := json.NewDecoder(r.Body).Decode(&tour); err != nil {
+					writeSimpleError(w, r, http.StatusBadRequest, "Invalid patrol tour payload")
+					return
+				}
+				created, err := s.ptzEng.CreatePatrol(dev.ID, tour, "Technician")
+				if err != nil {
+					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
+					return
+				}
+				writeJSON(w, http.StatusOK, created)
+				return
+			}
+
+		case "home":
+			var req struct {
+				Action string `json:"action"` // "goto" or "set"
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if req.Action == "set" {
+				if err := s.ptzEng.SetHome(dev.ID, "Technician"); err != nil {
+					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
+					return
+				}
+				writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "message": "Home position calibrated"})
+				return
+			}
+			if err := s.ptzEng.GotoHome(dev.ID, "Technician"); err != nil {
+				writeSimpleError(w, r, http.StatusBadRequest, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "message": "Navigating to home position"})
+			return
+
+		case "autoscan":
+			var req struct {
+				Enabled bool `json:"enabled"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if err := s.ptzEng.AutoScan(dev.ID, req.Enabled, "Technician"); err != nil {
+				writeSimpleError(w, r, http.StatusBadRequest, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "auto_scan": req.Enabled})
+			return
+		}
+	}
+
+	// Legacy single-command fallback: POST /api/v1/devices/{id}/ptz
+	var action models.PTZAction
+	_ = json.NewDecoder(r.Body).Decode(&action)
+	action.DeviceID = dev.ID
+
+	switch action.Command {
+	case "STOP":
+		_ = s.ptzEng.Stop(dev.ID, "Technician")
+	case "GOTO_PRESET":
+		_ = s.ptzEng.GotoPreset(dev.ID, action.PresetID, action.Speed, "Technician")
+	case "SET_PRESET":
+		_, _ = s.ptzEng.CreatePreset(dev.ID, action.PresetID, fmt.Sprintf("Preset %d", action.PresetID), "Technician")
+	default:
+		if err := s.ptzEng.ContinuousMove(dev.ID, action.Pan, action.Tilt, action.Zoom, action.Speed, 0, "Technician"); err != nil {
+			writeSimpleError(w, r, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "command": action.Command})
+}
+
+// -----------------------------------------------------------------------------
+// Phase 7 Events Management Handlers
+// -----------------------------------------------------------------------------
+
+func (s *Server) handleEventsListSubscriptions(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "GET" {
+		subs := s.eventMgr.GetSubscriptions()
+		writeJSON(w, http.StatusOK, subs)
+		return
+	}
+	if r.Method == "POST" {
+		var req struct {
+			DeviceID string                      `json:"device_id"`
+			Protocol events.SubscriptionProtocol `json:"protocol"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeSimpleError(w, r, http.StatusBadRequest, "Invalid subscription request")
+			return
+		}
+		if req.Protocol == "" {
+			req.Protocol = events.ProtoONVIFPullPoint
+		}
+		sub, err := s.eventMgr.CreateSubscription(req.DeviceID, req.Protocol, "Technician")
+		if err != nil {
+			writeSimpleError(w, r, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, sub)
+		return
+	}
+	writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
+}
+
+func (s *Server) handleEventsCancelSubscription(w http.ResponseWriter, r *http.Request) {
+	subID := strings.TrimPrefix(r.URL.Path, "/api/v1/events/subscriptions/")
+	if subID == "" {
+		writeSimpleError(w, r, http.StatusBadRequest, "Subscription ID required")
+		return
+	}
+	if r.Method == "DELETE" || r.Method == "POST" {
+		if err := s.eventMgr.CancelSubscription(subID, "Technician"); err != nil {
+			writeSimpleError(w, r, http.StatusNotFound, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "cancelled_id": subID})
+		return
+	}
+	writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
+}
+
+func (s *Server) handleEventsLive(w http.ResponseWriter, r *http.Request) {
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit <= 0 {
+		limit = 50
+	}
+	eventsList := s.eventMgr.GetRecentEvents(limit)
+	writeJSON(w, http.StatusOK, eventsList)
+}
+
+// -----------------------------------------------------------------------------
+// Phase 7 Unified Alarms & Rule Automation Handlers
+// -----------------------------------------------------------------------------
+
+func (s *Server) handleAlarms(w http.ResponseWriter, r *http.Request) {
+	filter := alarms.AlarmFilter{}
+
+	if r.Method == "POST" {
+		_ = json.NewDecoder(r.Body).Decode(&filter)
+	} else {
+		filter.DeviceID = r.URL.Query().Get("device_id")
+		filter.SiteID = r.URL.Query().Get("site_id")
+		filter.Manufacturer = r.URL.Query().Get("manufacturer")
+		filter.EventCategory = r.URL.Query().Get("category")
+		filter.Severity = alarms.AlarmSeverity(r.URL.Query().Get("severity"))
+		filter.State = alarms.AlarmState(r.URL.Query().Get("state"))
+		l, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+		filter.Limit = l
+	}
+
+	results := s.alarmEng.FilterAlarms(filter)
+	writeJSON(w, http.StatusOK, results)
+}
+
+func (s *Server) handleAlarmsStats(w http.ResponseWriter, r *http.Request) {
+	stats := s.alarmEng.GetStats()
+	writeJSON(w, http.StatusOK, stats)
+}
+
+func (s *Server) handleAlarmsRules(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "GET" {
+		writeJSON(w, http.StatusOK, s.alarmEng.GetRules())
+		return
+	}
+	if r.Method == "POST" {
+		var rule alarms.AlarmRule
+		if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
+			writeSimpleError(w, r, http.StatusBadRequest, "Invalid alarm rule payload")
+			return
+		}
+		upserted := s.alarmEng.UpsertRule(&rule, "Technician")
+		writeJSON(w, http.StatusOK, upserted)
+		return
+	}
+	writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
+}
+
+func (s *Server) handleAlarmsRulesDelete(w http.ResponseWriter, r *http.Request) {
+	ruleID := strings.TrimPrefix(r.URL.Path, "/api/v1/alarms/rules/")
+	if ruleID == "" {
+		writeSimpleError(w, r, http.StatusBadRequest, "Rule ID required")
+		return
+	}
+	if r.Method == "DELETE" {
+		if err := s.alarmEng.DeleteRule(ruleID, "Technician"); err != nil {
+			writeSimpleError(w, r, http.StatusNotFound, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "deleted_rule_id": ruleID})
+		return
+	}
+	writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
+}
+
+func (s *Server) handleAlarmsExport(w http.ResponseWriter, r *http.Request) {
+	format := strings.ToLower(r.URL.Query().Get("format"))
+	filter := alarms.AlarmFilter{}
+
+	if format == "csv" {
+		csvBytes, err := s.alarmEng.ExportCSV(filter)
+		if err != nil {
+			writeSimpleError(w, r, http.StatusInternalServerError, err.Error())
+			return
+		}
+		w.Header().Set("Content-Type", "text/csv")
+		w.Header().Set("Content-Disposition", "attachment; filename=\"alarm_history.csv\"")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(csvBytes)
+		return
+	}
+
+	jsonBytes, err := s.alarmEng.ExportJSON(filter)
+	if err != nil {
+		writeSimpleError(w, r, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Disposition", "attachment; filename=\"alarm_history.json\"")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(jsonBytes)
+}
+
+func (s *Server) handleAlarmsStream(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeSimpleError(w, r, http.StatusInternalServerError, "Streaming unsupported")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+
+	// Send initial heartbeat
+	fmt.Fprintf(w, "data: {\"type\":\"CONNECTED\",\"timestamp\":\"%s\"}\n\n", time.Now().UTC().Format(time.RFC3339))
+	flusher.Flush()
+
+	almChan := s.alarmEng.SubscribeAlarms()
+	defer s.alarmEng.UnsubscribeAlarms(almChan)
+
+	evChan := s.eventMgr.SubscribeEvents()
+	defer s.eventMgr.UnsubscribeEvents(evChan)
+
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case alm, ok := <-almChan:
+			if !ok {
+				return
+			}
+			payload, _ := json.Marshal(alm)
+			fmt.Fprintf(w, "data: {\"type\":\"ALARM\",\"payload\":%s}\n\n", string(payload))
+			flusher.Flush()
+		case ev, ok := <-evChan:
+			if !ok {
+				return
+			}
+			payload, _ := json.Marshal(ev)
+			fmt.Fprintf(w, "data: {\"type\":\"EVENT\",\"payload\":%s}\n\n", string(payload))
+			flusher.Flush()
+		}
+	}
+}
+
+func (s *Server) handleAlarmSubroutes(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/api/v1/alarms/")
+	parts := strings.Split(path, "/")
+	if len(parts) == 0 || parts[0] == "" {
+		s.handleAlarms(w, r)
+		return
+	}
+
+	alarmID := parts[0]
+
+	if len(parts) == 1 {
+		alm, ok := s.alarmEng.GetAlarm(alarmID)
+		if !ok {
+			writeSimpleError(w, r, http.StatusNotFound, "Alarm not found")
+			return
+		}
+		writeJSON(w, http.StatusOK, alm)
+		return
+	}
+
+	action := parts[1]
+	switch action {
+	case "acknowledge":
+		ack, err := s.alarmEng.Acknowledge(alarmID, "Technician")
+		if err != nil {
+			writeSimpleError(w, r, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, ack)
+		return
+
+	case "assign":
+		var req struct {
+			Technician string `json:"technician"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Technician == "" {
+			req.Technician = "Lead_Technician"
+		}
+		assigned, err := s.alarmEng.Assign(alarmID, req.Technician, "Technician")
+		if err != nil {
+			writeSimpleError(w, r, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, assigned)
+		return
+
+	case "resolve":
+		var req struct {
+			Notes string `json:"notes"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Notes == "" {
+			req.Notes = "Resolved by surveillance technician"
+		}
+		resolved, err := s.alarmEng.Resolve(alarmID, req.Notes, "Technician")
+		if err != nil {
+			writeSimpleError(w, r, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, resolved)
+		return
+
+	case "dismiss":
+		var req struct {
+			Reason string `json:"reason"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Reason == "" {
+			req.Reason = "False positive alarm / test drill"
+		}
+		dismissed, err := s.alarmEng.Dismiss(alarmID, req.Reason, "Technician")
+		if err != nil {
+			writeSimpleError(w, r, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, dismissed)
+		return
+
+	default:
+		writeSimpleError(w, r, http.StatusNotFound, "Unknown alarm action")
 	}
 }

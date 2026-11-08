@@ -46,7 +46,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ activeTab, setActiveTab, devic
     { id: 'live', label: 'Live Video Grid', icon: Grid },
     { id: 'config', label: 'Universal Config', icon: Sliders },
     { id: 'recorder', label: 'Recorder & XVR', icon: Server },
-    { id: 'ptz', label: 'PTZ Controller', icon: Compass },
+    { id: 'ptz', label: 'PTZ & Alarms', icon: Compass },
     { id: 'diagnostics', label: 'Diagnostics & RTSP', icon: Wrench },
     { id: 'calculators', label: 'Calculators (HDD/BW)', icon: Calculator },
     { id: 'batch', label: 'Batch Configuration', icon: Layers },

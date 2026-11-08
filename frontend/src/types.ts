@@ -703,3 +703,161 @@ export interface DiskFormatPreview {
   warning: string;
   expires_at: string;
 }
+
+// Phase 7 - PTZ Control, Events & Unified Alarm Monitoring
+export interface PTZCapabilities {
+  device_id: string;
+  ptz_supported: boolean;
+  pan_tilt_supported: boolean;
+  continuous_pan_tilt: boolean;
+  relative_pan_tilt: boolean;
+  absolute_pan_tilt: boolean;
+  zoom_supported: boolean;
+  continuous_zoom: boolean;
+  relative_zoom: boolean;
+  focus_supported: boolean;
+  iris_supported: boolean;
+  presets_supported: boolean;
+  max_presets: number;
+  preset_tour_supported: boolean;
+  home_position_supported: boolean;
+  auto_scan_supported: boolean;
+  supported_protocols: string[];
+  status_notes: string;
+}
+
+export interface Preset {
+  id: string;
+  device_id: string;
+  number: number;
+  name: string;
+  pan: number;
+  tilt: number;
+  zoom: number;
+  created_at: string;
+}
+
+export interface PatrolStep {
+  preset_number: number;
+  dwell_time_sec: number;
+  speed: number;
+}
+
+export interface PatrolTour {
+  id: string;
+  device_id: string;
+  tour_number: number;
+  name: string;
+  steps: PatrolStep[];
+  repeat_count: number;
+  is_running: boolean;
+}
+
+export interface MoveRequest {
+  pan_speed: number;
+  tilt_speed: number;
+  zoom_speed: number;
+  timeout_ms?: number;
+}
+
+export interface FocusIrisRequest {
+  action: 'FOCUS_NEAR' | 'FOCUS_FAR' | 'FOCUS_AUTO' | 'IRIS_OPEN' | 'IRIS_CLOSE' | 'IRIS_RESET';
+  speed?: number;
+}
+
+export type EventCategory =
+  | 'MOTION'
+  | 'TAMPER'
+  | 'LINE_CROSSING'
+  | 'INTRUSION'
+  | 'AI_ANALYTICS'
+  | 'DEVICE_FAULT'
+  | 'IO_ALARM'
+  | 'SYSTEM';
+
+export interface EventSubscription {
+  id: string;
+  device_id: string;
+  protocol: string;
+  endpoint: string;
+  status: 'ACTIVE' | 'CONNECTING' | 'RETRYING' | 'TERMINATED';
+  subscribed_at: string;
+  expires_at: string;
+  renew_count: number;
+  last_error?: string;
+}
+
+export interface SurveillanceEvent {
+  id: string;
+  device_id: string;
+  channel_id: number;
+  timestamp: string;
+  category: EventCategory;
+  topic: string;
+  source: string;
+  state: 'START' | 'STOP' | 'PULSE';
+  severity: 'INFO' | 'MINOR' | 'MAJOR' | 'CRITICAL';
+  details?: Record<string, any>;
+  raw_payload?: string;
+  normalized_by: string;
+}
+
+export type AlarmSeverity = 'CRITICAL' | 'MAJOR' | 'MINOR' | 'INFO';
+export type AlarmState = 'NEW' | 'ACKNOWLEDGED' | 'INVESTIGATING' | 'RESOLVED' | 'DISMISSED';
+
+export interface Alarm {
+  id: string;
+  device_id: string;
+  device_name: string;
+  channel_id: number;
+  category: string;
+  severity: AlarmSeverity;
+  state: AlarmState;
+  event_id: string;
+  event_topic: string;
+  event_timestamp: string;
+  first_seen_at: string;
+  last_seen_at: string;
+  occurrence_count: number;
+  description: string;
+  assigned_technician?: string;
+  resolution_notes?: string;
+  acknowledged_at?: string;
+  acknowledged_by?: string;
+  resolved_at?: string;
+  resolved_by?: string;
+  snapshot_url?: string;
+  snapshot_capture_time?: string;
+  snapshot_evidence_id?: string;
+  metadata?: Record<string, any>;
+}
+
+export interface AlarmRule {
+  id: string;
+  name: string;
+  enabled: boolean;
+  match_categories: string[];
+  match_device_ids: string[];
+  severity_override: AlarmSeverity;
+  cooldown_sec: number;
+  capture_snapshot: boolean;
+  assign_technician: string;
+  webhook_url: string;
+  email_recipients: string[];
+  suppress_duplicates: boolean;
+}
+
+export interface AlarmStats {
+  total_count: number;
+  new_count: number;
+  acknowledged_count: number;
+  investigating_count: number;
+  resolved_count: number;
+  critical_count: number;
+  major_count: number;
+  minor_count: number;
+  info_count: number;
+  by_category: Record<string, number>;
+  by_device: Record<string, number>;
+}
+
