@@ -51,7 +51,7 @@ async function request<T>(endpoint: string, options?: RequestInit): Promise<T> {
 
   // Active client-side timeout: prevent any API call from stalling or hanging indefinitely
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 8000);
+  const timeoutId = setTimeout(() => controller.abort(), 12000);
 
   try {
     // Pure cookie-based browser session: credentials: 'include' automatically transmits HttpOnly sentinel_session
@@ -152,6 +152,7 @@ export const api = {
       body: JSON.stringify({ stream_type: streamType, user, ttl_seconds: ttlSeconds })
     }),
   getStreamMJPEGUrl: (token: string) => `${BASE_URL}/streams/${token}/mjpeg`,
+  getStreamFrameUrl: (token: string) => `${BASE_URL}/streams/${token}/frame`,
   getStreamStats: (token: string) => request<StreamStats>(`/streams/${token}/stats`),
   getStreamDiagnostics: (deviceId: string) => request<StreamDiagnosticReport>(`/devices/${deviceId}/diagnostics/stream`),
 

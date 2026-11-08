@@ -20,6 +20,45 @@ interface TileState {
   error?: string;
 }
 
+interface StreamPlayerProps {
+  token: string;
+  name: string;
+  isGridHighDensity: boolean;
+  onError: () => void;
+}
+
+const StreamPlayer: React.FC<StreamPlayerProps> = ({ token, name, isGridHighDensity, onError }) => {
+  const [frameTimestamp, setFrameTimestamp] = useState(Date.now());
+
+  useEffect(() => {
+    if (!isGridHighDensity) return;
+    const interval = setInterval(() => {
+      setFrameTimestamp(Date.now());
+    }, 300);
+    return () => clearInterval(interval);
+  }, [isGridHighDensity]);
+
+  if (isGridHighDensity) {
+    return (
+      <img
+        src={`${api.getStreamFrameUrl(token)}?t=${frameTimestamp}`}
+        alt={name}
+        className="w-full h-full object-cover"
+        onError={onError}
+      />
+    );
+  }
+
+  return (
+    <img
+      src={api.getStreamMJPEGUrl(token)}
+      alt={name}
+      className="w-full h-full object-cover"
+      onError={onError}
+    />
+  );
+};
+
 export const LiveView: React.FC<LiveViewProps> = ({ devices, selectedDevice }) => {
   const [layout, setLayout] = useState<'1x1' | '2x2' | '3x3' | '4x4'>('2x2');
   const [activeID, setActiveID] = useState<string>(selectedDevice?.id || devices[0]?.id || '');
@@ -391,10 +430,10 @@ export const LiveView: React.FC<LiveViewProps> = ({ devices, selectedDevice }) =
                 {/* Video Canvas Viewport */}
                 <div className="relative aspect-video bg-black flex items-center justify-center overflow-hidden">
                   {tile.status === 'LIVE' && tile.token ? (
-                    <img
-                      src={api.getStreamMJPEGUrl(tile.token)}
-                      alt={dev.name}
-                      className="w-full h-full object-cover"
+                    <StreamPlayer
+                      token={tile.token}
+                      name={dev.name}
+                      isGridHighDensity={layout === '3x3' || layout === '4x4'}
                       onError={() => {
                         setTileStates((prev) => ({
                           ...prev,

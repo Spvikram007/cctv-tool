@@ -1653,6 +1653,9 @@ func (s *Server) handleStreamSubroutes(w http.ResponseWriter, r *http.Request) {
 		case "mjpeg":
 			s.streamHub.ServeMJPEG(w, r, token)
 			return
+		case "frame":
+			s.streamHub.ServeSingleFrame(w, r, token)
+			return
 		case "stats":
 			stats, err := s.streamHub.GetTokenStats(token)
 			if err != nil {

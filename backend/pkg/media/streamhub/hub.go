@@ -211,13 +211,13 @@ func (h *Hub) GetOrCreateSession(deviceID, streamType string) (*LiveSession, err
 			}
 		}
 	}
-	if activeSessions >= 16 {
+	if activeSessions >= 64 {
 		h.mu.Unlock()
 		return nil, ErrMaxStreamsReached
 	}
-	if deviceSessions >= 2 {
+	if deviceSessions >= 8 {
 		h.mu.Unlock()
-		return nil, fmt.Errorf("device %s already has %d active streams (limit: 2)", deviceID, deviceSessions)
+		return nil, fmt.Errorf("device %s already has %d active streams (limit: 8)", deviceID, deviceSessions)
 	}
 
 	adapter, err := h.registry.ResolveForDevice(&dev)
@@ -231,10 +231,18 @@ func (h *Hub) GetOrCreateSession(deviceID, streamType string) (*LiveSession, err
 		streamIdx = 1
 	}
 
+	// Release lock during network resolution of stream URI to prevent blocking the entire hub
+	h.mu.Unlock()
+
 	streamURI, err := adapter.GetStreamURI(&dev, streamIdx)
 	if err != nil {
-		h.mu.Unlock()
 		return nil, fmt.Errorf("failed to get stream URI: %w", err)
+	}
+
+	h.mu.Lock()
+	if existing, ok := h.sessions[key]; ok && existing.running {
+		h.mu.Unlock()
+		return existing, nil
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -512,9 +520,9 @@ func (s *LiveSession) UnregisterViewer(ch chan []byte) {
 	s.mu.Unlock()
 
 	if v <= 0 {
-		// Stop session after grace period if no viewers remain
+		// Stop session quickly after viewers detach to release decoder resources
 		go func() {
-			time.Sleep(20 * time.Second)
+			time.Sleep(3 * time.Second)
 			if atomic.LoadInt32(&s.viewers) <= 0 {
 				s.Stop()
 			}
@@ -534,6 +542,13 @@ func (s *LiveSession) Stop() {
 		s.status = "OFFLINE"
 	}
 	s.mu.Unlock()
+
+	if s.hub != nil {
+		s.hub.mu.Lock()
+		key := fmt.Sprintf("%s:%s", s.DeviceID, s.StreamType)
+		delete(s.hub.sessions, key)
+		s.hub.mu.Unlock()
+	}
 }
 
 // InvalidateDeviceSessions terminates and cleans up all active streaming sessions for a device
@@ -624,4 +639,40 @@ func (h *Hub) ServeMJPEG(w http.ResponseWriter, r *http.Request, tokenStr string
 			flusher.Flush()
 		}
 	}
+}
+
+// ServeSingleFrame returns the latest live JPEG frame for rapid-refresh grid rendering without socket starvation
+func (h *Hub) ServeSingleFrame(w http.ResponseWriter, r *http.Request, tokenStr string) {
+	token, err := h.ValidateToken(tokenStr)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	session, err := h.GetOrCreateSession(token.DeviceID, token.StreamType)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	session.mu.RLock()
+	frame := session.lastFrame
+	status := session.status
+	errMsg := session.errorMsg
+	session.mu.RUnlock()
+
+	if len(frame) == 0 {
+		msg := status
+		if errMsg != "" {
+			msg = errMsg
+		}
+		frame = generateStatusJPEG(session.DeviceID, msg)
+	}
+
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(frame)))
+	_, _ = w.Write(frame)
 }
