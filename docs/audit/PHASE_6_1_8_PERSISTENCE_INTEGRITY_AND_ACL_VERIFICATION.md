@@ -237,3 +237,4 @@ Per Requirement 6:
 - Direct integration with OS-level credential vaults (Windows Credential Manager / DPAPI, macOS Keychain, Linux Secret Service / libsecret) is **NOT IMPLEMENTED** in this repository.
 - Desktop authentication capabilities implemented on the backend provide asymmetric Ed25519 signature proof verification, bearer token generation, and device session binding.
 - Status: **NOT IMPLEMENTED** (No native client application present).
+

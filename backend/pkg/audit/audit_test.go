@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"cctv-sentinel/pkg/audit"
+	"cctv-sentinel/pkg/security"
 )
 
 func TestAuditSecretRedaction(t *testing.T) {
@@ -155,5 +156,66 @@ func TestExportedLedgerCryptographicVerification(t *testing.T) {
 	valid, err = logger.VerifyExportedLedger(tamperedFile)
 	if err == nil || valid {
 		t.Fatalf("SECURITY VIOLATION: Tampered export archive was accepted without cryptographic failure!")
+	}
+}
+
+// TestAuditKeyFilePermissionsAndRestartContinuity verifies that audit key creation, rotation,
+// hardened permissions, and restart recovery operate correctly without regression.
+func TestAuditKeyFilePermissionsAndRestartContinuity(t *testing.T) {
+	tempDir := t.TempDir()
+	keyFile := filepath.Join(tempDir, "audit_lifecycle.key")
+
+	// 1. Initial key creation
+	logger, err := audit.NewLoggerWithKeyFile(keyFile)
+	if err != nil {
+		t.Fatalf("failed to initialize audit logger: %v", err)
+	}
+
+	// Verify permissions on newly created key file
+	if err := security.VerifyFilePermissions(keyFile); err != nil {
+		t.Errorf("initial audit keyfile failed permissions check: %v", err)
+	}
+
+	logger.Log("Operator", "dev-init", "192.168.1.50", "INIT", "SYSTEM", "SUCCESS", "Initial entry", "")
+	// Sign payload with initial key
+	sig1, keyID1 := logger.SignPayload([]byte("audit-evidence-checkpoint-1"))
+
+	// 2. Rotate key
+	newKeyID, err := logger.RotateCheckpointKey()
+	if err != nil {
+		t.Fatalf("failed to rotate checkpoint key: %v", err)
+	}
+	if newKeyID == keyID1 {
+		t.Errorf("expected distinct key ID after rotation")
+	}
+
+	// Verify permissions on key file after rotation
+	if err := security.VerifyFilePermissions(keyFile); err != nil {
+		t.Errorf("rotated audit keyfile failed permissions check: %v", err)
+	}
+
+	// Sign payload with new key
+	sig2, keyID2 := logger.SignPayload([]byte("audit-evidence-checkpoint-2"))
+	if keyID2 != newKeyID {
+		t.Errorf("expected keyID2 %s, got %s", newKeyID, keyID2)
+	}
+
+	// 3. Simulate Server Restart: Reconstruct new logger from the same key file
+	loggerAfterRestart, err := audit.NewLoggerWithKeyFile(keyFile)
+	if err != nil {
+		t.Fatalf("failed to reload audit logger from keyfile after restart: %v", err)
+	}
+
+	// Verify key file permissions after restart reload
+	if err := security.VerifyFilePermissions(keyFile); err != nil {
+		t.Errorf("reloaded audit keyfile failed permissions check: %v", err)
+	}
+
+	// Signature verification must succeed for BOTH initial and rotated keys using reloaded keyring
+	if !loggerAfterRestart.VerifyPayloadSignature([]byte("audit-evidence-checkpoint-1"), sig1, keyID1) {
+		t.Errorf("failed to verify pre-rotation signature with reloaded logger")
+	}
+	if !loggerAfterRestart.VerifyPayloadSignature([]byte("audit-evidence-checkpoint-2"), sig2, keyID2) {
+		t.Errorf("failed to verify post-rotation signature with reloaded logger")
 	}
 }
