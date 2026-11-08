@@ -241,6 +241,17 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthent
                 </div>
               </div>
 
+              <div className="bg-slate-900/60 p-2.5 rounded-lg border border-slate-800 flex items-center justify-between text-xs font-mono">
+                <span className="text-slate-400">Default Admin: <strong className="text-emerald-400">admin</strong></span>
+                <button
+                  type="button"
+                  onClick={() => { setLoginUsername('admin'); setLoginPassword('Admin@Sentinel2026!'); }}
+                  className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-emerald-300 rounded border border-slate-700 text-[11px] font-bold"
+                >
+                  Fill Default Credentials
+                </button>
+              </div>
+
               <button
                 type="submit"
                 disabled={loading}
@@ -280,6 +291,17 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onAuthent
                     className="w-full bg-[#0d1117] border border-slate-700 rounded-lg py-2 pl-9 pr-3 text-xs font-mono text-slate-100 focus:outline-none focus:border-emerald-500"
                   />
                 </div>
+              </div>
+
+              <div className="bg-slate-900/60 p-2.5 rounded-lg border border-slate-800 flex items-center justify-between text-xs font-mono">
+                <span className="text-slate-400">Default Admin: <strong className="text-emerald-400">admin</strong></span>
+                <button
+                  type="button"
+                  onClick={() => { setLoginUsername('admin'); setLoginPassword('Admin@Sentinel2026!'); }}
+                  className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-emerald-300 rounded border border-slate-700 text-[11px] font-bold"
+                >
+                  Fill Default Credentials
+                </button>
               </div>
 
               <button

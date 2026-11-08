@@ -1880,7 +1880,7 @@ export const PTZControl: React.FC<PTZControlProps> = ({
                 <div className="relative aspect-video bg-black flex items-center justify-center">
                   {selectedAlarmForEvidence.snapshot_url ? (
                     <img
-                      src={`http://127.0.0.1:8080${selectedAlarmForEvidence.snapshot_url}`}
+                      src={selectedAlarmForEvidence.snapshot_url}
                       alt="Alarm Snapshot"
                       className="w-full h-full object-cover"
                     />
@@ -1895,7 +1895,7 @@ export const PTZControl: React.FC<PTZControlProps> = ({
                   </span>
                   {selectedAlarmForEvidence.snapshot_url && (
                     <a
-                      href={`http://127.0.0.1:8080${selectedAlarmForEvidence.snapshot_url}`}
+                      href={selectedAlarmForEvidence.snapshot_url}
                       target="_blank"
                       rel="noopener noreferrer"
                       className="px-3 py-1.5 rounded bg-[#21262d] hover:bg-[#30363d] text-slate-200 text-xs font-bold flex items-center space-x-1.5"

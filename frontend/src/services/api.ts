@@ -15,7 +15,7 @@ import {
   EventSubscription, SurveillanceEvent, Alarm, AlarmRule, AlarmStats
 } from '../types';
 
-const BASE_URL = 'http://127.0.0.1:8080/api/v1';
+const BASE_URL = '/api/v1';
 
 // In-memory CSRF token storage - NEVER exposed or stored in localStorage / sessionStorage
 let memoryCsrfToken = '';
@@ -40,6 +40,11 @@ async function request<T>(endpoint: string, options?: RequestInit): Promise<T> {
     'Content-Type': 'application/json',
     ...(options?.headers as Record<string, string>),
   };
+
+  // Explicit Origin tracking for browser environments
+  if (typeof window !== 'undefined' && window.location && window.location.origin) {
+    headers['X-Sentinel-Origin'] = window.location.origin;
+  }
 
   // CSRF Protection: Attach anti-CSRF token to all state-changing requests
   if (['POST', 'PUT', 'DELETE', 'PATCH'].includes(method)) {

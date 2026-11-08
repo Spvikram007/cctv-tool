@@ -257,7 +257,7 @@ export const LiveView: React.FC<LiveViewProps> = ({ devices, selectedDevice }) =
           </div>
           <div className="flex items-center space-x-2">
             <a
-              href={`http://127.0.0.1:8080${lastSnapshot.url}`}
+              href={lastSnapshot.url}
               target="_blank"
               rel="noreferrer"
               className="px-3 py-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded flex items-center space-x-1 font-bold"
