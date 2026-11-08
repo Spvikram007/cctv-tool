@@ -475,6 +475,18 @@ func (s *LiveSession) Stop() {
 	s.mu.Unlock()
 }
 
+// InvalidateDeviceSessions terminates and cleans up all active streaming sessions for a device
+func (h *Hub) InvalidateDeviceSessions(deviceID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for k, s := range h.sessions {
+		if s.DeviceID == deviceID {
+			s.Stop()
+			delete(h.sessions, k)
+		}
+	}
+}
+
 // GetStats returns current stream performance metrics
 func (s *LiveSession) GetStats() StreamStats {
 	s.mu.RLock()

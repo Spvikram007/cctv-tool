@@ -689,6 +689,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/auth/setup", s.handleAuthSetup)
 	s.mux.HandleFunc("/api/v1/auth/login", s.handleSecurityLogin)
 	s.mux.HandleFunc("/api/v1/security/login", s.handleSecurityLogin)
+	s.mux.HandleFunc("/api/v1/auth/session", s.handleSecurityCurrentSession)
+	s.mux.HandleFunc("/api/v1/security/session", s.handleSecurityCurrentSession)
 	s.mux.HandleFunc("/api/v1/auth/logout", s.handleSecurityLogout)
 	s.mux.HandleFunc("/api/v1/security/logout", s.handleSecurityLogout)
 	s.mux.HandleFunc("/api/v1/auth/csrf", s.handleSecurityCSRFToken)
@@ -1086,6 +1088,10 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 		}
 		if authReq.Password != "" {
 			dev.Password = authReq.Password
+		}
+		if authReq.Username != "" || authReq.Password != "" {
+			s.store.UpsertDevice(dev)
+			s.streamHub.InvalidateDeviceSessions(dev.ID)
 		}
 		authStatus, err := adapter.Authenticate(&dev)
 		if err != nil {
@@ -2153,6 +2159,40 @@ func (s *Server) handleSecurityLogin(w http.ResponseWriter, r *http.Request) {
 		"permissions": security.RolePermissions[sess.Role],
 	}
 
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleSecurityCurrentSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	token, _ := s.extractSessionToken(r)
+	if token == "" {
+		writeError(w, r, http.StatusUnauthorized, "UNAUTHORIZED", "No active session")
+		return
+	}
+	sess, err := s.rbacMgr.ValidateSession(token)
+	if err != nil || sess == nil {
+		writeError(w, r, http.StatusUnauthorized, "UNAUTHORIZED", "Invalid or expired session")
+		return
+	}
+	safeSess := map[string]interface{}{
+		"username":        sess.Username,
+		"role":            sess.Role,
+		"tenant_id":       sess.TenantID,
+		"site_id":         sess.SiteID,
+		"is_global_admin": sess.IsGlobalAdmin,
+		"scopes":          sess.Scopes,
+		"created_at":      sess.CreatedAt,
+		"expires_at":      sess.ExpiresAt,
+	}
+	resp := map[string]interface{}{
+		"authenticated": true,
+		"session":       safeSess,
+		"csrf_token":    sess.CSRFToken,
+		"permissions":   security.RolePermissions[sess.Role],
+	}
 	writeJSON(w, http.StatusOK, resp)
 }
 

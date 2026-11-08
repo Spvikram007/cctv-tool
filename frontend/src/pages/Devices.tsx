@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Device, AuthStatus, DeviceCapabilities } from '../types';
 import { api } from '../services/api';
-import { Video, Sliders, Play, Wrench, Compass, Trash2, Filter, KeyRound, ShieldCheck, Cpu, X } from 'lucide-react';
+import { Video, Sliders, Play, Wrench, Compass, Trash2, Filter, KeyRound, ShieldCheck, Cpu, X, Lock, Eye, EyeOff, CheckCircle2, AlertTriangle } from 'lucide-react';
 
 interface DevicesProps {
   devices: Device[];
@@ -18,9 +18,50 @@ export const Devices: React.FC<DevicesProps> = ({
 }) => {
   const [vendorFilter, setVendorFilter] = useState('ALL');
   const [categoryFilter, setCategoryFilter] = useState('ALL');
-  const [authTestingId, setAuthTestingId] = useState<string | null>(null);
   const [authModal, setAuthModal] = useState<AuthStatus | null>(null);
   const [capsModal, setCapsModal] = useState<{ dev: Device; caps: DeviceCapabilities } | null>(null);
+
+  // Camera Authentication & Credentials Prompt State
+  const [authTargetDev, setAuthTargetDev] = useState<Device | null>(null);
+  const [camUsername, setCamUsername] = useState('admin');
+  const [camPassword, setCamPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+  const [authResult, setAuthResult] = useState<AuthStatus | null>(null);
+  const [authError, setAuthError] = useState<string | null>(null);
+
+  const openAuthModal = (dev: Device) => {
+    setAuthTargetDev(dev);
+    setCamUsername(dev.username || 'admin');
+    setCamPassword('');
+    setShowPassword(false);
+    setAuthResult(null);
+    setAuthError(null);
+  };
+
+  const handlePerformAuth = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!authTargetDev) return;
+    setAuthSubmitting(true);
+    setAuthError(null);
+    setAuthResult(null);
+    try {
+      const res = await api.authenticateDevice(authTargetDev.id, {
+        username: camUsername.trim(),
+        password: camPassword,
+      });
+      setAuthResult(res);
+      if (res.authenticated) {
+        onRefresh();
+      } else {
+        setAuthError(res.error_message || 'Camera rejected authentication: check username and password');
+      }
+    } catch (err: any) {
+      setAuthError(err.message || 'Authentication request failed');
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
 
   const filtered = devices.filter((d) => {
     if (vendorFilter !== 'ALL' && d.manufacturer !== vendorFilter) return false;
@@ -36,19 +77,6 @@ export const Devices: React.FC<DevicesProps> = ({
       } catch (err: any) {
         alert(err.message);
       }
-    }
-  };
-
-  const handleTestAuth = async (dev: Device) => {
-    setAuthTestingId(dev.id);
-    try {
-      const res = await api.authenticateDevice(dev.id);
-      setAuthModal(res);
-      onRefresh();
-    } catch (err: any) {
-      alert(`Authentication test failed: ${err.message}`);
-    } finally {
-      setAuthTestingId(null);
     }
   };
 
@@ -156,10 +184,9 @@ export const Devices: React.FC<DevicesProps> = ({
                   <td className="py-3 px-4 text-right">
                     <div className="flex items-center justify-end space-x-1.5">
                       <button
-                        title="Test Authentication"
-                        disabled={authTestingId === dev.id}
-                        onClick={() => handleTestAuth(dev)}
-                        className="p-1.5 rounded bg-[#0d1117] hover:bg-emerald-600/30 text-slate-300 hover:text-emerald-300 border border-slate-700 transition-colors"
+                        title="Authenticate & Set Camera Credentials"
+                        onClick={() => openAuthModal(dev)}
+                        className="p-1.5 rounded bg-[#0d1117] hover:bg-emerald-600/30 text-emerald-400 hover:text-emerald-300 border border-slate-700 transition-colors"
                       >
                         <KeyRound className="w-3.5 h-3.5" />
                       </button>
@@ -231,6 +258,106 @@ export const Devices: React.FC<DevicesProps> = ({
           </table>
         </div>
       </div>
+
+      {/* Camera Authentication & Credentials Prompt Modal */}
+      {authTargetDev && (
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-[#161b22] border border-[#30363d] rounded-xl max-w-md w-full p-6 space-y-4 font-mono shadow-2xl">
+            <div className="flex items-center justify-between border-b border-[#30363d] pb-3">
+              <div className="flex items-center space-x-2 text-emerald-400 font-bold text-sm">
+                <KeyRound className="w-5 h-5" />
+                <span>AUTHENTICATE CAMERA</span>
+              </div>
+              <button onClick={() => setAuthTargetDev(null)} className="text-slate-400 hover:text-slate-200">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-3 bg-[#0d1117] border border-[#30363d] rounded-lg text-xs space-y-1">
+              <div className="text-slate-200 font-bold">{authTargetDev.name}</div>
+              <div className="text-slate-400 text-[11px] flex justify-between">
+                <span>IP: {authTargetDev.ip}:{authTargetDev.port}</span>
+                <span>Vendor: {authTargetDev.manufacturer}</span>
+              </div>
+            </div>
+
+            {authError && (
+              <div className="p-3 bg-red-950/60 border border-red-800 text-red-300 rounded-lg text-xs flex items-start space-x-2">
+                <AlertTriangle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+                <span>{authError}</span>
+              </div>
+            )}
+
+            {authResult?.authenticated && (
+              <div className="p-3 bg-emerald-950/60 border border-emerald-800 text-emerald-300 rounded-lg text-xs space-y-1.5">
+                <div className="flex items-center space-x-1.5 font-bold text-emerald-400">
+                  <CheckCircle2 className="w-4 h-4" />
+                  <span>AUTHENTICATED SUCCESSFULLY</span>
+                </div>
+                <div className="text-[11px] text-slate-300">
+                  Protocol: {authResult.protocol} • Method: {authResult.auth_method}
+                  {authResult.firmware && <div>Firmware: {authResult.firmware}</div>}
+                  {authResult.model && <div>Model: {authResult.model}</div>}
+                </div>
+              </div>
+            )}
+
+            <form onSubmit={handlePerformAuth} className="space-y-3.5">
+              <div>
+                <label className="block text-[11px] uppercase text-slate-400 mb-1">Camera Username</label>
+                <input
+                  type="text"
+                  required
+                  value={camUsername}
+                  onChange={(e) => setCamUsername(e.target.value)}
+                  placeholder="admin"
+                  className="w-full px-3 py-2 bg-[#0d1117] border border-[#30363d] rounded-lg text-xs text-slate-200 focus:outline-none focus:border-emerald-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[11px] uppercase text-slate-400 mb-1">Camera Password</label>
+                <div className="relative">
+                  <input
+                    type={showPassword ? 'text' : 'password'}
+                    value={camPassword}
+                    onChange={(e) => setCamPassword(e.target.value)}
+                    placeholder="Enter camera password"
+                    className="w-full px-3 py-2 pr-9 bg-[#0d1117] border border-[#30363d] rounded-lg text-xs text-slate-200 focus:outline-none focus:border-emerald-500"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword(!showPassword)}
+                    className="absolute right-2.5 top-2.5 text-slate-400 hover:text-slate-200"
+                    title={showPassword ? 'Hide password' : 'Show password'}
+                  >
+                    {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+                <p className="text-[10px] text-slate-500 mt-1">Credentials will be encrypted and stored in the secure Vault.</p>
+              </div>
+
+              <div className="pt-2 flex justify-end space-x-2">
+                <button
+                  type="button"
+                  onClick={() => setAuthTargetDev(null)}
+                  className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs"
+                >
+                  {authResult?.authenticated ? 'Done' : 'Cancel'}
+                </button>
+                <button
+                  type="submit"
+                  disabled={authSubmitting}
+                  className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg text-xs flex items-center space-x-1.5 transition-colors disabled:bg-slate-700"
+                >
+                  <Lock className="w-3.5 h-3.5" />
+                  <span>{authSubmitting ? 'Authenticating...' : 'Authenticate & Save'}</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
 
       {/* Auth Status Modal */}
       {authModal && (

@@ -224,6 +224,13 @@ export const api = {
 
   // Security, RBAC & Audit Integrity (Phase 5 & 6.1)
   getSetupStatus: () => request<{ setup_required: boolean; users_count: number }>('/auth/setup/status'),
+  getCurrentSession: async () => {
+    const res = await request<{ authenticated: boolean; session: Session; csrf_token?: string; permissions: string[] }>('/auth/session');
+    if (res && res.csrf_token) {
+      memoryCsrfToken = res.csrf_token;
+    }
+    return res;
+  },
   completeSetup: (payload: { setup_token: string; username: string; password: string; full_name?: string; email?: string }) =>
     request<{ success: boolean; message: string; username: string }>('/auth/setup', { method: 'POST', body: JSON.stringify(payload) }),
   login: async (username: string, password: string) => {

@@ -93,6 +93,7 @@ export interface Device {
   capabilities: string[];
   channel_count: number;
   last_seen: string;
+  username?: string;
   site_id?: string;
 }
 

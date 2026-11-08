@@ -3,7 +3,8 @@ import { Device, StreamStats, StreamDiagnosticReport, SnapshotMetadata } from '.
 import { api } from '../services/api';
 import {
   Grid, Camera, RefreshCw, ShieldAlert, Maximize2,
-  Activity, Play, CheckCircle2, AlertTriangle, X, Download
+  Activity, Play, CheckCircle2, AlertTriangle, X, Download,
+  KeyRound, Lock, Eye, EyeOff
 } from 'lucide-react';
 
 interface LiveViewProps {
@@ -33,6 +34,49 @@ export const LiveView: React.FC<LiveViewProps> = ({ devices, selectedDevice }) =
   const [lastSnapshot, setLastSnapshot] = useState<SnapshotMetadata | null>(null);
   const [snapshotLoadingId, setSnapshotLoadingId] = useState<string | null>(null);
   const [fullscreenTile, setFullscreenTile] = useState<string | null>(null);
+
+  // Camera Authentication & Credentials Prompt State
+  const [authTargetDev, setAuthTargetDev] = useState<Device | null>(null);
+  const [camUsername, setCamUsername] = useState('admin');
+  const [camPassword, setCamPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+  const [authResult, setAuthResult] = useState<any | null>(null);
+  const [authError, setAuthError] = useState<string | null>(null);
+
+  const openAuthModal = (dev: Device) => {
+    setAuthTargetDev(dev);
+    setCamUsername(dev.username || 'admin');
+    setCamPassword('');
+    setShowPassword(false);
+    setAuthResult(null);
+    setAuthError(null);
+  };
+
+  const handlePerformAuth = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!authTargetDev) return;
+    setAuthSubmitting(true);
+    setAuthError(null);
+    setAuthResult(null);
+    try {
+      const res = await api.authenticateDevice(authTargetDev.id, {
+        username: camUsername.trim(),
+        password: camPassword,
+      });
+      setAuthResult(res);
+      // Restart the stream immediately with the new credentials
+      const currentStreamType = tileStates[authTargetDev.id]?.streamType || 'sub';
+      initDeviceStream(authTargetDev, currentStreamType);
+      if (!res.authenticated) {
+        setAuthError(res.error_message || 'Camera rejected credentials (check password)');
+      }
+    } catch (err: any) {
+      setAuthError(err.message || 'Authentication request failed');
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
 
   useEffect(() => {
     if (selectedDevice) {
@@ -367,13 +411,22 @@ export const LiveView: React.FC<LiveViewProps> = ({ devices, selectedDevice }) =
                       <AlertTriangle className="w-7 h-7 text-rose-400" />
                       <span className="text-xs text-rose-300 font-bold">Stream Offline</span>
                       <p className="text-[10px] text-slate-500 max-w-xs">{tile.error || 'Device RTSP socket unreachable'}</p>
-                      <button
-                        onClick={() => initDeviceStream(dev, tile.streamType)}
-                        className="px-3 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] rounded flex items-center space-x-1"
-                      >
-                        <Play className="w-3 h-3 text-emerald-400" />
-                        <span>Retry Stream</span>
-                      </button>
+                      <div className="flex items-center space-x-2 pt-1">
+                        <button
+                          onClick={() => initDeviceStream(dev, tile.streamType)}
+                          className="px-3 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] rounded flex items-center space-x-1"
+                        >
+                          <Play className="w-3 h-3 text-emerald-400" />
+                          <span>Retry Stream</span>
+                        </button>
+                        <button
+                          onClick={() => openAuthModal(dev)}
+                          className="px-3 py-1 bg-emerald-700 hover:bg-emerald-600 text-white text-[11px] font-bold rounded flex items-center space-x-1"
+                        >
+                          <KeyRound className="w-3 h-3" />
+                          <span>Set Camera Password</span>
+                        </button>
+                      </div>
                     </div>
                   )}
 
@@ -398,6 +451,15 @@ export const LiveView: React.FC<LiveViewProps> = ({ devices, selectedDevice }) =
                     </div>
 
                     <div className="flex items-center space-x-1.5">
+                      {/* Enter Camera Credentials Button */}
+                      <button
+                        onClick={() => openAuthModal(dev)}
+                        className="p-1.5 rounded bg-slate-800 hover:bg-emerald-600/30 text-emerald-400 hover:text-emerald-300 transition-colors"
+                        title="Set Camera Credentials (Username/Password)"
+                      >
+                        <KeyRound className="w-3.5 h-3.5" />
+                      </button>
+
                       {/* Capture Snapshot Button */}
                       <button
                         onClick={() => handleCaptureSnapshot(dev)}
@@ -595,6 +657,106 @@ export const LiveView: React.FC<LiveViewProps> = ({ devices, selectedDevice }) =
                 CLOSE
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Camera Authentication & Credentials Prompt Modal */}
+      {authTargetDev && (
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-[#161b22] border border-[#30363d] rounded-xl max-w-md w-full p-6 space-y-4 font-mono shadow-2xl">
+            <div className="flex items-center justify-between border-b border-[#30363d] pb-3">
+              <div className="flex items-center space-x-2 text-emerald-400 font-bold text-sm">
+                <KeyRound className="w-5 h-5" />
+                <span>AUTHENTICATE CAMERA STREAM</span>
+              </div>
+              <button onClick={() => setAuthTargetDev(null)} className="text-slate-400 hover:text-slate-200">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-3 bg-[#0d1117] border border-[#30363d] rounded-lg text-xs space-y-1">
+              <div className="text-slate-200 font-bold">{authTargetDev.name}</div>
+              <div className="text-slate-400 text-[11px] flex justify-between">
+                <span>RTSP Endpoint: {authTargetDev.ip}:{authTargetDev.rtsp_port || 554}</span>
+                <span>Vendor: {authTargetDev.manufacturer}</span>
+              </div>
+            </div>
+
+            {authError && (
+              <div className="p-3 bg-red-950/60 border border-red-800 text-red-300 rounded-lg text-xs flex items-start space-x-2">
+                <AlertTriangle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+                <span>{authError}</span>
+              </div>
+            )}
+
+            {authResult?.authenticated && (
+              <div className="p-3 bg-emerald-950/60 border border-emerald-800 text-emerald-300 rounded-lg text-xs space-y-1.5">
+                <div className="flex items-center space-x-1.5 font-bold text-emerald-400">
+                  <CheckCircle2 className="w-4 h-4" />
+                  <span>AUTHENTICATED & STREAM RESTARTED</span>
+                </div>
+                <div className="text-[11px] text-slate-300">
+                  Negotiated: {authResult.protocol} • Transcoder reconnecting...
+                </div>
+              </div>
+            )}
+
+            <form onSubmit={handlePerformAuth} className="space-y-3.5">
+              <div>
+                <label className="block text-[11px] uppercase text-slate-400 mb-1">Camera Username</label>
+                <input
+                  type="text"
+                  required
+                  value={camUsername}
+                  onChange={(e) => setCamUsername(e.target.value)}
+                  placeholder="admin"
+                  className="w-full px-3 py-2 bg-[#0d1117] border border-[#30363d] rounded-lg text-xs text-slate-200 focus:outline-none focus:border-emerald-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[11px] uppercase text-slate-400 mb-1">Camera Password</label>
+                <div className="relative">
+                  <input
+                    type={showPassword ? 'text' : 'password'}
+                    value={camPassword}
+                    onChange={(e) => setCamPassword(e.target.value)}
+                    placeholder="Enter camera password"
+                    className="w-full px-3 py-2 pr-9 bg-[#0d1117] border border-[#30363d] rounded-lg text-xs text-slate-200 focus:outline-none focus:border-emerald-500"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword(!showPassword)}
+                    className="absolute right-2.5 top-2.5 text-slate-400 hover:text-slate-200"
+                    title={showPassword ? 'Hide password' : 'Show password'}
+                  >
+                    {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+                <p className="text-[10px] text-slate-500 mt-1">
+                  Credentials are encrypted in the hardware vault and used for RTSP stream decoding.
+                </p>
+              </div>
+
+              <div className="pt-2 flex justify-end space-x-2">
+                <button
+                  type="button"
+                  onClick={() => setAuthTargetDev(null)}
+                  className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs"
+                >
+                  {authResult?.authenticated ? 'Done' : 'Cancel'}
+                </button>
+                <button
+                  type="submit"
+                  disabled={authSubmitting}
+                  className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg text-xs flex items-center space-x-1.5 transition-colors disabled:bg-slate-700"
+                >
+                  <Lock className="w-3.5 h-3.5" />
+                  <span>{authSubmitting ? 'Authenticating...' : 'Authenticate & Start Stream'}</span>
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

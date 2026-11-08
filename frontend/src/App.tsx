@@ -34,6 +34,19 @@ export const App: React.FC = () => {
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
 
   useEffect(() => {
+    // Restore authenticated session from HttpOnly cookie if present
+    const restoreSession = async () => {
+      try {
+        const res = await api.getCurrentSession();
+        if (res && res.session) {
+          setSession(res.session);
+        }
+      } catch {
+        // Not authenticated yet
+      }
+    };
+    restoreSession();
+
     // Initial data load
     loadAllData();
 
