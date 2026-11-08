@@ -1,6 +1,7 @@
 package dahua
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 
 	"cctv-sentinel/pkg/adapters"
 	"cctv-sentinel/pkg/adapters/httpauth"
+	"cctv-sentinel/pkg/media/rtsp"
 	"cctv-sentinel/pkg/models"
 )
 
@@ -128,33 +130,72 @@ func (d *DahuaAdapter) Authenticate(dev *models.Device) (*models.AuthStatus, err
 		port = 80
 	}
 	resp, err := d.doRequest("/cgi-bin/magicBox.cgi?action=getSystemInfo", dev.IP, port, dev.Username, dev.Password)
-	if err != nil {
+	if err == nil {
+		kv := parseCGIResponse(resp)
+		devType := kv["deviceType"]
+		version := kv["appVersion"]
+
 		return &models.AuthStatus{
 			DeviceID:      dev.ID,
-			Authenticated: false,
+			Authenticated: true,
 			Username:      dev.Username,
 			Protocol:      "DAHUA_CGI",
 			AuthMethod:    "HTTP Digest (RFC 2617)",
+			ClockSkewSec:  0,
+			Firmware:      version,
+			Model:         devType,
 			LastChecked:   time.Now().UTC(),
-			ErrorMessage:  err.Error(),
-		}, err
+		}, nil
 	}
 
-	kv := parseCGIResponse(resp)
-	devType := kv["deviceType"]
-	version := kv["appVersion"]
+	// RTSP Stream Fallback: If HTTP port 80 is unresponsive or disabled,
+	// validate camera credentials against the live RTSP streaming endpoint (port 554)
+	rtspPort := dev.RTSPPort
+	if rtspPort <= 0 {
+		rtspPort = 554
+	}
+	rtspURL := fmt.Sprintf("rtsp://%s:%d/cam/realmonitor?channel=1&subtype=1", dev.IP, rtspPort)
+	rtspClient := rtsp.NewClient(rtspURL, dev.Username, dev.Password, 2*time.Second)
+	if dialErr := rtspClient.Connect(); dialErr == nil {
+		defer rtspClient.Close()
+		sdp, descErr := rtspClient.Describe()
+		if descErr == nil && sdp != nil {
+			codec := "H.264"
+			if vt := sdp.VideoTrack(); vt != nil && vt.Codec != "" {
+				codec = vt.Codec
+			}
+			return &models.AuthStatus{
+				DeviceID:      dev.ID,
+				Authenticated: true,
+				Username:      dev.Username,
+				Protocol:      "RTSP",
+				AuthMethod:    "RTSP Digest / Basic (RFC 2326)",
+				Firmware:      codec,
+				LastChecked:   time.Now().UTC(),
+			}, nil
+		}
+		if errors.Is(descErr, rtsp.ErrRTSPUnauthorized) {
+			return &models.AuthStatus{
+				DeviceID:      dev.ID,
+				Authenticated: false,
+				Username:      dev.Username,
+				Protocol:      "RTSP",
+				AuthMethod:    "RTSP Digest (RFC 2326)",
+				ErrorMessage:  "Camera rejected credentials (RTSP 401 Unauthorized: invalid username or password)",
+				LastChecked:   time.Now().UTC(),
+			}, descErr
+		}
+	}
 
 	return &models.AuthStatus{
 		DeviceID:      dev.ID,
-		Authenticated: true,
+		Authenticated: false,
 		Username:      dev.Username,
 		Protocol:      "DAHUA_CGI",
 		AuthMethod:    "HTTP Digest (RFC 2617)",
-		ClockSkewSec:  0,
-		Firmware:      version,
-		Model:         devType,
 		LastChecked:   time.Now().UTC(),
-	}, nil
+		ErrorMessage:  err.Error(),
+	}, err
 }
 
 func (d *DahuaAdapter) GetCapabilities(dev *models.Device) (*models.DeviceCapabilities, error) {

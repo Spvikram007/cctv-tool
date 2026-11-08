@@ -76,8 +76,14 @@ export const App: React.FC = () => {
         setSelectedDevice(devs[0]);
       }
     } catch (err: any) {
-      if (err.message && err.message.includes('Authentication required')) {
-        // Unauthenticated visitor: clear session without popping up intrusive blocking modals
+      const msg = err.message || '';
+      if (
+        msg.includes('Authentication required') ||
+        msg.includes('Invalid or terminated session token') ||
+        msg.includes('Session token expired') ||
+        msg.includes('UNAUTHORIZED')
+      ) {
+        // Session invalid or expired: cleanly reset state
         setSession(null);
       } else {
         console.warn('Backend connection notice:', err);
