@@ -9,13 +9,16 @@ import (
 	"time"
 
 	"cctv-sentinel/pkg/adapters"
+	"cctv-sentinel/pkg/alarms"
 	"cctv-sentinel/pkg/api"
 	"cctv-sentinel/pkg/audit"
 	"cctv-sentinel/pkg/configengine"
 	"cctv-sentinel/pkg/database"
 	"cctv-sentinel/pkg/discovery"
+	"cctv-sentinel/pkg/events"
 	"cctv-sentinel/pkg/licensing"
 	"cctv-sentinel/pkg/models"
+	"cctv-sentinel/pkg/recorder"
 	"cctv-sentinel/pkg/security"
 )
 
@@ -545,7 +548,7 @@ func TestAuthMatrix_LegacyDeviceMigration(t *testing.T) {
 	})
 
 	tenantToken := srv.IssueSessionForTest(security.RoleAdmin, "tenant-gamma", "site-gamma-1")
-	superAdminToken := srv.IssueSessionForTest(security.RoleAdmin, "default", "hq")
+	superAdminToken := srv.IssueGlobalAdminSessionForTest()
 
 	// 7.1 Tenant-scoped user access to unassigned legacy device is strictly rejected (403)
 	reqTenant := httptest.NewRequest("GET", "/api/v1/devices/legacy-dev-unassigned", nil)
@@ -605,5 +608,572 @@ func TestAuthMatrix_LegacyDeviceMigration(t *testing.T) {
 	migratedDev, ok := store.GetDevice("legacy-dev-unassigned")
 	if !ok || migratedDev.TenantID != "tenant-gamma" || migratedDev.SiteID != "site-gamma-1" {
 		t.Errorf("Device metadata not updated properly: %+v", migratedDev)
+	}
+}
+
+// 8. Prove Default Admin Cannot Access Other Tenants (Isolation Hardening)
+func TestAuthMatrix_DefaultAdminCannotAccessOtherTenants(t *testing.T) {
+	srv, handler, store, _ := setupFullMatrixTestServer(t)
+
+	// Seed tenant-beta device
+	store.UpsertDevice(models.Device{
+		ID:           "cam-tenant-beta",
+		Name:         "Beta Branch Camera",
+		IP:           "192.168.30.100",
+		Manufacturer: models.VendorHikvision,
+		TenantID:     "tenant-beta",
+		SiteID:       "beta-hq",
+	})
+
+	// Seed default tenant device
+	store.UpsertDevice(models.Device{
+		ID:           "cam-default-hq",
+		Name:         "Default HQ Camera",
+		IP:           "192.168.1.100",
+		Manufacturer: models.VendorHikvision,
+		TenantID:     "default",
+		SiteID:       "hq",
+	})
+
+	// Ordinary administrator in "default" tenant (non-global)
+	defaultAdminToken := srv.IssueSessionForTest(security.RoleAdmin, "default", "hq")
+	// Global super-admin with ScopeGlobalAdmin
+	globalAdminToken := srv.IssueGlobalAdminSessionForTest()
+
+	// 8.1 Default Admin accessing tenant-beta camera directly must receive 403 CROSS_TENANT_ACCESS_DENIED
+	reqGet := httptest.NewRequest("GET", "/api/v1/devices/cam-tenant-beta", nil)
+	reqGet.Header.Set("Authorization", "Bearer "+defaultAdminToken)
+	recGet := httptest.NewRecorder()
+	handler.ServeHTTP(recGet, reqGet)
+
+	if recGet.Code != http.StatusForbidden {
+		t.Errorf("Default Admin must be forbidden (403) from accessing tenant-beta device, got %d: %s", recGet.Code, recGet.Body.String())
+	}
+	if !strings.Contains(recGet.Body.String(), "CROSS_TENANT_ACCESS_DENIED") {
+		t.Errorf("Expected CROSS_TENANT_ACCESS_DENIED error code, got %s", recGet.Body.String())
+	}
+
+	// 8.2 Default Admin attempting state-change on tenant-beta device must be rejected
+	reqReboot := httptest.NewRequest("POST", "/api/v1/devices/cam-tenant-beta/reboot", nil)
+	reqReboot.Header.Set("Authorization", "Bearer "+defaultAdminToken)
+	recReboot := httptest.NewRecorder()
+	handler.ServeHTTP(recReboot, reqReboot)
+
+	if recReboot.Code != http.StatusForbidden {
+		t.Errorf("Default Admin must be forbidden from rebooting tenant-beta device, got %d", recReboot.Code)
+	}
+
+	// 8.3 Default Admin listing devices must only see default tenant devices (tenant-beta is hidden)
+	reqList := httptest.NewRequest("GET", "/api/v1/devices", nil)
+	reqList.Header.Set("Authorization", "Bearer "+defaultAdminToken)
+	recList := httptest.NewRecorder()
+	handler.ServeHTTP(recList, reqList)
+
+	if recList.Code != http.StatusOK {
+		t.Fatalf("Device list failed: %d", recList.Code)
+	}
+	var listedDevs []models.Device
+	_ = json.NewDecoder(recList.Body).Decode(&listedDevs)
+	if len(listedDevs) != 1 || listedDevs[0].ID != "cam-default-hq" {
+		t.Errorf("Default Admin device list must contain only 'cam-default-hq', got %+v", listedDevs)
+	}
+
+	// 8.4 Global Super-Admin CAN access tenant-beta device
+	reqGlobal := httptest.NewRequest("GET", "/api/v1/devices/cam-tenant-beta", nil)
+	reqGlobal.Header.Set("Authorization", "Bearer "+globalAdminToken)
+	recGlobal := httptest.NewRecorder()
+	handler.ServeHTTP(recGlobal, reqGlobal)
+
+	if recGlobal.Code != http.StatusOK {
+		t.Errorf("Global Super-Admin must be able to view tenant-beta device, got %d: %s", recGlobal.Code, recGlobal.Body.String())
+	}
+
+	// 8.5 Global Super-Admin sees all devices in fleet
+	reqGlobalList := httptest.NewRequest("GET", "/api/v1/devices", nil)
+	reqGlobalList.Header.Set("Authorization", "Bearer "+globalAdminToken)
+	recGlobalList := httptest.NewRecorder()
+	handler.ServeHTTP(recGlobalList, reqGlobalList)
+
+	if recGlobalList.Code != http.StatusOK {
+		t.Fatalf("Global Admin device list failed: %d", recGlobalList.Code)
+	}
+	var allDevs []models.Device
+	_ = json.NewDecoder(recGlobalList.Body).Decode(&allDevs)
+	if len(allDevs) != 2 {
+		t.Errorf("Global Admin must see all 2 devices, got %d", len(allDevs))
+	}
+}
+
+// 9. CSRF & Origin Validation Protection Suite
+func TestAuthMatrix_CSRFProtection(t *testing.T) {
+	srv, handler, store, rbacMgr := setupFullMatrixTestServer(t)
+
+	store.UpsertDevice(models.Device{
+		ID:           "cam-csrf-device",
+		Name:         "Perimeter Camera",
+		IP:           "192.168.1.110",
+		Manufacturer: models.VendorHikvision,
+		TenantID:     "default",
+		SiteID:       "hq",
+	})
+
+	token := srv.IssueSessionForTest(security.RoleAdmin, "default", "hq")
+	sess, err := rbacMgr.ValidateSession(token)
+	if err != nil {
+		t.Fatalf("Failed to retrieve session: %v", err)
+	}
+	csrfToken := sess.CSRFToken
+	if csrfToken == "" {
+		t.Fatalf("Expected non-empty CSRFToken on session")
+	}
+
+	bodyRule := `{"name":"CSRF Test Rule","event_type":"MotionDetection","action":"LOG"}`
+
+	// 9.1 Cookie auth with state-changing POST and missing CSRF header returns 403 CSRF_TOKEN_INVALID
+	reqNoCSRF := httptest.NewRequest("POST", "/api/v1/alarms/rules", strings.NewReader(bodyRule))
+	reqNoCSRF.AddCookie(&http.Cookie{Name: "sentinel_session", Value: token})
+	recNoCSRF := httptest.NewRecorder()
+	handler.ServeHTTP(recNoCSRF, reqNoCSRF)
+
+	if recNoCSRF.Code != http.StatusForbidden {
+		t.Errorf("Cookie POST without CSRF token must return 403 Forbidden, got %d", recNoCSRF.Code)
+	}
+	if !strings.Contains(recNoCSRF.Body.String(), "CSRF_TOKEN_INVALID") {
+		t.Errorf("Expected CSRF_TOKEN_INVALID, got %s", recNoCSRF.Body.String())
+	}
+
+	// 9.2 Cookie auth with invalid CSRF header returns 403 CSRF_TOKEN_INVALID
+	reqBadCSRF := httptest.NewRequest("POST", "/api/v1/alarms/rules", strings.NewReader(bodyRule))
+	reqBadCSRF.AddCookie(&http.Cookie{Name: "sentinel_session", Value: token})
+	reqBadCSRF.Header.Set("X-CSRF-Token", "forged-csrf-token-123456")
+	recBadCSRF := httptest.NewRecorder()
+	handler.ServeHTTP(recBadCSRF, reqBadCSRF)
+
+	if recBadCSRF.Code != http.StatusForbidden {
+		t.Errorf("Cookie POST with invalid CSRF token must return 403 Forbidden, got %d", recBadCSRF.Code)
+	}
+
+	// 9.3 Cookie auth with untrusted Origin returns 403 CSRF_UNTRUSTED_ORIGIN
+	reqBadOrigin := httptest.NewRequest("POST", "/api/v1/alarms/rules", strings.NewReader(bodyRule))
+	reqBadOrigin.AddCookie(&http.Cookie{Name: "sentinel_session", Value: token})
+	reqBadOrigin.Header.Set("Origin", "https://attacker-origin.evil.com")
+	reqBadOrigin.Header.Set("X-CSRF-Token", csrfToken)
+	recBadOrigin := httptest.NewRecorder()
+	handler.ServeHTTP(recBadOrigin, reqBadOrigin)
+
+	if recBadOrigin.Code != http.StatusForbidden {
+		t.Errorf("Cookie POST with untrusted Origin must return 403 Forbidden, got %d", recBadOrigin.Code)
+	}
+	if !strings.Contains(recBadOrigin.Body.String(), "CSRF_UNTRUSTED_ORIGIN") {
+		t.Errorf("Expected CSRF_UNTRUSTED_ORIGIN, got %s", recBadOrigin.Body.String())
+	}
+
+	// 9.4 Cookie auth with trusted Origin and valid CSRF token succeeds (200 OK)
+	reqValid := httptest.NewRequest("POST", "/api/v1/alarms/rules", strings.NewReader(bodyRule))
+	reqValid.AddCookie(&http.Cookie{Name: "sentinel_session", Value: token})
+	reqValid.Header.Set("Origin", "http://localhost:5173")
+	reqValid.Header.Set("X-CSRF-Token", csrfToken)
+	recValid := httptest.NewRecorder()
+	handler.ServeHTTP(recValid, reqValid)
+
+	if recValid.Code != http.StatusOK {
+		t.Errorf("Cookie POST with valid CSRF token and trusted Origin must succeed (200), got %d: %s", recValid.Code, recValid.Body.String())
+	}
+
+	// 9.5 Alternative header X-Sentinel-CSRF is also accepted
+	reqAlt := httptest.NewRequest("POST", "/api/v1/alarms/rules", strings.NewReader(bodyRule))
+	reqAlt.AddCookie(&http.Cookie{Name: "sentinel_session", Value: token})
+	reqAlt.Header.Set("Origin", "http://localhost:5173")
+	reqAlt.Header.Set("X-Sentinel-CSRF", csrfToken)
+	recAlt := httptest.NewRecorder()
+	handler.ServeHTTP(recAlt, reqAlt)
+
+	if recAlt.Code != http.StatusOK {
+		t.Errorf("Cookie POST with X-Sentinel-CSRF must succeed (200), got %d: %s", recAlt.Code, recAlt.Body.String())
+	}
+
+	// 9.6 Native Desktop Client via Bearer token (no cookie) does not require CSRF token
+	reqDesktop := httptest.NewRequest("POST", "/api/v1/alarms/rules", strings.NewReader(bodyRule))
+	reqDesktop.Header.Set("Authorization", "Bearer "+token)
+	reqDesktop.Header.Set("X-Client-Type", "desktop")
+	recDesktop := httptest.NewRecorder()
+	handler.ServeHTTP(recDesktop, reqDesktop)
+
+	if recDesktop.Code != http.StatusOK {
+		t.Errorf("Desktop client with Bearer token must succeed without CSRF header, got %d: %s", recDesktop.Code, recDesktop.Body.String())
+	}
+}
+
+// 10. Multi-Tenant Telemetry Stream and Event Isolation Suite
+func TestAuthMatrix_StreamTenantIsolation(t *testing.T) {
+	srv, handler, store, _ := setupFullMatrixTestServer(t)
+
+	// Seed devices across tenants
+	store.UpsertDevice(models.Device{
+		ID:           "cam-telemetry-alpha",
+		Name:         "Alpha Camera",
+		IP:           "192.168.10.50",
+		Manufacturer: models.VendorHikvision,
+		TenantID:     "tenant-alpha",
+		SiteID:       "site-alpha",
+	})
+	store.UpsertDevice(models.Device{
+		ID:           "cam-telemetry-beta",
+		Name:         "Beta Camera",
+		IP:           "192.168.20.50",
+		Manufacturer: models.VendorDahua,
+		TenantID:     "tenant-beta",
+		SiteID:       "site-beta",
+	})
+	store.UpsertDevice(models.Device{
+		ID:           "cam-telemetry-unassigned",
+		Name:         "Unassigned Camera",
+		IP:           "192.168.30.50",
+		Manufacturer: models.VendorCPPlus,
+		TenantID:     "",
+		SiteID:       "",
+	})
+
+	tokenAlpha := srv.IssueSessionForTest(security.RoleAdmin, "tenant-alpha", "site-alpha")
+	tokenBeta := srv.IssueSessionForTest(security.RoleAdmin, "tenant-beta", "site-beta")
+	tokenGlobal := srv.IssueGlobalAdminSessionForTest()
+
+	// Ingest Events & Alarms into both event manager and alarm engine
+	evAlpha := events.SurveillanceEvent{
+		ID:           "ev-alpha-001",
+		DeviceID:     "cam-telemetry-alpha",
+		DeviceIP:     "192.168.10.50",
+		Manufacturer: "Hikvision",
+		EventType:    "MotionDetection",
+		Source:       "Channel 1",
+		Timestamp:    time.Now().UTC(),
+		ReceivedAt:   time.Now().UTC(),
+		IsActive:     true,
+	}
+	evBeta := events.SurveillanceEvent{
+		ID:           "ev-beta-001",
+		DeviceID:     "cam-telemetry-beta",
+		DeviceIP:     "192.168.20.50",
+		Manufacturer: "Dahua",
+		EventType:    "LineCrossing",
+		Source:       "Channel 1",
+		Timestamp:    time.Now().UTC(),
+		ReceivedAt:   time.Now().UTC(),
+		IsActive:     true,
+	}
+	evUnassigned := events.SurveillanceEvent{
+		ID:           "ev-unassigned-001",
+		DeviceID:     "cam-telemetry-unassigned",
+		DeviceIP:     "192.168.30.50",
+		Manufacturer: "CP PLUS",
+		EventType:    "Intrusion",
+		Source:       "Channel 1",
+		Timestamp:    time.Now().UTC(),
+		ReceivedAt:   time.Now().UTC(),
+		IsActive:     true,
+	}
+
+	srv.GetEventManager().IngestEvent(evAlpha)
+	srv.GetEventManager().IngestEvent(evBeta)
+	srv.GetEventManager().IngestEvent(evUnassigned)
+
+	srv.GetAlarmEngine().ProcessEvent(evAlpha)
+	srv.GetAlarmEngine().ProcessEvent(evBeta)
+	srv.GetAlarmEngine().ProcessEvent(evUnassigned)
+
+	// 10.1 Live Events endpoint (/api/v1/events/live) isolation:
+	// Tenant Alpha must only see Alpha events
+	reqAlphaEv := httptest.NewRequest("GET", "/api/v1/events/live", nil)
+	reqAlphaEv.Header.Set("Authorization", "Bearer "+tokenAlpha)
+	recAlphaEv := httptest.NewRecorder()
+	handler.ServeHTTP(recAlphaEv, reqAlphaEv)
+
+	if recAlphaEv.Code != http.StatusOK {
+		t.Fatalf("Tenant Alpha events request failed: %d", recAlphaEv.Code)
+	}
+	var evsAlpha []events.SurveillanceEvent
+	_ = json.NewDecoder(recAlphaEv.Body).Decode(&evsAlpha)
+	for _, ev := range evsAlpha {
+		if ev.DeviceID != "cam-telemetry-alpha" {
+			t.Errorf("Tenant Alpha received cross-tenant event: %+v", ev)
+		}
+	}
+
+	// Tenant Beta must only see Beta events
+	reqBetaEv := httptest.NewRequest("GET", "/api/v1/events/live", nil)
+	reqBetaEv.Header.Set("Authorization", "Bearer "+tokenBeta)
+	recBetaEv := httptest.NewRecorder()
+	handler.ServeHTTP(recBetaEv, reqBetaEv)
+
+	if recBetaEv.Code != http.StatusOK {
+		t.Fatalf("Tenant Beta events request failed: %d", recBetaEv.Code)
+	}
+	var evsBeta []events.SurveillanceEvent
+	_ = json.NewDecoder(recBetaEv.Body).Decode(&evsBeta)
+	for _, ev := range evsBeta {
+		if ev.DeviceID != "cam-telemetry-beta" {
+			t.Errorf("Tenant Beta received cross-tenant event: %+v", ev)
+		}
+	}
+
+	// Global Super-Admin sees all events including unassigned
+	reqGlobalEv := httptest.NewRequest("GET", "/api/v1/events/live", nil)
+	reqGlobalEv.Header.Set("Authorization", "Bearer "+tokenGlobal)
+	recGlobalEv := httptest.NewRecorder()
+	handler.ServeHTTP(recGlobalEv, reqGlobalEv)
+
+	if recGlobalEv.Code != http.StatusOK {
+		t.Fatalf("Global Admin events request failed: %d", recGlobalEv.Code)
+	}
+	var evsGlobal []events.SurveillanceEvent
+	_ = json.NewDecoder(recGlobalEv.Body).Decode(&evsGlobal)
+	if len(evsGlobal) < 3 {
+		t.Errorf("Global Admin must see all 3 events, got %d", len(evsGlobal))
+	}
+
+	// 10.2 Alarms endpoint (/api/v1/alarms) isolation:
+	// Tenant Alpha only receives Alpha alarms
+	reqAlphaAlm := httptest.NewRequest("GET", "/api/v1/alarms", nil)
+	reqAlphaAlm.Header.Set("Authorization", "Bearer "+tokenAlpha)
+	recAlphaAlm := httptest.NewRecorder()
+	handler.ServeHTTP(recAlphaAlm, reqAlphaAlm)
+
+	if recAlphaAlm.Code != http.StatusOK {
+		t.Fatalf("Tenant Alpha alarms request failed: %d", recAlphaAlm.Code)
+	}
+	var almsAlpha []alarms.Alarm
+	_ = json.NewDecoder(recAlphaAlm.Body).Decode(&almsAlpha)
+	for _, alm := range almsAlpha {
+		if alm.DeviceID != "cam-telemetry-alpha" {
+			t.Errorf("Tenant Alpha received cross-tenant alarm: %+v", alm)
+		}
+	}
+
+	// Tenant Beta only receives Beta alarms
+	reqBetaAlm := httptest.NewRequest("GET", "/api/v1/alarms", nil)
+	reqBetaAlm.Header.Set("Authorization", "Bearer "+tokenBeta)
+	recBetaAlm := httptest.NewRecorder()
+	handler.ServeHTTP(recBetaAlm, reqBetaAlm)
+
+	if recBetaAlm.Code != http.StatusOK {
+		t.Fatalf("Tenant Beta alarms request failed: %d", recBetaAlm.Code)
+	}
+	var almsBeta []alarms.Alarm
+	_ = json.NewDecoder(recBetaAlm.Body).Decode(&almsBeta)
+	for _, alm := range almsBeta {
+		if alm.DeviceID != "cam-telemetry-beta" {
+			t.Errorf("Tenant Beta received cross-tenant alarm: %+v", alm)
+		}
+	}
+
+	// Global Admin receives all alarms
+	reqGlobalAlm := httptest.NewRequest("GET", "/api/v1/alarms", nil)
+	reqGlobalAlm.Header.Set("Authorization", "Bearer "+tokenGlobal)
+	recGlobalAlm := httptest.NewRecorder()
+	handler.ServeHTTP(recGlobalAlm, reqGlobalAlm)
+
+	if recGlobalAlm.Code != http.StatusOK {
+		t.Fatalf("Global Admin alarms request failed: %d", recGlobalAlm.Code)
+	}
+	var almsGlobal []alarms.Alarm
+	_ = json.NewDecoder(recGlobalAlm.Body).Decode(&almsGlobal)
+	if len(almsGlobal) < 3 {
+		t.Errorf("Global Admin must see all 3 alarms, got %d", len(almsGlobal))
+	}
+}
+
+// 11. Recorder Subroutes and Channel Aliases Authorization Matrix Audit
+func TestAuthMatrix_RecorderSubroutesAndAliasesAudit(t *testing.T) {
+	srv, handler, store, _ := setupFullMatrixTestServer(t)
+
+	recorderID := "nvr-audit-matrix-01"
+	store.UpsertDevice(models.Device{
+		ID:           recorderID,
+		Name:         "Matrix Audit XVR",
+		IP:           "192.168.1.150",
+		Manufacturer: models.VendorDahua,
+		Category:     models.CategoryXVR,
+		ChannelCount: 8,
+		TenantID:     "default",
+		SiteID:       "hq",
+	})
+
+	viewerToken := srv.IssueSessionForTest(security.RoleViewer, "default", "hq")
+	auditorToken := srv.IssueSessionForTest(security.RoleAuditor, "default", "hq")
+	techToken := srv.IssueSessionForTest(security.RoleTechnician, "default", "hq")
+	adminToken := srv.IssueSessionForTest(security.RoleAdmin, "default", "hq")
+
+	// 11.1 Channel alias GET /api/v1/recorders/:id/channels/:ch
+	reqCh1 := httptest.NewRequest("GET", "/api/v1/recorders/"+recorderID+"/channels/1", nil)
+	reqCh1.Header.Set("Authorization", "Bearer "+viewerToken)
+	recCh1 := httptest.NewRecorder()
+	handler.ServeHTTP(recCh1, reqCh1)
+
+	if recCh1.Code != http.StatusOK {
+		t.Errorf("Channel alias GET /channels/1 failed: %d: %s", recCh1.Code, recCh1.Body.String())
+	}
+	var chInfo recorder.ChannelInfo
+	_ = json.NewDecoder(recCh1.Body).Decode(&chInfo)
+	if chInfo.ChannelNumber != 1 {
+		t.Errorf("Expected ChannelNumber 1, got %d", chInfo.ChannelNumber)
+	}
+
+	// Out of bounds channel alias returns 404
+	reqCh99 := httptest.NewRequest("GET", "/api/v1/recorders/"+recorderID+"/channels/99", nil)
+	reqCh99.Header.Set("Authorization", "Bearer "+viewerToken)
+	recCh99 := httptest.NewRecorder()
+	handler.ServeHTTP(recCh99, reqCh99)
+
+	if recCh99.Code != http.StatusNotFound {
+		t.Errorf("Non-existent channel must return 404, got %d", recCh99.Code)
+	}
+
+	// 11.2 Analog format: POST /api/v1/recorders/:id/analog-format
+	bodyAnalog := `{"channel_id": 1, "format": "AHD"}`
+	// Viewer -> 403 Forbidden
+	reqVAnalog := httptest.NewRequest("POST", "/api/v1/recorders/"+recorderID+"/analog-format", strings.NewReader(bodyAnalog))
+	reqVAnalog.Header.Set("Authorization", "Bearer "+viewerToken)
+	recVAnalog := httptest.NewRecorder()
+	handler.ServeHTTP(recVAnalog, reqVAnalog)
+	if recVAnalog.Code != http.StatusForbidden {
+		t.Errorf("Viewer must be forbidden from configuring analog format, got %d", recVAnalog.Code)
+	}
+	// Auditor -> 403 Forbidden
+	reqAAnalog := httptest.NewRequest("POST", "/api/v1/recorders/"+recorderID+"/analog-format", strings.NewReader(bodyAnalog))
+	reqAAnalog.Header.Set("Authorization", "Bearer "+auditorToken)
+	recAAnalog := httptest.NewRecorder()
+	handler.ServeHTTP(recAAnalog, reqAAnalog)
+	if recAAnalog.Code != http.StatusForbidden {
+		t.Errorf("Auditor must be forbidden from configuring analog format, got %d", recAAnalog.Code)
+	}
+	// Technician -> 200 OK
+	reqTAnalog := httptest.NewRequest("POST", "/api/v1/recorders/"+recorderID+"/analog-format", strings.NewReader(bodyAnalog))
+	reqTAnalog.Header.Set("Authorization", "Bearer "+techToken)
+	recTAnalog := httptest.NewRecorder()
+	handler.ServeHTTP(recTAnalog, reqTAnalog)
+	if recTAnalog.Code != http.StatusOK {
+		t.Errorf("Technician must be permitted to configure analog format, got %d: %s", recTAnalog.Code, recTAnalog.Body.String())
+	}
+
+	// 11.3 Coaxial control: POST /api/v1/recorders/:id/coaxial-control
+	bodyCoax := `{"channel_id": 1, "command": "MENU_ENTER"}`
+	reqVCoax := httptest.NewRequest("POST", "/api/v1/recorders/"+recorderID+"/coaxial-control", strings.NewReader(bodyCoax))
+	reqVCoax.Header.Set("Authorization", "Bearer "+viewerToken)
+	recVCoax := httptest.NewRecorder()
+	handler.ServeHTTP(recVCoax, reqVCoax)
+	if recVCoax.Code != http.StatusForbidden {
+		t.Errorf("Viewer must be forbidden from coaxial control, got %d", recVCoax.Code)
+	}
+	reqTCoax := httptest.NewRequest("POST", "/api/v1/recorders/"+recorderID+"/coaxial-control", strings.NewReader(bodyCoax))
+	reqTCoax.Header.Set("Authorization", "Bearer "+techToken)
+	recTCoax := httptest.NewRecorder()
+	handler.ServeHTTP(recTCoax, reqTCoax)
+	if recTCoax.Code != http.StatusOK {
+		t.Errorf("Technician must be permitted for coaxial control, got %d: %s", recTCoax.Code, recTCoax.Body.String())
+	}
+
+	// 11.4 IP Registration: POST /api/v1/recorders/:id/ip-registration
+	bodyIPReg := `{"channel_id": 9, "ip": "192.168.1.200", "port": 80, "protocol": "ONVIF"}`
+	reqVIP := httptest.NewRequest("POST", "/api/v1/recorders/"+recorderID+"/ip-registration", strings.NewReader(bodyIPReg))
+	reqVIP.Header.Set("Authorization", "Bearer "+viewerToken)
+	recVIP := httptest.NewRecorder()
+	handler.ServeHTTP(recVIP, reqVIP)
+	if recVIP.Code != http.StatusForbidden {
+		t.Errorf("Viewer must be forbidden from IP registration, got %d", recVIP.Code)
+	}
+	reqTIP := httptest.NewRequest("POST", "/api/v1/recorders/"+recorderID+"/ip-registration", strings.NewReader(bodyIPReg))
+	reqTIP.Header.Set("Authorization", "Bearer "+techToken)
+	recTIP := httptest.NewRecorder()
+	handler.ServeHTTP(recTIP, reqTIP)
+	if recTIP.Code != http.StatusOK {
+		t.Errorf("Technician must be permitted for IP registration, got %d: %s", recTIP.Code, recTIP.Body.String())
+	}
+
+	// 11.5 Recording Schedule: GET allowed for Viewer, POST forbidden for Viewer
+	reqGetSched := httptest.NewRequest("GET", "/api/v1/recorders/"+recorderID+"/schedule", nil)
+	reqGetSched.Header.Set("Authorization", "Bearer "+viewerToken)
+	recGetSched := httptest.NewRecorder()
+	handler.ServeHTTP(recGetSched, reqGetSched)
+	if recGetSched.Code != http.StatusOK {
+		t.Errorf("Viewer must be allowed to read schedule, got %d", recGetSched.Code)
+	}
+
+	bodySched := `{"channel_id": 1, "weekday": 1, "recording_type": "CONTINUOUS"}`
+	reqVSched := httptest.NewRequest("POST", "/api/v1/recorders/"+recorderID+"/schedule", strings.NewReader(bodySched))
+	reqVSched.Header.Set("Authorization", "Bearer "+viewerToken)
+	recVSched := httptest.NewRecorder()
+	handler.ServeHTTP(recVSched, reqVSched)
+	if recVSched.Code != http.StatusForbidden {
+		t.Errorf("Viewer must be forbidden from updating schedule, got %d", recVSched.Code)
+	}
+
+	reqTSched := httptest.NewRequest("POST", "/api/v1/recorders/"+recorderID+"/schedule", strings.NewReader(bodySched))
+	reqTSched.Header.Set("Authorization", "Bearer "+techToken)
+	recTSched := httptest.NewRecorder()
+	handler.ServeHTTP(recTSched, reqTSched)
+	if recTSched.Code != http.StatusOK {
+		t.Errorf("Technician must be permitted to update schedule, got %d", recTSched.Code)
+	}
+
+	// 11.6 Storage Format: Preview & Format require technician or admin
+	bodyStoragePreview := `{"disk_index": 0}`
+	reqVStorePrev := httptest.NewRequest("POST", "/api/v1/recorders/"+recorderID+"/storage/preview", strings.NewReader(bodyStoragePreview))
+	reqVStorePrev.Header.Set("Authorization", "Bearer "+viewerToken)
+	recVStorePrev := httptest.NewRecorder()
+	handler.ServeHTTP(recVStorePrev, reqVStorePrev)
+	if recVStorePrev.Code != http.StatusForbidden {
+		t.Errorf("Viewer must be forbidden from storage format preview, got %d", recVStorePrev.Code)
+	}
+
+	bodyStorageFmt := `{"disk_index": 0, "confirm_token": "FMT-TEST-CONFIRM"}`
+	reqVStoreFmt := httptest.NewRequest("POST", "/api/v1/recorders/"+recorderID+"/storage/format", strings.NewReader(bodyStorageFmt))
+	reqVStoreFmt.Header.Set("Authorization", "Bearer "+viewerToken)
+	recVStoreFmt := httptest.NewRecorder()
+	handler.ServeHTTP(recVStoreFmt, reqVStoreFmt)
+	if recVStoreFmt.Code != http.StatusForbidden {
+		t.Errorf("Viewer must be forbidden from storage formatting, got %d", recVStoreFmt.Code)
+	}
+
+	reqAdminStoreFmt := httptest.NewRequest("POST", "/api/v1/recorders/"+recorderID+"/storage/format", strings.NewReader(bodyStorageFmt))
+	reqAdminStoreFmt.Header.Set("Authorization", "Bearer "+adminToken)
+	recAdminStoreFmt := httptest.NewRecorder()
+	handler.ServeHTTP(recAdminStoreFmt, reqAdminStoreFmt)
+	if recAdminStoreFmt.Code == http.StatusForbidden {
+		t.Errorf("Admin must not be forbidden from storage formatting, got %d: %s", recAdminStoreFmt.Code, recAdminStoreFmt.Body.String())
+	}
+}
+
+// 12. Deception Remediation: Playback Frame Extraction Returns HTTP 501
+func TestAuthMatrix_PlaybackNotImplemented(t *testing.T) {
+	srv, handler, store, _ := setupFullMatrixTestServer(t)
+
+	recorderID := "nvr-playback-501"
+	store.UpsertDevice(models.Device{
+		ID:           recorderID,
+		Name:         "Playback Test NVR",
+		IP:           "192.168.1.180",
+		Manufacturer: models.VendorHikvision,
+		Category:     models.CategoryNVR,
+		TenantID:     "default",
+		SiteID:       "hq",
+	})
+
+	adminToken := srv.IssueSessionForTest(security.RoleAdmin, "default", "hq")
+
+	reqPB := httptest.NewRequest("GET", "/api/v1/recorders/"+recorderID+"/playback/dummy-session-token/stream.mjpeg", nil)
+	reqPB.Header.Set("Authorization", "Bearer "+adminToken)
+	recPB := httptest.NewRecorder()
+	handler.ServeHTTP(recPB, reqPB)
+
+	if recPB.Code != http.StatusNotImplemented {
+		t.Fatalf("Expected HTTP 501 Not Implemented for unintegrated playback stream, got %d: %s", recPB.Code, recPB.Body.String())
+	}
+
+	bodyStr := recPB.Body.String()
+	if !strings.Contains(bodyStr, "PLAYBACK_NOT_IMPLEMENTED") {
+		t.Errorf("Expected PLAYBACK_NOT_IMPLEMENTED error code in response body, got %s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, "physical NVR storage") {
+		t.Errorf("Expected explicit disclaimer in body about physical NVR storage hardware, got %s", bodyStr)
 	}
 }

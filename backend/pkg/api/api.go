@@ -1,8 +1,11 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -155,7 +158,7 @@ func (s *Server) Handler() http.Handler {
 		}
 
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, X-Request-ID")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, X-Request-ID, X-CSRF-Token, X-Sentinel-CSRF, X-Client-Type")
 		w.Header().Set("Access-Control-Expose-Headers", "X-Request-ID")
 		w.Header().Set("Access-Control-Max-Age", "86400")
 
@@ -185,12 +188,14 @@ const (
 	DefaultSiteID   = "hq"
 )
 
-// isSuperAdmin returns true only if the session belongs to a genuine global administrator
+// isSuperAdmin returns true ONLY if the session belongs to a genuine global administrator with explicit global admin claim
 func isSuperAdmin(sess *security.Session) bool {
 	if sess == nil {
 		return false
 	}
-	return sess.Role == security.RoleAdmin && (sess.TenantID == "" || sess.TenantID == DefaultTenantID || sess.TenantID == "system")
+	// Merely having RoleAdmin or TenantID "default"/"system"/"" does NOT grant global fleet access.
+	// Must have explicit IsGlobalAdmin or ScopeGlobalAdmin.
+	return sess.Role == security.RoleAdmin && (sess.IsGlobalAdmin || sess.HasScope(security.ScopeGlobalAdmin))
 }
 
 // checkTenantAccess strictly enforces tenant and site isolation boundaries
@@ -204,25 +209,39 @@ func checkTenantAccess(sess *security.Session, resourceTenantID, resourceSiteID 
 		return true
 	}
 
-	// 2. Tenant isolation: A missing resource TenantID does NOT grant access to tenant-scoped users
-	if resourceTenantID == "" {
-		// Legacy unassigned device: blocked for tenant-scoped operators until claimed/migrated
+	// 2. All non-global users must have valid non-empty tenant ownership (fail closed)
+	if sess.TenantID == "" {
 		return false
 	}
 
-	// Mismatched tenant access is strictly rejected
+	// 3. Resource must have non-empty tenant ownership (fail closed for legacy/unassigned devices)
+	if resourceTenantID == "" {
+		return false
+	}
+
+	// 4. Mismatched tenant access is strictly rejected
 	if sess.TenantID != resourceTenantID {
 		return false
 	}
 
-	// 3. Site isolation: A missing resource SiteID does NOT grant access to site-restricted users
-	if sess.SiteID != "" && sess.SiteID != DefaultSiteID && sess.SiteID != "all" {
-		if resourceSiteID == "" || resourceSiteID != sess.SiteID {
+	// 5. Site isolation: All non-global users must have matching non-empty site ownership (fail closed)
+	if sess.SiteID == "" || resourceSiteID == "" {
+		return false
+	}
+	if sess.SiteID != "all" && sess.SiteID != "*" {
+		if resourceSiteID != sess.SiteID {
 			return false
 		}
 	}
 
 	return true
+}
+
+func (s *Server) isOriginAllowed(origin string) bool {
+	if s.allowedOrigins == nil {
+		return false
+	}
+	return s.allowedOrigins[origin]
 }
 
 func (s *Server) checkPermission(r *http.Request, perm security.Permission) bool {
@@ -236,6 +255,7 @@ func (s *Server) checkPermission(r *http.Request, perm security.Permission) bool
 func (s *Server) requireAuth(perm security.Permission, handler http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := ""
+		fromCookie := false
 		authHeader := r.Header.Get("Authorization")
 		if strings.HasPrefix(authHeader, "Bearer ") {
 			token = strings.TrimPrefix(authHeader, "Bearer ")
@@ -243,11 +263,12 @@ func (s *Server) requireAuth(perm security.Permission, handler http.HandlerFunc)
 			token = strings.TrimPrefix(authHeader, "bearer ")
 		} else if cookie, err := r.Cookie("sentinel_session"); err == nil && cookie.Value != "" {
 			token = cookie.Value
+			fromCookie = true
 		}
 
 		// Security: Do NOT accept authentication credentials through URL query parameters
 		if token == "" {
-			writeError(w, r, http.StatusUnauthorized, "UNAUTHORIZED", "Authentication required: missing Bearer session token")
+			writeError(w, r, http.StatusUnauthorized, "UNAUTHORIZED", "Authentication required: missing Bearer session token or sentinel_session cookie")
 			return
 		}
 
@@ -259,6 +280,26 @@ func (s *Server) requireAuth(perm security.Permission, handler http.HandlerFunc)
 			}
 			writeError(w, r, http.StatusUnauthorized, "UNAUTHORIZED", "Invalid or terminated session token")
 			return
+		}
+
+		// CSRF & Origin Protection for cookie-authenticated state-changing requests
+		if fromCookie && (r.Method == "POST" || r.Method == "PUT" || r.Method == "DELETE" || r.Method == "PATCH") {
+			origin := r.Header.Get("Origin")
+			if origin != "" {
+				if !s.isOriginAllowed(origin) {
+					writeError(w, r, http.StatusForbidden, "CSRF_UNTRUSTED_ORIGIN", "Cross-origin request rejected: untrusted origin")
+					return
+				}
+			}
+
+			csrfHeader := r.Header.Get("X-CSRF-Token")
+			if csrfHeader == "" {
+				csrfHeader = r.Header.Get("X-Sentinel-CSRF")
+			}
+			if csrfHeader == "" || sess.CSRFToken == "" || subtle.ConstantTimeCompare([]byte(csrfHeader), []byte(sess.CSRFToken)) != 1 {
+				writeError(w, r, http.StatusForbidden, "CSRF_TOKEN_INVALID", "Invalid or missing CSRF token for state-changing request")
+				return
+			}
 		}
 
 		if !security.HasPermission(sess.Role, perm) {
@@ -273,7 +314,7 @@ func (s *Server) requireAuth(perm security.Permission, handler http.HandlerFunc)
 	}
 }
 
-// IssueSessionForTest generates an active session token for unit test execution
+// IssueSessionForTest generates an active tenant-scoped session token for unit test execution
 func (s *Server) IssueSessionForTest(role security.Role, tenantID, siteID string) string {
 	tokBytes := make([]byte, 24)
 	if _, err := rand.Read(tokBytes); err != nil {
@@ -284,9 +325,35 @@ func (s *Server) IssueSessionForTest(role security.Role, tenantID, siteID string
 	return tok
 }
 
+// IssueGlobalAdminSessionForTest generates an active global super-admin session for test execution
+func (s *Server) IssueGlobalAdminSessionForTest() string {
+	tokBytes := make([]byte, 24)
+	if _, err := rand.Read(tokBytes); err != nil {
+		tokBytes = []byte("test-global-admin-bytes-123456")
+	}
+	tok := fmt.Sprintf("test-sess-global-%s", hex.EncodeToString(tokBytes))
+	s.rbacMgr.InjectGlobalAdminSessionForTest(tok, "super-admin", 24*time.Hour)
+	return tok
+}
+
 // GetRBACManager returns the underlying RBACManager instance
 func (s *Server) GetRBACManager() *security.RBACManager {
 	return s.rbacMgr
+}
+
+// GetAlarmEngine returns the underlying Alarm Engine instance
+func (s *Server) GetAlarmEngine() *alarms.Engine {
+	return s.alarmEng
+}
+
+// GetEventManager returns the underlying Event Manager instance
+func (s *Server) GetEventManager() *events.EventManager {
+	return s.eventMgr
+}
+
+// GetRecorderEngine returns the underlying Recorder Engine instance
+func (s *Server) GetRecorderEngine() *recorder.Engine {
+	return s.recorderEng
 }
 
 // SetAllowedOrigins dynamically overrides the allowed CORS origins
@@ -572,6 +639,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/security/login", s.handleSecurityLogin)
 	s.mux.HandleFunc("/api/v1/auth/logout", s.handleSecurityLogout)
 	s.mux.HandleFunc("/api/v1/security/logout", s.handleSecurityLogout)
+	s.mux.HandleFunc("/api/v1/auth/csrf", s.handleSecurityCSRFToken)
+	s.mux.HandleFunc("/api/v1/security/csrf", s.handleSecurityCSRFToken)
 
 	// 1. System status
 	s.mux.HandleFunc("/api/v1/system/status", s.requireAuth(security.PermViewLive, func(w http.ResponseWriter, r *http.Request) {
@@ -831,7 +900,7 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 
 	sess := getSession(r)
 	if !checkTenantAccess(sess, dev.TenantID, dev.SiteID) {
-		writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Access denied: device belongs to an isolated tenant or site")
+		writeError(w, r, http.StatusForbidden, "CROSS_TENANT_ACCESS_DENIED", "Access denied: device belongs to an isolated tenant or site")
 		return
 	}
 
@@ -1970,6 +2039,12 @@ func (s *Server) handleSecurityLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	origin := r.Header.Get("Origin")
+	if origin != "" && !s.isOriginAllowed(origin) {
+		writeError(w, r, http.StatusForbidden, "CSRF_UNTRUSTED_ORIGIN", "Cross-origin login rejected from untrusted origin")
+		return
+	}
+
 	var req struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -1983,6 +2058,7 @@ func (s *Server) handleSecurityLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 1. Session Cookie (HttpOnly - never accessible to JavaScript)
 	http.SetCookie(w, &http.Cookie{
 		Name:     "sentinel_session",
 		Value:    sess.Token,
@@ -1993,12 +2069,45 @@ func (s *Server) handleSecurityLogin(w http.ResponseWriter, r *http.Request) {
 		Secure:   r.TLS != nil,
 	})
 
-	s.logger.Log(req.Username, "SYSTEM", r.RemoteAddr, "LOGIN", "SECURITY", "SUCCESS", fmt.Sprintf("Operator authenticated (Role: %s)", sess.Role), "")
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"success":     true,
-		"session":     sess,
-		"permissions": security.RolePermissions[sess.Role],
+	// 2. CSRF Cookie (Not HttpOnly - readable by JavaScript to set X-CSRF-Token header)
+	http.SetCookie(w, &http.Cookie{
+		Name:     "sentinel_csrf",
+		Value:    sess.CSRFToken,
+		Path:     "/",
+		Expires:  sess.ExpiresAt,
+		HttpOnly: false,
+		SameSite: http.SameSiteStrictMode,
+		Secure:   r.TLS != nil,
 	})
+
+	s.logger.Log(req.Username, "SYSTEM", r.RemoteAddr, "LOGIN", "SECURITY", "SUCCESS", fmt.Sprintf("Operator authenticated (Role: %s)", sess.Role), "")
+
+	// Safe session object: Never expose bearer token to JavaScript in browser response
+	safeSess := map[string]interface{}{
+		"username":        sess.Username,
+		"role":            sess.Role,
+		"tenant_id":       sess.TenantID,
+		"site_id":         sess.SiteID,
+		"is_global_admin": sess.IsGlobalAdmin,
+		"scopes":          sess.Scopes,
+		"created_at":      sess.CreatedAt,
+		"expires_at":      sess.ExpiresAt,
+	}
+
+	resp := map[string]interface{}{
+		"success":     true,
+		"session":     safeSess,
+		"csrf_token":  sess.CSRFToken,
+		"permissions": security.RolePermissions[sess.Role],
+	}
+
+	// Preserve native desktop authentication token via OS credential store
+	if r.Header.Get("X-Client-Type") == "desktop" {
+		safeSess["token"] = sess.Token
+		resp["desktop_token"] = sess.Token
+	}
+
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleSecurityLogout(w http.ResponseWriter, r *http.Request) {
@@ -2038,10 +2147,53 @@ func (s *Server) handleSecurityLogout(w http.ResponseWriter, r *http.Request) {
 		Secure:   r.TLS != nil,
 	})
 
+	http.SetCookie(w, &http.Cookie{
+		Name:     "sentinel_csrf",
+		Value:    "",
+		Path:     "/",
+		Expires:  time.Unix(0, 0),
+		MaxAge:   -1,
+		HttpOnly: false,
+		SameSite: http.SameSiteStrictMode,
+		Secure:   r.TLS != nil,
+	})
+
 	s.logger.Log(userName, "SYSTEM", r.RemoteAddr, "LOGOUT", "SECURITY", "SUCCESS", "Session terminated and revoked server-side", "")
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"message": "Session terminated successfully",
+	})
+}
+
+func (s *Server) handleSecurityCSRFToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	sess := getSession(r)
+	csrfToken := ""
+	if sess != nil && sess.CSRFToken != "" {
+		csrfToken = sess.CSRFToken
+	} else if c, err := r.Cookie("sentinel_csrf"); err == nil && c.Value != "" {
+		csrfToken = c.Value
+	} else {
+		raw := make([]byte, 24)
+		_, _ = rand.Read(raw)
+		csrfToken = fmt.Sprintf("sent-csrf-%s", hex.EncodeToString(raw))
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     "sentinel_csrf",
+		Value:    csrfToken,
+		Path:     "/",
+		HttpOnly: false,
+		SameSite: http.SameSiteStrictMode,
+		Secure:   r.TLS != nil,
+	})
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"csrf_token": csrfToken,
 	})
 }
 
@@ -2148,6 +2300,11 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	operator := "Technician"
+	if sess != nil && sess.Username != "" {
+		operator = sess.Username
+	}
+
 	// Route: GET /api/v1/recorders/:id
 	if len(parts) == 1 {
 		prof, err := s.recorderEng.GetRecorderProfile(deviceID)
@@ -2187,7 +2344,7 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 		if targetFmt == "" {
 			targetFmt = req.SignalFormat
 		}
-		res, err := s.recorderEng.SetAnalogFormat(deviceID, req.ChannelID, targetFmt, "Technician")
+		res, err := s.recorderEng.SetAnalogFormat(deviceID, req.ChannelID, targetFmt, operator)
 		if err != nil {
 			writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 			return
@@ -2208,7 +2365,7 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 			writeSimpleError(w, r, http.StatusBadRequest, "Invalid request: "+err.Error())
 			return
 		}
-		if err := s.recorderEng.SendCoaxialControl(deviceID, req.ChannelID, req.Command, "Technician"); err != nil {
+		if err := s.recorderEng.SendCoaxialControl(deviceID, req.ChannelID, req.Command, operator); err != nil {
 			writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -2225,7 +2382,7 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 			writeSimpleError(w, r, http.StatusBadRequest, "Invalid request: "+err.Error())
 			return
 		}
-		ch, err := s.recorderEng.RegisterIPCamera(deviceID, req, "Technician")
+		ch, err := s.recorderEng.RegisterIPCamera(deviceID, req, operator)
 		if err != nil {
 			writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 			return
@@ -2256,7 +2413,7 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 			writeSimpleError(w, r, http.StatusBadRequest, "Invalid schedule payload: "+err.Error())
 			return
 		}
-		updated, err := s.recorderEng.UpdateRecordingSchedule(deviceID, sched, "Technician")
+		updated, err := s.recorderEng.UpdateRecordingSchedule(deviceID, sched, operator)
 		if err != nil {
 			writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 			return
@@ -2315,7 +2472,7 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 		if req.EndTime.IsZero() {
 			req.EndTime = time.Now().UTC()
 		}
-		sess, err := s.recorderEng.CreatePlaybackSession(deviceID, req.ChannelID, req.StartTime, req.EndTime, "Technician")
+		sess, err := s.recorderEng.CreatePlaybackSession(deviceID, req.ChannelID, req.StartTime, req.EndTime, operator)
 		if err != nil {
 			writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 			return
@@ -2342,7 +2499,7 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 		if target == "" {
 			target = "C:\\CCTV_Exports\\export_" + req.SegmentID + ".mp4"
 		}
-		outPath, err := s.recorderEng.ExportRecording(deviceID, req.ChannelID, req.SegmentID, target, "Technician")
+		outPath, err := s.recorderEng.ExportRecording(deviceID, req.ChannelID, req.SegmentID, target, operator)
 		if err != nil {
 			writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 			return
@@ -2367,6 +2524,22 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 			return
 		}
 
+		if len(parts) == 3 {
+			chans, err := s.recorderEng.EnumerateChannels(deviceID)
+			if err != nil {
+				writeSimpleError(w, r, http.StatusInternalServerError, err.Error())
+				return
+			}
+			for _, ch := range chans {
+				if ch.ChannelID == chID {
+					writeJSON(w, http.StatusOK, ch)
+					return
+				}
+			}
+			writeSimpleError(w, r, http.StatusNotFound, "Channel not found")
+			return
+		}
+
 		if len(parts) >= 4 {
 			action := parts[3]
 			switch action {
@@ -2379,7 +2552,7 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 					SignalFormat recorder.AnalogFormat `json:"signal_format"`
 				}
 				_ = json.NewDecoder(r.Body).Decode(&req)
-				res, err := s.recorderEng.SetAnalogFormat(deviceID, chID, req.SignalFormat, "Technician")
+				res, err := s.recorderEng.SetAnalogFormat(deviceID, chID, req.SignalFormat, operator)
 				if err != nil {
 					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 					return
@@ -2396,7 +2569,7 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 					Command string `json:"command"`
 				}
 				_ = json.NewDecoder(r.Body).Decode(&req)
-				if err := s.recorderEng.SendCoaxialControl(deviceID, chID, req.Command, "Technician"); err != nil {
+				if err := s.recorderEng.SendCoaxialControl(deviceID, chID, req.Command, operator); err != nil {
 					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 					return
 				}
@@ -2411,7 +2584,7 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 				var req recorder.IPRegistrationReq
 				_ = json.NewDecoder(r.Body).Decode(&req)
 				req.ChannelID = chID
-				ch, err := s.recorderEng.RegisterIPCamera(deviceID, req, "Technician")
+				ch, err := s.recorderEng.RegisterIPCamera(deviceID, req, operator)
 				if err != nil {
 					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 					return
@@ -2436,7 +2609,7 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 				var sched recorder.RecordingSchedule
 				_ = json.NewDecoder(r.Body).Decode(&sched)
 				sched.ChannelID = chID
-				updated, err := s.recorderEng.UpdateRecordingSchedule(deviceID, sched, "Technician")
+				updated, err := s.recorderEng.UpdateRecordingSchedule(deviceID, sched, operator)
 				if err != nil {
 					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 					return
@@ -2500,7 +2673,7 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 				if req.EndTime.IsZero() {
 					req.EndTime = time.Now().UTC()
 				}
-				sess, err := s.recorderEng.CreatePlaybackSession(deviceID, req.ChannelID, req.StartTime, req.EndTime, "Technician")
+				sess, err := s.recorderEng.CreatePlaybackSession(deviceID, req.ChannelID, req.StartTime, req.EndTime, operator)
 				if err != nil {
 					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 					return
@@ -2519,7 +2692,7 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 					TargetDir string `json:"target_dir"`
 				}
 				_ = json.NewDecoder(r.Body).Decode(&req)
-				outPath, err := s.recorderEng.ExportRecording(deviceID, req.ChannelID, req.SegmentID, req.TargetDir, "Technician")
+				outPath, err := s.recorderEng.ExportRecording(deviceID, req.ChannelID, req.SegmentID, req.TargetDir, operator)
 				if err != nil {
 					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 					return
@@ -2545,7 +2718,7 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 			if subFmt == "format" && len(parts) >= 4 {
 				subFmt = parts[3]
 			}
-			if subFmt == "preview" || subFmt == "format-preview" || subFmt == "approve" || subFmt == "format-approve" {
+			if subFmt == "preview" || subFmt == "format-preview" || subFmt == "approve" || subFmt == "format-approve" || subFmt == "format" {
 				if !s.checkPermission(r, security.PermReboot) {
 					writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Disk formatting requires REBOOT or ADMIN permission")
 					return
@@ -2560,7 +2733,7 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 				if req.DiskIndex <= 0 {
 					req.DiskIndex = 1
 				}
-				preview, err := s.recorderEng.StageFormatDiskPreview(deviceID, req.DiskIndex, "Technician")
+				preview, err := s.recorderEng.StageFormatDiskPreview(deviceID, req.DiskIndex, operator)
 				if err != nil {
 					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 					return
@@ -2568,17 +2741,25 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 				writeJSON(w, http.StatusOK, preview)
 				return
 
-			case "approve", "format-approve":
+			case "approve", "format-approve", "format":
 				var req struct {
 					FormatToken  string `json:"format_token"`
 					Confirmation string `json:"confirmation"`
+					ConfirmToken string `json:"confirm_token"`
 				}
 				_ = json.NewDecoder(r.Body).Decode(&req)
-				if err := s.recorderEng.ApproveFormatDisk(req.FormatToken, "Technician"); err != nil {
+				tok := req.FormatToken
+				if tok == "" {
+					tok = req.ConfirmToken
+				}
+				if err := s.recorderEng.ApproveFormatDisk(tok, operator); err != nil {
 					writeSimpleError(w, r, http.StatusUnprocessableEntity, err.Error())
 					return
 				}
 				writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "message": "Storage disk formatted successfully"})
+				return
+			default:
+				writeSimpleError(w, r, http.StatusNotFound, "Unknown storage subaction")
 				return
 			}
 		}
@@ -2588,21 +2769,10 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 			writeError(w, r, http.StatusForbidden, "INSUFFICIENT_PERMISSIONS", "Viewing playback frames requires PLAYBACK_VIEW permission")
 			return
 		}
-		// Stream playback frame endpoint
-		if len(parts) >= 4 {
-			// Return genuine verified JPEG test frame for playback scrubber
-			frame := []byte{
-				0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 'J', 'F', 'I', 'F', 0x00, 0x01, 0x01, 0x01, 0x00, 0x48,
-				0x00, 0x48, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43, 0x00, 0x03, 0x02, 0x02, 0x03, 0x02, 0x02, 0x03,
-				0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x40, 0x00, 0x40, 0x01, 0x01, 0x11, 0x00, 0xFF, 0xDA, 0x00,
-				0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00, 0x7F, 0x00, 0xFF, 0xD9,
-			}
-			w.Header().Set("Content-Type", "image/jpeg")
-			w.Header().Set("Content-Length", strconv.Itoa(len(frame)))
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(frame)
-			return
-		}
+		// Genuine playback frame extraction requires an active physical NVR storage volume or hardware decoder pipeline
+		// Do NOT return a fake test frame as successful production playback
+		writeError(w, r, http.StatusNotImplemented, "PLAYBACK_NOT_IMPLEMENTED", "Playback frame extraction is not implemented: genuine recorded media stream pipeline or physical NVR storage hardware required [SIMULATED TIMELINE / PLAYBACK PIPELINE UNSUPPORTED WITHOUT PHYSICAL NVR]")
+		return
 
 	default:
 		writeSimpleError(w, r, http.StatusNotFound, "Unknown recorder subresource")
@@ -2997,6 +3167,9 @@ func (s *Server) handleEventsCancelSubscription(w http.ResponseWriter, r *http.R
 						writeError(w, r, http.StatusForbidden, "CROSS_TENANT_ACCESS_DENIED", "Access denied: subscription belongs to an isolated device")
 						return
 					}
+				} else if !isSuperAdmin(sess) {
+					writeError(w, r, http.StatusForbidden, "CROSS_TENANT_ACCESS_DENIED", "Access denied: subscription device not found")
+					return
 				}
 				break
 			}
@@ -3016,15 +3189,66 @@ func (s *Server) handleEventsCancelSubscription(w http.ResponseWriter, r *http.R
 }
 
 func (s *Server) handleEventsLive(w http.ResponseWriter, r *http.Request) {
+	sess := getSession(r)
+
+	// Support SSE real-time event streaming if Accept: text/event-stream or ?stream=true
+	if r.Header.Get("Accept") == "text/event-stream" || r.URL.Query().Get("stream") == "true" {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			writeSimpleError(w, r, http.StatusInternalServerError, "Streaming unsupported")
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.WriteHeader(http.StatusOK)
+
+		fmt.Fprintf(w, "data: {\"type\":\"CONNECTED\",\"timestamp\":\"%s\"}\n\n", time.Now().UTC().Format(time.RFC3339))
+		flusher.Flush()
+
+		evChan := s.eventMgr.SubscribeEvents()
+		defer s.eventMgr.UnsubscribeEvents(evChan)
+
+		ctx := r.Context()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case ev, ok := <-evChan:
+				if !ok {
+					return
+				}
+				dev, devOk := s.store.GetDevice(ev.DeviceID)
+				if !devOk {
+					if !isSuperAdmin(sess) {
+						continue
+					}
+				} else {
+					if !checkTenantAccess(sess, dev.TenantID, dev.SiteID) {
+						continue
+					}
+				}
+				payload, _ := json.Marshal(ev)
+				fmt.Fprintf(w, "data: {\"type\":\"EVENT\",\"payload\":%s}\n\n", string(payload))
+				flusher.Flush()
+			}
+		}
+	}
+
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	if limit <= 0 {
 		limit = 50
 	}
-	sess := getSession(r)
 	eventsList := s.eventMgr.GetRecentEvents(limit)
 	filtered := make([]events.SurveillanceEvent, 0, len(eventsList))
 	for _, ev := range eventsList {
-		if dev, ok := s.store.GetDevice(ev.DeviceID); ok {
+		dev, ok := s.store.GetDevice(ev.DeviceID)
+		if !ok {
+			if !isSuperAdmin(sess) {
+				continue
+			}
+		} else {
 			if !checkTenantAccess(sess, dev.TenantID, dev.SiteID) {
 				continue
 			}
@@ -3058,7 +3282,12 @@ func (s *Server) handleAlarms(w http.ResponseWriter, r *http.Request) {
 	results := s.alarmEng.FilterAlarms(filter)
 	filtered := make([]*alarms.Alarm, 0, len(results))
 	for _, alm := range results {
-		if dev, ok := s.store.GetDevice(alm.DeviceID); ok {
+		dev, ok := s.store.GetDevice(alm.DeviceID)
+		if !ok {
+			if !isSuperAdmin(sess) {
+				continue
+			}
+		} else {
 			if !checkTenantAccess(sess, dev.TenantID, dev.SiteID) {
 				continue
 			}
@@ -3069,7 +3298,44 @@ func (s *Server) handleAlarms(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAlarmsStats(w http.ResponseWriter, r *http.Request) {
-	stats := s.alarmEng.GetStats()
+	sess := getSession(r)
+	allAlarms := s.alarmEng.FilterAlarms(alarms.AlarmFilter{})
+	stats := alarms.AlarmStats{}
+
+	for _, a := range allAlarms {
+		dev, ok := s.store.GetDevice(a.DeviceID)
+		if !ok {
+			if !isSuperAdmin(sess) {
+				continue
+			}
+		} else {
+			if !checkTenantAccess(sess, dev.TenantID, dev.SiteID) {
+				continue
+			}
+		}
+		stats.TotalAlarms++
+		switch a.State {
+		case alarms.StateNew:
+			stats.NewAlarms++
+		case alarms.StateAcknowledged:
+			stats.AcknowledgedAlarms++
+		case alarms.StateInvestigating:
+			stats.InvestigatingAlarms++
+		case alarms.StateResolved, alarms.StateDismissed:
+			stats.ResolvedAlarms++
+		}
+		switch a.Severity {
+		case alarms.SeverityCritical:
+			stats.CriticalCount++
+		case alarms.SeverityMajor:
+			stats.MajorCount++
+		case alarms.SeverityMinor:
+			stats.MinorCount++
+		case alarms.SeverityInfo:
+			stats.InfoCount++
+		}
+	}
+
 	writeJSON(w, http.StatusOK, stats)
 }
 
@@ -3131,23 +3397,43 @@ func (s *Server) handleAlarmsExport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusForbidden, "INSUFFICIENT_PERMISSIONS", "Exporting alarm ledger requires ALARM_EXPORT or PLAYBACK_EXPORT permission")
 		return
 	}
+	sess := getSession(r)
 	format := strings.ToLower(r.URL.Query().Get("format"))
-	filter := alarms.AlarmFilter{}
+	allAlarms := s.alarmEng.FilterAlarms(alarms.AlarmFilter{})
+	filtered := make([]*alarms.Alarm, 0, len(allAlarms))
+	for _, alm := range allAlarms {
+		dev, ok := s.store.GetDevice(alm.DeviceID)
+		if !ok {
+			if !isSuperAdmin(sess) {
+				continue
+			}
+		} else {
+			if !checkTenantAccess(sess, dev.TenantID, dev.SiteID) {
+				continue
+			}
+		}
+		filtered = append(filtered, alm)
+	}
 
 	if format == "csv" {
-		csvBytes, err := s.alarmEng.ExportCSV(filter)
-		if err != nil {
-			writeSimpleError(w, r, http.StatusInternalServerError, err.Error())
-			return
+		var buf bytes.Buffer
+		writer := csv.NewWriter(&buf)
+		_ = writer.Write([]string{"alarm_id", "device_id", "severity", "state", "category", "rule_id", "timestamp", "description"})
+		for _, alm := range filtered {
+			_ = writer.Write([]string{
+				alm.ID, alm.DeviceID, string(alm.Severity), string(alm.State),
+				alm.EventCategory, alm.EventType, alm.EventTimestamp.Format(time.RFC3339), alm.Description,
+			})
 		}
+		writer.Flush()
 		w.Header().Set("Content-Type", "text/csv")
 		w.Header().Set("Content-Disposition", "attachment; filename=\"alarm_history.csv\"")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(csvBytes)
+		_, _ = w.Write(buf.Bytes())
 		return
 	}
 
-	jsonBytes, err := s.alarmEng.ExportJSON(filter)
+	jsonBytes, err := json.MarshalIndent(filtered, "", "  ")
 	if err != nil {
 		writeSimpleError(w, r, http.StatusInternalServerError, err.Error())
 		return
@@ -3181,6 +3467,8 @@ func (s *Server) handleAlarmsStream(w http.ResponseWriter, r *http.Request) {
 	defer s.eventMgr.UnsubscribeEvents(evChan)
 
 	ctx := r.Context()
+	sess := getSession(r)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -3189,12 +3477,32 @@ func (s *Server) handleAlarmsStream(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
+			dev, devOk := s.store.GetDevice(alm.DeviceID)
+			if !devOk {
+				if !isSuperAdmin(sess) {
+					continue
+				}
+			} else {
+				if !checkTenantAccess(sess, dev.TenantID, dev.SiteID) {
+					continue
+				}
+			}
 			payload, _ := json.Marshal(alm)
 			fmt.Fprintf(w, "data: {\"type\":\"ALARM\",\"payload\":%s}\n\n", string(payload))
 			flusher.Flush()
 		case ev, ok := <-evChan:
 			if !ok {
 				return
+			}
+			dev, devOk := s.store.GetDevice(ev.DeviceID)
+			if !devOk {
+				if !isSuperAdmin(sess) {
+					continue
+				}
+			} else {
+				if !checkTenantAccess(sess, dev.TenantID, dev.SiteID) {
+					continue
+				}
 			}
 			payload, _ := json.Marshal(ev)
 			fmt.Fprintf(w, "data: {\"type\":\"EVENT\",\"payload\":%s}\n\n", string(payload))
@@ -3225,6 +3533,9 @@ func (s *Server) handleAlarmSubroutes(w http.ResponseWriter, r *http.Request) {
 			writeError(w, r, http.StatusForbidden, "CROSS_TENANT_ACCESS_DENIED", "Access denied: alarm belongs to a device on an isolated tenant or site")
 			return
 		}
+	} else if !isSuperAdmin(sess) {
+		writeError(w, r, http.StatusForbidden, "CROSS_TENANT_ACCESS_DENIED", "Access denied: alarm device not found or unassigned")
+		return
 	}
 
 	if len(parts) == 1 {

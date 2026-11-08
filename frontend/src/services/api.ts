@@ -17,16 +17,39 @@ import {
 
 const BASE_URL = 'http://127.0.0.1:8080/api/v1';
 
+// In-memory CSRF token storage - NEVER exposed or stored in localStorage / sessionStorage
+let memoryCsrfToken = '';
+
+function getCsrfToken(): string {
+  if (memoryCsrfToken) {
+    return memoryCsrfToken;
+  }
+  if (typeof document !== 'undefined' && document.cookie) {
+    const match = document.cookie.match(/(?:^|;\s*)sentinel_csrf=([^;]+)/);
+    if (match && match[1]) {
+      memoryCsrfToken = decodeURIComponent(match[1]);
+      return memoryCsrfToken;
+    }
+  }
+  return '';
+}
+
 async function request<T>(endpoint: string, options?: RequestInit): Promise<T> {
-  const token = typeof window !== 'undefined' ? localStorage.getItem('sentinel_token') : null;
+  const method = (options?.method || 'GET').toUpperCase();
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     ...(options?.headers as Record<string, string>),
   };
-  if (token && !headers['Authorization']) {
-    headers['Authorization'] = `Bearer ${token}`;
+
+  // CSRF Protection: Attach anti-CSRF token to all state-changing requests
+  if (['POST', 'PUT', 'DELETE', 'PATCH'].includes(method)) {
+    const csrf = getCsrfToken();
+    if (csrf && !headers['X-CSRF-Token']) {
+      headers['X-CSRF-Token'] = csrf;
+    }
   }
 
+  // Pure cookie-based browser session: credentials: 'include' automatically transmits HttpOnly sentinel_session
   const res = await fetch(`${BASE_URL}${endpoint}`, {
     ...options,
     credentials: 'include',
@@ -204,12 +227,12 @@ export const api = {
   completeSetup: (payload: { setup_token: string; username: string; password: string; full_name?: string; email?: string }) =>
     request<{ success: boolean; message: string; username: string }>('/auth/setup', { method: 'POST', body: JSON.stringify(payload) }),
   login: async (username: string, password: string) => {
-    const res = await request<{ success: boolean; session: Session; permissions: string[] }>('/security/login', {
+    const res = await request<{ success: boolean; session: Session; csrf_token?: string; permissions: string[] }>('/security/login', {
       method: 'POST',
       body: JSON.stringify({ username, password })
     });
-    if (res && res.session?.token) {
-      localStorage.setItem('sentinel_token', res.session.token);
+    if (res && res.csrf_token) {
+      memoryCsrfToken = res.csrf_token;
     }
     return res;
   },
@@ -219,8 +242,9 @@ export const api = {
     } catch {
       // ignore network errors during session termination
     }
-    localStorage.removeItem('sentinel_token');
+    memoryCsrfToken = '';
   },
+  getCSRFToken: () => request<{ csrf_token: string }>('/security/csrf'),
   migrateDevice: (deviceId: string, targetTenant: string, targetSite: string) =>
     request<{ success: boolean; device_id: string; target_tenant: string; target_site: string; message: string }>(
       `/devices/${deviceId}/migrate`,

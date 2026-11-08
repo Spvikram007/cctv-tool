@@ -59,6 +59,8 @@ func TestPhase5BatchFirmwareSecurityAPIE2E(t *testing.T) {
 		Status:       "online",
 		Username:     "admin",
 		Password:     "Admin@123",
+		TenantID:     "default",
+		SiteID:       "hq",
 	})
 
 	client := &http.Client{Timeout: 5 * time.Second}
@@ -75,7 +77,10 @@ func TestPhase5BatchFirmwareSecurityAPIE2E(t *testing.T) {
 		"password": "Admin@Sentinel2026!",
 	}
 	b, _ := json.Marshal(loginReq)
-	resp, err := client.Post(ts.URL+"/api/v1/security/login", "application/json", bytes.NewReader(b))
+	reqLogin, _ := http.NewRequest("POST", ts.URL+"/api/v1/security/login", bytes.NewReader(b))
+	reqLogin.Header.Set("Content-Type", "application/json")
+	reqLogin.Header.Set("X-Client-Type", "desktop")
+	resp, err := client.Do(reqLogin)
 	if err != nil {
 		t.Fatalf("failed to call security login: %v", err)
 	}

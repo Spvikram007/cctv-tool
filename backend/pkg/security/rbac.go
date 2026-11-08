@@ -60,6 +60,11 @@ const (
 	PermAlarmExport     Permission = "ALARM_EXPORT"
 )
 
+// Security Scopes for Global Fleet Administration
+const (
+	ScopeGlobalAdmin = "global:admin"
+)
+
 // RolePermissions maps roles to granted enterprise capabilities
 var RolePermissions = map[Role][]Permission{
 	RoleAdmin: {
@@ -143,28 +148,65 @@ var DefaultArgon2Params = &Argon2Params{
 
 // UserAccount represents an authenticated enterprise operator
 type UserAccount struct {
-	Username     string    `json:"username"`
-	FullName     string    `json:"full_name"`
-	Role         Role      `json:"role"`
-	Email        string    `json:"email"`
-	PasswordHash string    `json:"-"` // Argon2id or legacy salted hash
-	Salt         string    `json:"-"`
-	TenantID     string    `json:"tenant_id,omitempty"`
-	SiteID       string    `json:"site_id,omitempty"`
-	Active       bool      `json:"active"`
-	CreatedAt    time.Time `json:"created_at"`
-	LastLogin    time.Time `json:"last_login,omitempty"`
+	Username      string    `json:"username"`
+	FullName      string    `json:"full_name"`
+	Role          Role      `json:"role"`
+	Email         string    `json:"email"`
+	PasswordHash  string    `json:"-"` // Argon2id or legacy salted hash
+	Salt          string    `json:"-"`
+	TenantID      string    `json:"tenant_id,omitempty"`
+	SiteID        string    `json:"site_id,omitempty"`
+	IsGlobalAdmin bool      `json:"is_global_admin,omitempty"`
+	Scopes        []string  `json:"scopes,omitempty"`
+	Active        bool      `json:"active"`
+	CreatedAt     time.Time `json:"created_at"`
+	LastLogin     time.Time `json:"last_login,omitempty"`
+}
+
+// HasScope checks if the user account holds an explicit security scope
+func (u *UserAccount) HasScope(scope string) bool {
+	if u == nil {
+		return false
+	}
+	if u.IsGlobalAdmin && scope == ScopeGlobalAdmin {
+		return true
+	}
+	for _, s := range u.Scopes {
+		if s == scope {
+			return true
+		}
+	}
+	return false
 }
 
 // Session represents an active authenticated session
 type Session struct {
-	Token     string    `json:"token"`
-	Username  string    `json:"username"`
-	Role      Role      `json:"role"`
-	TenantID  string    `json:"tenant_id,omitempty"`
-	SiteID    string    `json:"site_id,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
-	ExpiresAt time.Time `json:"expires_at"`
+	Token         string    `json:"token,omitempty"`
+	Username      string    `json:"username"`
+	Role          Role      `json:"role"`
+	TenantID      string    `json:"tenant_id,omitempty"`
+	SiteID        string    `json:"site_id,omitempty"`
+	IsGlobalAdmin bool      `json:"is_global_admin,omitempty"`
+	Scopes        []string  `json:"scopes,omitempty"`
+	CSRFToken     string    `json:"csrf_token,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
+	ExpiresAt     time.Time `json:"expires_at"`
+}
+
+// HasScope checks if the session holds an explicit security scope
+func (s *Session) HasScope(scope string) bool {
+	if s == nil {
+		return false
+	}
+	if s.IsGlobalAdmin && scope == ScopeGlobalAdmin {
+		return true
+	}
+	for _, sc := range s.Scopes {
+		if sc == scope {
+			return true
+		}
+	}
+	return false
 }
 
 // RBACManager handles user authentication, role checks, session tokens, and first-run setup
@@ -288,16 +330,18 @@ func (m *RBACManager) CompleteSetup(token, username, password, fullName, email s
 	argonHash := HashPasswordArgon2id(password, saltBytes, m.argon2Config)
 
 	u := &UserAccount{
-		Username:     username,
-		FullName:     fullName,
-		Role:         RoleAdmin,
-		Email:        email,
-		PasswordHash: argonHash,
-		Salt:         hex.EncodeToString(saltBytes),
-		TenantID:     "default",
-		SiteID:       "hq",
-		Active:       true,
-		CreatedAt:    time.Now().UTC(),
+		Username:      username,
+		FullName:      fullName,
+		Role:          RoleAdmin,
+		Email:         email,
+		PasswordHash:  argonHash,
+		Salt:          hex.EncodeToString(saltBytes),
+		TenantID:      "system",
+		SiteID:        "hq",
+		IsGlobalAdmin: true,
+		Scopes:        []string{ScopeGlobalAdmin},
+		Active:        true,
+		CreatedAt:     time.Now().UTC(),
 	}
 
 	m.users[username] = u
@@ -509,15 +553,24 @@ func (m *RBACManager) Authenticate(username, password string, ttl time.Duration)
 	}
 	token := fmt.Sprintf("sent-sess-%s", hex.EncodeToString(tokBytes))
 
+	csrfBytes := make([]byte, 24)
+	if _, err := rand.Read(csrfBytes); err != nil {
+		return nil, fmt.Errorf("failed to generate secure csrf token: %w", err)
+	}
+	csrfToken := fmt.Sprintf("sent-csrf-%s", hex.EncodeToString(csrfBytes))
+
 	now := time.Now().UTC()
 	sess := &Session{
-		Token:     token,
-		Username:  username,
-		Role:      userRole,
-		TenantID:  tenantID,
-		SiteID:    siteID,
-		CreatedAt: now,
-		ExpiresAt: now.Add(ttl),
+		Token:         token,
+		Username:      username,
+		Role:          userRole,
+		TenantID:      tenantID,
+		SiteID:        siteID,
+		IsGlobalAdmin: currentUser.IsGlobalAdmin,
+		Scopes:        append([]string(nil), currentUser.Scopes...),
+		CSRFToken:     csrfToken,
+		CreatedAt:     now,
+		ExpiresAt:     now.Add(ttl),
 	}
 
 	m.sessions[token] = sess
@@ -620,18 +673,82 @@ func (m *RBACManager) InjectUserWithHashForTest(username, hash, salt string, rol
 	}
 }
 
+// CreateGlobalAdminUser registers an explicit global super-administrator
+func (m *RBACManager) CreateGlobalAdminUser(username, password, fullName, email string) error {
+	if err := ValidatePasswordStrength(password); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	if _, exists := m.users[username]; exists {
+		m.mu.Unlock()
+		return fmt.Errorf("user %s already exists", username)
+	}
+
+	saltLength := m.argon2Config.SaltLength
+	argonConfig := *m.argon2Config
+	m.mu.Unlock()
+
+	saltBytes := make([]byte, saltLength)
+	if _, err := rand.Read(saltBytes); err != nil {
+		return fmt.Errorf("failed to generate cryptographic salt: %w", err)
+	}
+
+	argonHash := HashPasswordArgon2id(password, saltBytes, &argonConfig)
+
+	u := &UserAccount{
+		Username:      username,
+		FullName:      fullName,
+		Role:          RoleAdmin,
+		Email:         email,
+		PasswordHash:  argonHash,
+		Salt:          hex.EncodeToString(saltBytes),
+		TenantID:      "system",
+		SiteID:        "global",
+		IsGlobalAdmin: true,
+		Scopes:        []string{ScopeGlobalAdmin},
+		Active:        true,
+		CreatedAt:     time.Now().UTC(),
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.users[username] = u
+	return nil
+}
+
 // InjectSessionForTest creates an active session directly for test cases
 func (m *RBACManager) InjectSessionForTest(token, username string, role Role, tenantID, siteID string, ttl time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.sessions[token] = &Session{
-		Token:     token,
-		Username:  username,
-		Role:      role,
-		TenantID:  tenantID,
-		SiteID:    siteID,
-		CreatedAt: time.Now().UTC(),
-		ExpiresAt: time.Now().UTC().Add(ttl),
+		Token:         token,
+		Username:      username,
+		Role:          role,
+		TenantID:      tenantID,
+		SiteID:        siteID,
+		IsGlobalAdmin: false,
+		CSRFToken:     "test-csrf-" + token,
+		CreatedAt:     time.Now().UTC(),
+		ExpiresAt:     time.Now().UTC().Add(ttl),
+	}
+}
+
+// InjectGlobalAdminSessionForTest creates an active global super-admin session directly for tests
+func (m *RBACManager) InjectGlobalAdminSessionForTest(token, username string, ttl time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sessions[token] = &Session{
+		Token:         token,
+		Username:      username,
+		Role:          RoleAdmin,
+		TenantID:      "system",
+		SiteID:        "global",
+		IsGlobalAdmin: true,
+		Scopes:        []string{ScopeGlobalAdmin},
+		CSRFToken:     "test-csrf-" + token,
+		CreatedAt:     time.Now().UTC(),
+		ExpiresAt:     time.Now().UTC().Add(ttl),
 	}
 }
 

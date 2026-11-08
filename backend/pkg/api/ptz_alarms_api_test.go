@@ -41,6 +41,8 @@ func setupPhase7TestServer(t *testing.T) (*Server, http.Handler) {
 		Manufacturer: "Vatilon",
 		Capabilities: []string{"PTZ", "STREAMING"},
 		Protocols:    []models.ProtocolType{models.ProtocolONVIF},
+		TenantID:     "default",
+		SiteID:       "hq",
 	})
 
 	// Seed Fixed camera (Hikvision DS-2CD1023G0-IU)
@@ -54,6 +56,8 @@ func setupPhase7TestServer(t *testing.T) (*Server, http.Handler) {
 		Manufacturer: models.VendorHikvision,
 		Capabilities: []string{"STREAMING"},
 		Protocols:    []models.ProtocolType{models.ProtocolISAPI},
+		TenantID:     "default",
+		SiteID:       "hq",
 	})
 
 	srv := NewServer(store, registry, configEng, discEng, licMgr, logger, nil, nil, nil, nil, rbacMgr)

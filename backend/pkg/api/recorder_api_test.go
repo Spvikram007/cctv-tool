@@ -46,6 +46,8 @@ func setupRecorderAPITestServer(t *testing.T) (*httptest.Server, *database.Store
 		Category:     models.CategoryXVR,
 		Status:       "online",
 		ChannelCount: 16,
+		TenantID:     "default",
+		SiteID:       "hq",
 	})
 
 	store.UpsertDevice(models.Device{
@@ -58,6 +60,8 @@ func setupRecorderAPITestServer(t *testing.T) (*httptest.Server, *database.Store
 		Category:     models.CategoryNVR,
 		Status:       "online",
 		ChannelCount: 16,
+		TenantID:     "default",
+		SiteID:       "hq",
 	})
 
 	server := api.NewServer(store, registry, cfgEngine, discEngine, licMgr, logger, nil, nil, batchEng, firmwareEng, rbacMgr, recorderEng)

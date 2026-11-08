@@ -75,6 +75,8 @@ func TestDeviceAuthAndCapabilitiesAPI(t *testing.T) {
 		Status:       "discovered",
 		Username:     "admin",
 		Password:     "Admin@123",
+		TenantID:     "default",
+		SiteID:       "hq",
 	}
 	store.UpsertDevice(dev)
 

@@ -1154,6 +1154,18 @@ export const RecorderManager: React.FC<RecorderManagerProps> = ({
       {/* ========================================================================= */}
       {activeTab === 'playback' && (
         <div className="space-y-6 font-mono">
+          {/* Simulated / Unsupported Notice */}
+          <div className="p-3 bg-amber-950/40 border border-amber-500/40 rounded-lg text-amber-300 text-xs flex items-center justify-between">
+            <div className="flex items-center space-x-2">
+              <span className="font-bold px-2 py-0.5 rounded bg-amber-500/20 border border-amber-500/50 text-[10px]">
+                [SIMULATED TIMELINE / PLAYBACK PIPELINE UNSUPPORTED WITHOUT PHYSICAL NVR]
+              </span>
+              <span>
+                Metadata and index search available. Playback frame extraction returns HTTP 501 PLAYBACK_NOT_IMPLEMENTED without physical NVR storage.
+              </span>
+            </div>
+          </div>
+
           {/* Search Bar */}
           <div className="p-4 rounded-xl bg-[#161b22] border border-[#30363d] space-y-4">
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 text-xs">
@@ -1416,14 +1428,26 @@ export const RecorderManager: React.FC<RecorderManagerProps> = ({
             <span className="text-xs text-slate-400">Synchronized Timecode: {new Date().toLocaleTimeString()}</span>
           </div>
 
+          {/* Simulated / Unsupported Notice */}
+          <div className="p-3 bg-amber-950/40 border border-amber-500/40 rounded-lg text-amber-300 text-xs flex items-center justify-between">
+            <div className="flex items-center space-x-2">
+              <span className="font-bold px-2 py-0.5 rounded bg-amber-500/20 border border-amber-500/50 text-[10px]">
+                [SIMULATED TIMELINE / PLAYBACK PIPELINE UNSUPPORTED WITHOUT PHYSICAL NVR]
+              </span>
+              <span>
+                Multi-channel synchronized playback visualization is simulated in software. Frame extraction requires physical NVR storage connection.
+              </span>
+            </div>
+          </div>
+
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             {channels.slice(0, 4).map((ch) => (
               <div key={ch.channel_id} className="rounded-xl bg-[#161b22] border border-[#30363d] overflow-hidden">
                 <div className="p-3 bg-[#0d1117] border-b border-[#30363d] flex items-center justify-between text-xs">
                   <div className="flex items-center space-x-2">
                     <span className="font-bold text-slate-200">CH {ch.channel_number}: {ch.name}</span>
-                    <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-400 text-[10px] font-bold">
-                      {ch.recording_status}
+                    <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 text-[10px] font-bold">
+                      SIMULATED
                     </span>
                   </div>
                   <span className="text-[11px] text-slate-400">{ch.resolution || '1080P'}</span>
@@ -1431,12 +1455,12 @@ export const RecorderManager: React.FC<RecorderManagerProps> = ({
 
                 {/* Simulated Feed / Video Canvas */}
                 <div className="h-44 bg-slate-950 flex flex-col items-center justify-center p-4 relative group">
-                  <Video className="w-10 h-10 text-slate-700 group-hover:text-emerald-400 transition-colors mb-2" />
-                  <span className="text-xs text-slate-400">Authenticated Playback Stream</span>
-                  <span className="text-[10px] text-slate-600 mt-1">{ch.rtsp_stream_url || `rtsp://${currentDev.ip}:554/Streaming/Channels/${ch.channel_id}01`}</span>
+                  <Video className="w-10 h-10 text-slate-700 group-hover:text-amber-400 transition-colors mb-2" />
+                  <span className="text-xs text-amber-400/90 font-bold">[SIMULATED PLAYBACK PIPELINE]</span>
+                  <span className="text-[10px] text-slate-500 mt-1">FRAME EXTRACTION UNSUPPORTED WITHOUT PHYSICAL NVR</span>
 
                   <div className="absolute bottom-2 left-2 right-2 flex items-center justify-between text-[10px] text-slate-400 bg-slate-900/80 px-2 py-1 rounded backdrop-blur">
-                    <span>STATUS: SYNCED</span>
+                    <span>STATUS: SIMULATED (501 ON LIVE EXTRACTION)</span>
                     <span>1.0x PLAYING</span>
                   </div>
                 </div>

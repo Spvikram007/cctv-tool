@@ -1,7 +1,7 @@
 # CCTV SENTINEL UNIVERSAL — API AUTHORIZATION & TENANT ISOLATION MATRIX
 
 **Product:** CCTV SENTINEL UNIVERSAL  
-**Phase:** Phase 6.1.2 Final Stabilization  
+**Phase:** Phase 6.1.3 Final Multi-Tenant Security Corrections & Release Verification  
 **Company:** Tech Defence Solutions  
 **Security Level:** Enterprise Mission-Critical / Defense-Grade  
 **Branch:** `security/phase-6-1-7-1-stabilization`  
@@ -182,17 +182,20 @@ The architecture adheres strictly to:
 
 ### 4.1 Boundary Enforcement Logic (`checkTenantAccess`)
 ```text
-IF caller is Super-Admin (Role: Admin AND TenantID in {"", "default", "system"}):
-    ALLOW ALL RESOURCES
+IF caller is Super-Admin (Role: Admin AND (caller.IsGlobalAdmin == true OR "global:admin" IN caller.Scopes)):
+    ALLOW ALL RESOURCES (Fleet-wide root operator)
 
-IF resource.TenantID == "":
+IF caller.TenantID == "" OR caller.SiteID == "":
+    DENY (403 CROSS_TENANT_ACCESS_DENIED) — Fail-closed for unprovisioned operators
+
+IF resource.TenantID == "" OR resource.SiteID == "":
     DENY (403 CROSS_TENANT_ACCESS_DENIED) — Legacy unassigned devices require super-admin claim
 
 IF caller.TenantID != resource.TenantID:
     DENY (403 CROSS_TENANT_ACCESS_DENIED) — Cross-tenant boundary breach
 
-IF caller.SiteID NOT IN {"", "default", "all"}:
-    IF resource.SiteID == "" OR resource.SiteID != caller.SiteID:
+IF caller.SiteID NOT IN {"all", "*"}:
+    IF caller.SiteID != resource.SiteID:
         DENY (403 CROSS_TENANT_ACCESS_DENIED) — Cross-site boundary breach
 
 ALLOW ACCESS
@@ -210,20 +213,32 @@ ALLOW ACCESS
    ```
 4. **Audit Immutability:** The migration event is written to the cryptographic audit trail recording both the previous and new tenant identifiers. Once claimed, the device becomes accessible to operators authorized for `acme-corp`.
 
+### 4.3 Real-Time Telemetry Stream Tenant Isolation
+1. **Server-Sent Events (`/api/v1/events/live`):** Events are filtered per client session before dispatch. Unassigned or cross-tenant events are suppressed.
+2. **Alarm Streams (`/api/v1/alarms/stream`, `/api/v1/alarms/ws`):** Telemetry delivery verifies `checkTenantAccess` per alarm/event. Missing device ownership fails closed for non-global users.
+3. **Client Disconnection:** Clean cancellation and channel cleanup on `<-ctx.Done()`.
+
 ---
 
-## 5. Session Authentication & Token Security Standards
+## 5. Session Authentication, CSRF & Token Security Standards
 
-1. **Authorization Header:**
-   - Standard format: `Authorization: Bearer <session-token>` (case-insensitive `Bearer ` prefix).
-2. **Secure Session Cookie:**
+1. **Browser HttpOnly Session Cookie:**
    - Name: `sentinel_session`
    - Attributes: `HttpOnly; SameSite=Strict; Path=/`
    - Secure flag enabled automatically when TLS is present (`r.TLS != nil`).
-3. **URL Query-String Parameters Strictly Prohibited:**
+2. **Deprecation of Browser `localStorage` Bearer Tokens:**
+   - In browser environments, token persistence in `localStorage` or `sessionStorage` has been eliminated.
+   - Authentication tokens are not exposed in browser JSON responses (sanitized).
+3. **CSRF & Origin Protection:**
+   - For all cookie-authenticated state-changing requests (`POST`, `PUT`, `DELETE`, `PATCH`):
+     - `Origin` header validated against trusted origins (`localhost:5173`, `127.0.0.1:5173`, `localhost:8080`, `127.0.0.1:8080`). Untrusted origins are rejected with HTTP 403 `CSRF_UNTRUSTED_ORIGIN`.
+     - `X-CSRF-Token` or `X-Sentinel-CSRF` header must match session CSRF token via constant-time comparison (`subtle.ConstantTimeCompare`). Missing or invalid CSRF tokens receive HTTP 403 `CSRF_TOKEN_INVALID`.
+4. **Native Desktop Exemption:**
+   - Native desktop clients passing `X-Client-Type: desktop` and `Authorization: Bearer <token>` authenticate directly without CSRF headers.
+5. **URL Query-String Parameters Strictly Prohibited:**
    - Parameter `?token=...` is explicitly discarded. Requests relying on query strings receive HTTP 401 `UNAUTHORIZED`.
-4. **Server-Side Session Revocation:**
-   - Calling `/api/v1/security/logout` deletes the session from the in-memory `RBACManager` session map and issues an expired `sentinel_session` cookie (`Max-Age: -1`).
+6. **Server-Side Session Revocation:**
+   - Calling `/api/v1/security/logout` deletes the session from the in-memory `RBACManager` session map and issues expired `sentinel_session` and `sentinel_csrf` cookies (`Max-Age: -1`).
    - Subsequent calls using the revoked session token or cookie immediately fail with HTTP 401.
 
 ---
@@ -238,5 +253,8 @@ ALLOW ACCESS
 | `403` | `FORBIDDEN` | Caller lacks the specific permission string required for the action |
 | `403` | `INSUFFICIENT_PERMISSIONS` | Caller's role cannot perform this privileged operation |
 | `403` | `CROSS_TENANT_ACCESS_DENIED` | Attempted access to a device, recorder, or alarm on another tenant or site |
+| `403` | `CSRF_TOKEN_INVALID` | State-changing request with cookie session missing or having invalid CSRF header |
+| `403` | `CSRF_UNTRUSTED_ORIGIN` | State-changing cross-origin request rejected due to untrusted Origin header |
 | `403` | `SETUP_DISABLED` | First-run setup has already completed; setup token permanently disabled |
 | `429` | `RATE_LIMIT_EXCEEDED` | Client exceeded IP-based rate limiting thresholds (token bucket) |
+| `501` | `PLAYBACK_NOT_IMPLEMENTED` | Playback frame extraction unsupported without physical NVR storage hardware |

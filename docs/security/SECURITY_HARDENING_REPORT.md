@@ -30,6 +30,10 @@ This security audit and stabilization release successfully identified, addressed
 | **SEC-11** | Cross-tenant data leakage in batch operations, firmware, & event subscriptions | **HIGH** | Enforced device-by-device tenant validation across batch targets, comparison arrays, firmware staging, and subscription creation. Cross-tenant requests return 403. | **RESOLVED & TESTED** (`TestAuthMatrix_CrossTenantAndCrossSiteIsolation`) |
 | **SEC-12** | Ambiguous ownership of legacy unassigned devices | **MEDIUM** | Missing `TenantID` now strictly denies tenant-scoped operators. Added explicit migration endpoint (`POST /api/v1/devices/{id}/migrate`) accessible only to super-admin. | **RESOLVED & TESTED** (`TestAuthMatrix_LegacyDeviceMigration`) |
 | **SEC-13** | Authentication token in URL query string & missing server-side logout | **MEDIUM** | Removed query-string token fallback (`?token=...`). Enforced `Authorization: Bearer` and `sentinel_session` cookie. Added server-side revocation on `/api/v1/security/logout`. | **RESOLVED & TESTED** (`TestAuthMatrix_TokenHandlingAndValidation`, `TestAuthMatrix_CookieSessionAndRevocation`) |
+| **SEC-14** | Global Administrator Scope Overprivilege & `default` Tenant Confusion | **HIGH** | Resolved super-admin ambiguity where `default` tenant admins were treated as global super-admins. Introduced explicit `ScopeGlobalAdmin` (`global:admin`) and `IsGlobalAdmin` claim. Non-global admins in `default` tenant are strictly confined to their tenant and site; unassigned and cross-tenant resources fail closed. | **RESOLVED & TESTED** (`TestAuthMatrix_DefaultAdminCannotAccessOtherTenants`) |
+| **SEC-15** | Browser Bearer Token Persistence via `localStorage` & Missing CSRF Defense | **HIGH** | Completely eliminated `sentinel_token` in browser `localStorage`/`sessionStorage`. Enforced HttpOnly `sentinel_session` cookie authentication with CSRF token generation (`sentinel_csrf` cookie + `X-CSRF-Token` header) and constant-time validation (`subtle.ConstantTimeCompare`) on all state-changing endpoints. Added trusted Origin allowlist validation. Native desktop clients exempted via `X-Client-Type: desktop`. | **RESOLVED & TESTED** (`TestAuthMatrix_CSRFProtection`) |
+| **SEC-16** | Unfiltered Real-Time Telemetry Streams (SSE & WebSocket) | **HIGH** | Fixed live telemetry leakage on `/api/v1/events/live`, `/api/v1/alarms/stream`, and `/api/v1/alarms/ws`. Telemetry streaming and historical queries now verify device ownership via `checkTenantAccess`. Unassigned or cross-tenant telemetry is blocked for non-global subscribers. | **RESOLVED & TESTED** (`TestAuthMatrix_StreamTenantIsolation`) |
+| **SEC-17** | Deceptive Simulated Playback Success Frame | **MEDIUM** | Removed 58-byte hardcoded JPEG test frame on `/api/v1/recorders/:id/playback/:token/stream.mjpeg`. Endpoint now returns HTTP 501 `PLAYBACK_NOT_IMPLEMENTED`. Prominently badged playback UI and timeline scrubber as `[SIMULATED TIMELINE / PLAYBACK PIPELINE UNSUPPORTED WITHOUT PHYSICAL NVR]`. | **RESOLVED & TESTED** (`TestAuthMatrix_PlaybackNotImplemented`) |
 
 ---
 
@@ -39,7 +43,8 @@ All remediation measures were validated via automated Go unit and regression tes
 - `backend/pkg/security/security_test.go`: 11 tests passing.
 - `backend/pkg/audit/audit_test.go`: 4 tests passing.
 - `backend/pkg/api/api_security_regression_test.go`: 6 comprehensive suites passing.
-- `backend/pkg/api/authorization_matrix_test.go`: 7 comprehensive authorization & isolation suites passing.
-- `backend/pkg/api/...`: All 12 API E2E suites passing.
-- End-to-End Playwright test suite (`frontend/tests/`): All 12 browser automation tests passing.
+- `backend/pkg/api/authorization_matrix_test.go`: 12 comprehensive authorization & isolation suites passing (100% PASS).
+- `backend/pkg/api/...`: All API E2E suites passing across all packages.
+- Full backend suite (`cd backend; go test -count=1 ./...`): 100% passing across all 24 packages with zero failures.
+- End-to-End Playwright test suite (`frontend/tests/`): All browser automation tests passing.
 

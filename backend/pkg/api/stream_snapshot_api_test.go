@@ -59,6 +59,8 @@ func TestStreamAndSnapshotAPIE2E(t *testing.T) {
 		Protocols:    []models.ProtocolType{models.ProtocolISAPI, models.ProtocolRTSP},
 		Username:     "admin",
 		Password:     "Admin@123",
+		TenantID:     "default",
+		SiteID:       "hq",
 	}
 	store.UpsertDevice(dev)
 
