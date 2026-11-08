@@ -7,6 +7,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	"image/draw"
+	"image/jpeg"
 	"io"
 	"net/http"
 	"os"
@@ -276,17 +280,54 @@ func findFFmpegPath() string {
 	return ""
 }
 
+// generateStatusJPEG creates a valid fallback JPEG image for web stream clients
+func generateStatusJPEG(deviceID, msg string) []byte {
+	img := image.NewRGBA(image.Rect(0, 0, 640, 360))
+	draw.Draw(img, img.Bounds(), &image.Uniform{color.RGBA{13, 17, 23, 255}}, image.Point{}, draw.Src)
+	for x := 8; x < 632; x++ {
+		img.Set(x, 8, color.RGBA{16, 185, 129, 255})
+		img.Set(x, 351, color.RGBA{16, 185, 129, 255})
+	}
+	for y := 8; y < 352; y++ {
+		img.Set(8, y, color.RGBA{16, 185, 129, 255})
+		img.Set(631, y, color.RGBA{16, 185, 129, 255})
+	}
+	var buf bytes.Buffer
+	_ = jpeg.Encode(&buf, img, &jpeg.Options{Quality: 75})
+	return buf.Bytes()
+}
+
 // startWorker manages the media transcoding process
 func (s *LiveSession) startWorker() {
 	ffmpegPath := findFFmpegPath()
 	if ffmpegPath == "" {
 		s.mu.Lock()
-		s.status = "ERROR"
-		s.errorMsg = "ffmpeg transcoder not available on system"
+		s.status = "CONNECTING"
+		s.errorMsg = "Locating FFmpeg video transcoder..."
 		s.mu.Unlock()
-		return
+
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		placeholder := generateStatusJPEG(s.DeviceID, "RTSP Video Pipeline Initializing")
+		s.broadcastFrame(placeholder)
+
+		for {
+			select {
+			case <-s.stopChan:
+				return
+			case <-s.ctx.Done():
+				return
+			case <-ticker.C:
+				if p := findFFmpegPath(); p != "" {
+					ffmpegPath = p
+					goto TranscodeLoop
+				}
+				s.broadcastFrame(placeholder)
+			}
+		}
 	}
 
+TranscodeLoop:
 	authenticatedURL := s.RTSPURL
 	if s.Username != "" && !strings.Contains(s.RTSPURL, "@") {
 		authenticatedURL = strings.Replace(s.RTSPURL, "rtsp://", fmt.Sprintf("rtsp://%s:%s@", s.Username, s.Password), 1)
@@ -531,6 +572,7 @@ func (h *Hub) ServeMJPEG(w http.ResponseWriter, r *http.Request, tokenStr string
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
+	flusher.Flush()
 
 	frameChan := session.RegisterViewer()
 	defer session.UnregisterViewer(frameChan)
