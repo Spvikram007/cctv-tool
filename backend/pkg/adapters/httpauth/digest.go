@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -311,10 +312,18 @@ func (t *DigestTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return t.Transport.RoundTrip(retryReq)
 }
 
-// NewClient creates an http.Client configured with DigestTransport and TLS skip verification option
+// NewClient creates an http.Client configured with DigestTransport, fast connect timeouts, and TLS skip verification option
 func NewClient(username, password string, timeout time.Duration, skipTLS bool) *http.Client {
+	dialer := &net.Dialer{
+		Timeout:   2 * time.Second,
+		KeepAlive: 15 * time.Second,
+	}
 	baseTransport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           dialer.DialContext,
+		ResponseHeaderTimeout: 3 * time.Second,
+		TLSHandshakeTimeout:   2 * time.Second,
+		DisableKeepAlives:     true, // Embedded CCTV web servers frequently drop or hang on kept-alive sockets
 	}
 	if skipTLS {
 		baseTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}

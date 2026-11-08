@@ -960,7 +960,7 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(path, "/")
 	deviceID := parts[0]
 
-	dev, ok := s.store.GetDevice(deviceID)
+	dev, ok := s.store.GetDeviceDecrypted(deviceID)
 	if !ok {
 		writeSimpleError(w, r, http.StatusNotFound, "Device not found")
 		return
@@ -984,7 +984,9 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, map[string]bool{"success": true})
 			return
 		}
-		writeJSON(w, http.StatusOK, dev)
+		safeDev := dev
+		safeDev.Password = ""
+		writeJSON(w, http.StatusOK, safeDev)
 		return
 	}
 

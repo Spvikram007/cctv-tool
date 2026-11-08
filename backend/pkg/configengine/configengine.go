@@ -106,7 +106,7 @@ func (e *Engine) GeneratePreview(deviceID string, cfgType ConfigType, proposedJS
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	dev, ok := e.store.GetDevice(deviceID)
+	dev, ok := e.store.GetDeviceDecrypted(deviceID)
 	if !ok {
 		return nil, fmt.Errorf("%w: %s", ErrDeviceNotFound, deviceID)
 	}
@@ -278,7 +278,7 @@ func (e *Engine) ApplyConfirmed(deviceID string, cfgType ConfigType, approvalTok
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	dev, ok := e.store.GetDevice(deviceID)
+	dev, ok := e.store.GetDeviceDecrypted(deviceID)
 	if !ok {
 		return nil, fmt.Errorf("%w: %s", ErrDeviceNotFound, deviceID)
 	}
@@ -449,7 +449,7 @@ func (e *Engine) Rollback(deviceID string, rollbackKey string, user string) (*Co
 		return nil, fmt.Errorf("rollback snapshot key expired or not found: %s", rollbackKey)
 	}
 
-	dev, ok := e.store.GetDevice(deviceID)
+	dev, ok := e.store.GetDeviceDecrypted(deviceID)
 	if !ok {
 		return nil, fmt.Errorf("%w: %s", ErrDeviceNotFound, deviceID)
 	}

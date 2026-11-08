@@ -188,7 +188,7 @@ func (h *Hub) GetOrCreateSession(deviceID, streamType string) (*LiveSession, err
 		return sess, nil
 	}
 
-	dev, found := h.store.GetDevice(deviceID)
+	dev, found := h.store.GetDeviceDecrypted(deviceID)
 	if !found {
 		h.mu.Unlock()
 		return nil, fmt.Errorf("device %s not found in store", deviceID)
@@ -382,8 +382,8 @@ TranscodeLoop:
 		}
 
 		s.mu.Lock()
-		s.status = "LIVE"
-		s.errorMsg = ""
+		s.status = "CONNECTING"
+		s.errorMsg = "Starting RTSP transcoder..."
 		s.mu.Unlock()
 
 		// Read JPEG frames from stdout stream
@@ -427,6 +427,25 @@ TranscodeLoop:
 
 		_ = cmd.Wait()
 
+		stderrStr := stderrBuf.String()
+		s.mu.Lock()
+		if strings.Contains(stderrStr, "401") || strings.Contains(stderrStr, "Unauthorized") || strings.Contains(stderrStr, "authorization failed") {
+			s.status = "AUTH_REQUIRED"
+			s.errorMsg = "RTSP 401: Invalid camera credentials"
+		} else if strings.Contains(stderrStr, "Connection refused") || strings.Contains(stderrStr, "No route to host") {
+			s.status = "UNREACHABLE"
+			s.errorMsg = "RTSP endpoint unreachable"
+		} else {
+			s.status = "RECONNECTING"
+			if len(stderrStr) > 0 {
+				s.errorMsg = audit.RedactSecrets(strings.TrimSpace(stderrStr))
+			}
+		}
+		statusFrame := generateStatusJPEG(s.DeviceID, s.status+": "+s.errorMsg)
+		s.lastFrame = statusFrame
+		s.mu.Unlock()
+		s.broadcastFrame(statusFrame)
+
 		// If viewers dropped to 0, stop the session
 		if atomic.LoadInt32(&s.viewers) <= 0 {
 			s.mu.Lock()
@@ -452,6 +471,7 @@ func (s *LiveSession) broadcastFrame(frame []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.status = "LIVE"
 	s.lastFrame = frame
 	s.lastFrameTime = time.Now().UTC()
 	s.frameCount++

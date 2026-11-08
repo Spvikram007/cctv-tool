@@ -354,7 +354,7 @@ export const Devices: React.FC<DevicesProps> = ({
                   className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg text-xs flex items-center space-x-1.5 transition-colors disabled:bg-slate-700"
                 >
                   <Lock className="w-3.5 h-3.5" />
-                  <span>{authSubmitting ? 'Authenticating...' : 'Authenticate & Save'}</span>
+                  <span>{authSubmitting ? 'Authenticating...' : authError ? 'Retry Authentication' : 'Authenticate & Save'}</span>
                 </button>
               </div>
             </form>

@@ -520,7 +520,7 @@ func (e *Engine) executeDeviceAction(
 		return res
 	}
 
-	dev, ok := e.store.GetDevice(dp.DeviceID)
+	dev, ok := e.store.GetDeviceDecrypted(dp.DeviceID)
 	if !ok {
 		res.Status = DeviceStatusFailed
 		res.Message = "Device not found in store"

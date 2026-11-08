@@ -29,7 +29,7 @@ func (h *HikvisionAdapter) Vendor() models.Manufacturer {
 }
 
 func (h *HikvisionAdapter) getClient(username, password string) *http.Client {
-	return httpauth.NewClient(username, password, 6*time.Second, true)
+	return httpauth.NewClient(username, password, 3*time.Second, true)
 }
 
 func (h *HikvisionAdapter) doRequest(method, urlStr, bodyStr, username, password string) (string, error) {

@@ -65,11 +65,12 @@ export const LiveView: React.FC<LiveViewProps> = ({ devices, selectedDevice }) =
         password: camPassword,
       });
       setAuthResult(res);
-      // Restart the stream immediately with the new credentials
-      const currentStreamType = tileStates[authTargetDev.id]?.streamType || 'sub';
-      initDeviceStream(authTargetDev, currentStreamType);
-      if (!res.authenticated) {
-        setAuthError(res.error_message || 'Camera rejected credentials (check password)');
+      if (res.authenticated) {
+        // Restart the stream immediately with the newly validated credentials
+        const currentStreamType = tileStates[authTargetDev.id]?.streamType || 'sub';
+        initDeviceStream(authTargetDev, currentStreamType);
+      } else {
+        setAuthError(res.error_message || 'Camera rejected credentials (401 Unauthorized: please verify username and password)');
       }
     } catch (err: any) {
       setAuthError(err.message || 'Authentication request failed');
@@ -756,7 +757,7 @@ export const LiveView: React.FC<LiveViewProps> = ({ devices, selectedDevice }) =
                   className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg text-xs flex items-center space-x-1.5 transition-colors disabled:bg-slate-700"
                 >
                   <Lock className="w-3.5 h-3.5" />
-                  <span>{authSubmitting ? 'Authenticating...' : 'Authenticate & Start Stream'}</span>
+                  <span>{authSubmitting ? 'Authenticating...' : authError ? 'Retry Authentication' : 'Authenticate & Start Stream'}</span>
                 </button>
               </div>
             </form>

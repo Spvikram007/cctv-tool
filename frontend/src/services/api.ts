@@ -49,25 +49,40 @@ async function request<T>(endpoint: string, options?: RequestInit): Promise<T> {
     }
   }
 
-  // Pure cookie-based browser session: credentials: 'include' automatically transmits HttpOnly sentinel_session
-  const res = await fetch(`${BASE_URL}${endpoint}`, {
-    ...options,
-    credentials: 'include',
-    headers,
-  });
-  if (!res.ok) {
-    let errMessage = 'Request failed';
-    try {
-      const errData = await res.json();
-      errMessage = (typeof errData.error === 'object' && errData.error?.message) 
-        ? errData.error.message 
-        : (errData.error || errData.message || res.statusText);
-    } catch {
-      errMessage = await res.text();
+  // Active client-side timeout: prevent any API call from stalling or hanging indefinitely
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 8000);
+
+  try {
+    // Pure cookie-based browser session: credentials: 'include' automatically transmits HttpOnly sentinel_session
+    const res = await fetch(`${BASE_URL}${endpoint}`, {
+      ...options,
+      signal: options?.signal || controller.signal,
+      credentials: 'include',
+      headers,
+    });
+    clearTimeout(timeoutId);
+
+    if (!res.ok) {
+      let errMessage = 'Request failed';
+      try {
+        const errData = await res.json();
+        errMessage = (typeof errData.error === 'object' && errData.error?.message) 
+          ? errData.error.message 
+          : (errData.error || errData.message || res.statusText);
+      } catch {
+        errMessage = await res.text();
+      }
+      throw new Error(errMessage);
     }
-    throw new Error(errMessage);
+    return res.json();
+  } catch (err: any) {
+    clearTimeout(timeoutId);
+    if (err.name === 'AbortError') {
+      throw new Error('Request timed out: backend or camera endpoint did not respond within 8 seconds');
+    }
+    throw err;
   }
-  return res.json();
 }
 
 export const api = {

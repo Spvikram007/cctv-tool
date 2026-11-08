@@ -42,7 +42,7 @@ func (e *Engine) GetCapabilities(deviceID string) (*PTZCapabilities, error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	dev, ok := e.store.GetDevice(deviceID)
+	dev, ok := e.store.GetDeviceDecrypted(deviceID)
 	if !ok {
 		return nil, fmt.Errorf("device %s not found in inventory", deviceID)
 	}
@@ -127,7 +127,7 @@ func (e *Engine) ContinuousMove(deviceID string, pan, tilt, zoom, speed float64,
 		speed = 1.0
 	}
 
-	dev, ok := e.store.GetDevice(deviceID)
+	dev, ok := e.store.GetDeviceDecrypted(deviceID)
 	if !ok {
 		return fmt.Errorf("device %s not found in inventory", deviceID)
 	}
@@ -199,7 +199,7 @@ func (e *Engine) RelativeMove(deviceID string, panStep, tiltStep, zoomStep float
 		return ErrPTZNotSupported
 	}
 
-	dev, ok := e.store.GetDevice(deviceID)
+	dev, ok := e.store.GetDeviceDecrypted(deviceID)
 	if !ok {
 		return fmt.Errorf("device %s not found in inventory", deviceID)
 	}
@@ -239,7 +239,7 @@ func (e *Engine) AbsoluteMove(deviceID string, panDeg, tiltDeg, zoomVal float64,
 		return ErrPTZNotSupported
 	}
 
-	dev, ok := e.store.GetDevice(deviceID)
+	dev, ok := e.store.GetDeviceDecrypted(deviceID)
 	if !ok {
 		return fmt.Errorf("device %s not found in inventory", deviceID)
 	}
@@ -271,7 +271,7 @@ func (e *Engine) AbsoluteMove(deviceID string, panDeg, tiltDeg, zoomVal float64,
 
 // Stop halts all active robotic pan, tilt, and zoom movements
 func (e *Engine) Stop(deviceID string, operator string) error {
-	dev, ok := e.store.GetDevice(deviceID)
+	dev, ok := e.store.GetDeviceDecrypted(deviceID)
 	if !ok {
 		return fmt.Errorf("device %s not found in inventory", deviceID)
 	}
@@ -304,7 +304,7 @@ func (e *Engine) FocusIris(deviceID string, req FocusIrisRequest, operator strin
 		return ErrPTZNotSupported
 	}
 
-	dev, ok := e.store.GetDevice(deviceID)
+	dev, ok := e.store.GetDeviceDecrypted(deviceID)
 	if !ok {
 		return fmt.Errorf("device %s not found in inventory", deviceID)
 	}
@@ -388,7 +388,7 @@ func (e *Engine) CreatePreset(deviceID string, presetID int, name string, operat
 		name = fmt.Sprintf("Preset %d", presetID)
 	}
 
-	dev, ok := e.store.GetDevice(deviceID)
+	dev, ok := e.store.GetDeviceDecrypted(deviceID)
 	if !ok {
 		return nil, fmt.Errorf("device %s not found in inventory", deviceID)
 	}
@@ -433,7 +433,7 @@ func (e *Engine) GotoPreset(deviceID string, presetID int, speed float64, operat
 		return ErrPTZNotSupported
 	}
 
-	dev, ok := e.store.GetDevice(deviceID)
+	dev, ok := e.store.GetDeviceDecrypted(deviceID)
 	if !ok {
 		return fmt.Errorf("device %s not found in inventory", deviceID)
 	}
@@ -687,7 +687,7 @@ func (e *Engine) AutoScan(deviceID string, enabled bool, operator string) error 
 
 // Internal helper for capability inspection without mutex re-entry deadlock
 func (e *Engine) getCapabilitiesInternal(deviceID string) (*PTZCapabilities, error) {
-	dev, ok := e.store.GetDevice(deviceID)
+	dev, ok := e.store.GetDeviceDecrypted(deviceID)
 	if !ok {
 		return nil, fmt.Errorf("device %s not found in inventory", deviceID)
 	}

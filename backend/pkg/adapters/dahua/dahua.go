@@ -29,7 +29,7 @@ func (d *DahuaAdapter) Vendor() models.Manufacturer {
 }
 
 func (d *DahuaAdapter) getClient(username, password string) *http.Client {
-	return httpauth.NewClient(username, password, 6*time.Second, true)
+	return httpauth.NewClient(username, password, 3*time.Second, true)
 }
 
 func (d *DahuaAdapter) doRequest(endpoint string, targetIP string, port int, username, password string) (string, error) {
@@ -123,7 +123,11 @@ func (d *DahuaAdapter) Detect(targetIP string, port int, username, password stri
 }
 
 func (d *DahuaAdapter) Authenticate(dev *models.Device) (*models.AuthStatus, error) {
-	resp, err := d.doRequest("/cgi-bin/magicBox.cgi?action=getSystemInfo", dev.IP, dev.Port, dev.Username, dev.Password)
+	port := dev.Port
+	if port <= 0 {
+		port = 80
+	}
+	resp, err := d.doRequest("/cgi-bin/magicBox.cgi?action=getSystemInfo", dev.IP, port, dev.Username, dev.Password)
 	if err != nil {
 		return &models.AuthStatus{
 			DeviceID:      dev.ID,

@@ -165,7 +165,7 @@ func CaptureFromRTSP(rtspURL, username, password string, timeout time.Duration) 
 
 // CaptureSnapshot coordinates vendor adapter, ONVIF, and RTSP fallback to retrieve a genuine snapshot
 func (e *Engine) CaptureSnapshot(deviceID string) (*SnapshotMetadata, []byte, error) {
-	dev, ok := e.store.GetDevice(deviceID)
+	dev, ok := e.store.GetDeviceDecrypted(deviceID)
 	if !ok {
 		return nil, nil, ErrDeviceNotFound
 	}
