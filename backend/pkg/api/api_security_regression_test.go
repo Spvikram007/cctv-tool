@@ -254,7 +254,7 @@ func TestSecurityFirstRunSetupLockdown(t *testing.T) {
 	badTokenBody := map[string]string{
 		"setup_token": "sent-setup-0000000000000000000000000000000000000000000000000000000000000000",
 		"username":    "admin",
-		"password":    "Admin@Sentinel2026!",
+		"password":    "TestOperator#Pass2026!",
 		"full_name":   "System Admin",
 		"email":       "admin@sentinel.internal",
 	}

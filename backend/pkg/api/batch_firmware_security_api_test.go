@@ -67,14 +67,14 @@ func TestPhase5BatchFirmwareSecurityAPIE2E(t *testing.T) {
 
 	// 0. Complete initial first-run setup
 	setupToken := rbacMgr.GetSetupToken()
-	if err := rbacMgr.CompleteSetup(setupToken, "admin", "Admin@Sentinel2026!", "Administrator", "admin@sentinel.internal"); err != nil {
+	if err := rbacMgr.CompleteSetup(setupToken, "admin", "TestOperator#Pass2026!", "Administrator", "admin@sentinel.internal"); err != nil {
 		t.Fatalf("failed to complete setup: %v", err)
 	}
 
 	// 1. Test Security Login (RBAC)
 	loginReq := map[string]string{
 		"username": "admin",
-		"password": "Admin@Sentinel2026!",
+		"password": "TestOperator#Pass2026!",
 	}
 	b, _ := json.Marshal(loginReq)
 	reqLogin, _ := http.NewRequest("POST", ts.URL+"/api/v1/security/login", bytes.NewReader(b))

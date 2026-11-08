@@ -27,7 +27,7 @@ export const Discovery: React.FC<DiscoveryProps> = ({ onDeviceEnrolled }) => {
   const [cidr, setCidr] = useState('192.168.31.0/24');
   const [portsStr, setPortsStr] = useState('80, 554, 8000, 37777, 8080, 8001, 8899, 34567');
   const [username, setUsername] = useState('admin');
-  const [password, setPassword] = useState('Admin@123');
+  const [password, setPassword] = useState('');
 
   const [activeJobID, setActiveJobID] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
@@ -318,7 +318,7 @@ export const Discovery: React.FC<DiscoveryProps> = ({ onDeviceEnrolled }) => {
             />
           </div>
           <div>
-            <label className="block text-[10px] font-mono text-slate-400 mb-0.5">DEFAULT AUTH PASSWORD</label>
+            <label className="block text-[10px] font-mono text-slate-400 mb-0.5">CAMERA AUTH PASSWORD</label>
             <input
               type="password"
               value={password}

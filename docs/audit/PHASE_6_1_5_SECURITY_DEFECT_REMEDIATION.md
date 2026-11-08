@@ -70,6 +70,36 @@ Phase 6.1.5 addresses four critical security defects identified during repositor
   - Replaced browser `alert()` calls in `Calculators.tsx` with non-blocking inline error banners.
   - Modal includes dismiss backdrop and `X` close button to ensure non-blocking user navigation.
 
+### 2.6 Defect 5: Complete Removal of Hardcoded Default Credentials
+- **Files:** `frontend/src/components/AuthModal.tsx`, `frontend/src/pages/Discovery.tsx`, `backend/pkg/security/security_test.go`, `backend/pkg/api/batch_firmware_security_api_test.go`, `backend/pkg/api/api_security_regression_test.go`, `backend/pkg/api/authorization_matrix_test.go`
+- **Remediation:**
+  - Removed all "Fill Default Credentials" buttons and preset password hints.
+  - Removed all occurrences of hardcoded passwords (`Admin@Sentinel2026!`) in operational code and test suite setups.
+  - System enforces first-run administrator initialization using the one-time `sentinel-setup.token` generated cryptographically to the server host filesystem with operator-chosen master passwords meeting enterprise complexity (10+ characters, mixed case, numbers, special characters).
+  - Retained strict negative security test `TestNoDefaultCredentials` in `backend/pkg/security/security_test.go` verifying that no default accounts or default passwords can authenticate.
+
+### 2.7 Defect 6: Strict HTTP Origin Header Enforcement & Negative Security Testing
+- **Files:** `backend/pkg/api/api.go`, `frontend/src/services/api.ts`, `backend/pkg/api/authorization_matrix_test.go`
+- **Remediation:**
+  - Removed `extractRequestOrigin()` which previously fell back to `X-Sentinel-Origin` and `Referer`.
+  - Enforced that cookie-authenticated state-changing browser requests (`POST`, `PUT`, `DELETE`, `PATCH`) and browser logins require the genuine HTTP `Origin` header ONLY, verified against the strict configured allowlist (`http://localhost:5173`, `http://127.0.0.1:5173`, `http://localhost:8080`, `http://127.0.0.1:8080`).
+  - Removed client-side `X-Sentinel-Origin` injection from `frontend/src/services/api.ts`.
+  - Implemented exhaustive negative security tests proving:
+    - Missing Origin + Valid CSRF -> HTTP 403 `CSRF_MISSING_ORIGIN`
+    - Untrusted Origin + Valid CSRF -> HTTP 403 `CSRF_UNTRUSTED_ORIGIN`
+    - Missing Origin + `X-Sentinel-Origin` -> HTTP 403 `CSRF_MISSING_ORIGIN` (header fallback forbidden)
+    - Missing Origin + `Referer` -> HTTP 403 `CSRF_MISSING_ORIGIN` (referer fallback forbidden)
+    - Valid Origin + Missing CSRF -> HTTP 403 `CSRF_TOKEN_INVALID`
+    - Valid Origin + Invalid CSRF -> HTTP 403 `CSRF_TOKEN_INVALID`
+    - Valid Origin + Valid CSRF -> HTTP 200 `OK`
+    - Browser Login without Origin -> HTTP 403 `CSRF_MISSING_ORIGIN`
+    - Browser Login with Untrusted Origin -> HTTP 403 `CSRF_UNTRUSTED_ORIGIN`
+    - Browser Login with `X-Sentinel-Origin` alone -> HTTP 403 `CSRF_MISSING_ORIGIN`
+    - Browser Login with `Referer` alone -> HTTP 403 `CSRF_MISSING_ORIGIN`
+    - Desktop Login (`X-Client-Type: desktop`) -> HTTP 200 `OK` (native non-browser client exempt)
+    - Session Expiry -> HTTP 401 `SESSION_EXPIRED`
+    - Session Revocation -> HTTP 401 `UNAUTHORIZED`
+
 ---
 
 ## 3. Comprehensive Verification Matrix & Raw Output

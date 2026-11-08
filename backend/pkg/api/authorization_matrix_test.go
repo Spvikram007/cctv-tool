@@ -124,9 +124,9 @@ func TestAuthMatrix_CookieSessionAndRevocation(t *testing.T) {
 
 	// Complete initial setup
 	setupToken := rbacMgr.GetSetupToken()
-	_ = rbacMgr.CompleteSetup(setupToken, "admin_user", "AdminSec@Sentinel2026!", "Admin User", "admin@sentinel.io")
+	_ = rbacMgr.CompleteSetup(setupToken, "admin_user", "TestMatrixAdmin#2026!", "Admin User", "admin@sentinel.io")
 
-	loginBody := `{"username":"admin_user","password":"AdminSec@Sentinel2026!"}`
+	loginBody := `{"username":"admin_user","password":"TestMatrixAdmin#2026!"}`
 
 	// 1. Browser login without Origin must fail closed with 403 CSRF_MISSING_ORIGIN
 	loginNoOrigin := httptest.NewRequest("POST", "/api/v1/security/login", strings.NewReader(loginBody))
@@ -135,6 +135,26 @@ func TestAuthMatrix_CookieSessionAndRevocation(t *testing.T) {
 	handler.ServeHTTP(recNoOrigin, loginNoOrigin)
 	if recNoOrigin.Code != http.StatusForbidden || !strings.Contains(recNoOrigin.Body.String(), "CSRF_MISSING_ORIGIN") {
 		t.Fatalf("expected 403 CSRF_MISSING_ORIGIN for browser login without Origin, got %d: %s", recNoOrigin.Code, recNoOrigin.Body.String())
+	}
+
+	// 1a. Browser login with X-Sentinel-Origin alone (no Origin) must fail closed with 403 CSRF_MISSING_ORIGIN
+	loginXOrigin := httptest.NewRequest("POST", "/api/v1/security/login", strings.NewReader(loginBody))
+	loginXOrigin.Header.Set("Content-Type", "application/json")
+	loginXOrigin.Header.Set("X-Sentinel-Origin", "http://localhost:5173")
+	recXOrigin := httptest.NewRecorder()
+	handler.ServeHTTP(recXOrigin, loginXOrigin)
+	if recXOrigin.Code != http.StatusForbidden || !strings.Contains(recXOrigin.Body.String(), "CSRF_MISSING_ORIGIN") {
+		t.Fatalf("expected 403 CSRF_MISSING_ORIGIN for browser login with X-Sentinel-Origin alone, got %d: %s", recXOrigin.Code, recXOrigin.Body.String())
+	}
+
+	// 1b. Browser login with Referer alone (no Origin) must fail closed with 403 CSRF_MISSING_ORIGIN
+	loginReferer := httptest.NewRequest("POST", "/api/v1/security/login", strings.NewReader(loginBody))
+	loginReferer.Header.Set("Content-Type", "application/json")
+	loginReferer.Header.Set("Referer", "http://localhost:5173/dashboard")
+	recReferer := httptest.NewRecorder()
+	handler.ServeHTTP(recReferer, loginReferer)
+	if recReferer.Code != http.StatusForbidden || !strings.Contains(recReferer.Body.String(), "CSRF_MISSING_ORIGIN") {
+		t.Fatalf("expected 403 CSRF_MISSING_ORIGIN for browser login with Referer alone, got %d: %s", recReferer.Code, recReferer.Body.String())
 	}
 
 	// 2. Browser login with untrusted Origin must fail with 403 CSRF_UNTRUSTED_ORIGIN
@@ -841,6 +861,28 @@ func TestAuthMatrix_CSRFProtection(t *testing.T) {
 
 	if recAlt.Code != http.StatusOK {
 		t.Errorf("Cookie POST with X-Sentinel-CSRF must succeed (200), got %d: %s", recAlt.Code, recAlt.Body.String())
+	}
+
+	// 9.6a Missing Origin + X-Sentinel-Origin supplied must be REJECTED (403 CSRF_MISSING_ORIGIN)
+	reqXOrigin := httptest.NewRequest("POST", "/api/v1/alarms/rules", strings.NewReader(bodyRule))
+	reqXOrigin.AddCookie(&http.Cookie{Name: "sentinel_session", Value: token})
+	reqXOrigin.Header.Set("X-Sentinel-Origin", "http://localhost:5173")
+	reqXOrigin.Header.Set("X-CSRF-Token", csrfToken)
+	recXOrigin := httptest.NewRecorder()
+	handler.ServeHTTP(recXOrigin, reqXOrigin)
+	if recXOrigin.Code != http.StatusForbidden || !strings.Contains(recXOrigin.Body.String(), "CSRF_MISSING_ORIGIN") {
+		t.Errorf("Missing Origin with X-Sentinel-Origin supplied must return 403 CSRF_MISSING_ORIGIN, got %d: %s", recXOrigin.Code, recXOrigin.Body.String())
+	}
+
+	// 9.6b Missing Origin + Referer supplied must be REJECTED (403 CSRF_MISSING_ORIGIN)
+	reqReferer := httptest.NewRequest("POST", "/api/v1/alarms/rules", strings.NewReader(bodyRule))
+	reqReferer.AddCookie(&http.Cookie{Name: "sentinel_session", Value: token})
+	reqReferer.Header.Set("Referer", "http://localhost:5173/dashboard")
+	reqReferer.Header.Set("X-CSRF-Token", csrfToken)
+	recReferer := httptest.NewRecorder()
+	handler.ServeHTTP(recReferer, reqReferer)
+	if recReferer.Code != http.StatusForbidden || !strings.Contains(recReferer.Body.String(), "CSRF_MISSING_ORIGIN") {
+		t.Errorf("Missing Origin with Referer supplied must return 403 CSRF_MISSING_ORIGIN, got %d: %s", recReferer.Code, recReferer.Body.String())
 	}
 
 	// 9.7 Comprehensive Method Matrix: POST, PUT, PATCH, DELETE require Origin and CSRF

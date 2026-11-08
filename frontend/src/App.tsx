@@ -34,18 +34,8 @@ export const App: React.FC = () => {
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
 
   useEffect(() => {
-    // Initial setup and session check
-    api.getSetupStatus()
-      .then((setup) => {
-        if (setup.setup_required) {
-          setIsAuthModalOpen(true);
-        } else {
-          loadAllData();
-        }
-      })
-      .catch(() => {
-        loadAllData();
-      });
+    // Initial data load
+    loadAllData();
 
     const interval = setInterval(() => {
       if (session) {

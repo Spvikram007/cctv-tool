@@ -41,11 +41,6 @@ async function request<T>(endpoint: string, options?: RequestInit): Promise<T> {
     ...(options?.headers as Record<string, string>),
   };
 
-  // Explicit Origin tracking for browser environments
-  if (typeof window !== 'undefined' && window.location && window.location.origin) {
-    headers['X-Sentinel-Origin'] = window.location.origin;
-  }
-
   // CSRF Protection: Attach anti-CSRF token to all state-changing requests
   if (['POST', 'PUT', 'DELETE', 'PATCH'].includes(method)) {
     const csrf = getCsrfToken();

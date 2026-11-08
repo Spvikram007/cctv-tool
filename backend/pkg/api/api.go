@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -267,22 +266,6 @@ func (s *Server) isOriginAllowed(origin string) bool {
 	return s.allowedOrigins[origin]
 }
 
-func (s *Server) extractRequestOrigin(r *http.Request) string {
-	origin := r.Header.Get("Origin")
-	if origin != "" {
-		return origin
-	}
-	if xOrigin := r.Header.Get("X-Sentinel-Origin"); xOrigin != "" {
-		return xOrigin
-	}
-	if ref := r.Header.Get("Referer"); ref != "" {
-		if u, err := url.Parse(ref); err == nil && u.Scheme != "" && u.Host != "" {
-			return fmt.Sprintf("%s://%s", u.Scheme, u.Host)
-		}
-	}
-	return ""
-}
-
 func (s *Server) checkPermission(r *http.Request, perm security.Permission) bool {
 	sess := getSession(r)
 	if sess == nil {
@@ -313,7 +296,7 @@ func (s *Server) requireAuth(perm security.Permission, handler http.HandlerFunc)
 
 		// CSRF & Strict Origin Protection for cookie-authenticated state-changing requests
 		if fromCookie && (r.Method == "POST" || r.Method == "PUT" || r.Method == "DELETE" || r.Method == "PATCH") {
-			origin := s.extractRequestOrigin(r)
+			origin := r.Header.Get("Origin")
 			if origin == "" {
 				writeError(w, r, http.StatusForbidden, "CSRF_MISSING_ORIGIN", "Origin header required for cookie-authenticated state-changing requests")
 				return
@@ -2048,12 +2031,12 @@ func (s *Server) handleSecurityLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	origin := s.extractRequestOrigin(r)
+	origin := r.Header.Get("Origin")
 	clientType := r.Header.Get("X-Client-Type")
 
 	// Login Origin Policy:
 	// 1. Native desktop and CLI clients (X-Client-Type: desktop) are exempt from requiring Origin.
-	// 2. Browser login requests MUST supply an Origin, X-Sentinel-Origin, or valid Referer header matching trusted origins to prevent Login CSRF.
+	// 2. Browser login requests MUST supply an actual HTTP Origin header matching trusted origins to prevent Login CSRF.
 	if clientType != "desktop" {
 		if origin == "" {
 			writeError(w, r, http.StatusForbidden, "CSRF_MISSING_ORIGIN", "Origin header required for browser login")
@@ -2125,7 +2108,7 @@ func (s *Server) handleSecurityLogout(w http.ResponseWriter, r *http.Request) {
 
 	// Origin protection for cookie-authenticated logout to prevent Logout CSRF
 	if fromCookie {
-		origin := s.extractRequestOrigin(r)
+		origin := r.Header.Get("Origin")
 		if origin == "" {
 			writeError(w, r, http.StatusForbidden, "CSRF_MISSING_ORIGIN", "Origin header required for cookie-authenticated logout")
 			return

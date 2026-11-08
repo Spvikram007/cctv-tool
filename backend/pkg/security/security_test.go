@@ -43,7 +43,7 @@ func TestFirstRunSetupLifecycle(t *testing.T) {
 	}
 
 	// 2. Reject invalid setup token
-	err := rbac.CompleteSetup("sent-setup-invalid-token", "admin", "Admin@Sentinel2026!", "Admin", "admin@tds.in")
+	err := rbac.CompleteSetup("sent-setup-invalid-token", "admin", "TestOperator#Pass2026!", "Admin", "admin@tds.in")
 	if err != security.ErrInvalidSetupToken {
 		t.Fatalf("expected ErrInvalidSetupToken, got %v", err)
 	}
@@ -55,7 +55,7 @@ func TestFirstRunSetupLifecycle(t *testing.T) {
 	}
 
 	// 4. Accept valid administrator creation
-	validAdminPass := "Admin@Sentinel2026!"
+	validAdminPass := "TestOperator#Pass2026!"
 	err = rbac.CompleteSetup(setupTok, "admin", validAdminPass, "Lead Architect", "admin@tds.in")
 	if err != nil {
 		t.Fatalf("valid admin setup failed: %v", err)
@@ -99,7 +99,7 @@ func TestFirstRunSetupLifecycle(t *testing.T) {
 func TestArgon2idParameterLimitsAndDoSResistance(t *testing.T) {
 	rbac := security.NewRBACManager()
 	tok := rbac.GetSetupToken()
-	_ = rbac.CompleteSetup(tok, "admin", "Admin@Sentinel2026!", "Admin", "admin@tds.in")
+	_ = rbac.CompleteSetup(tok, "admin", "TestOperator#Pass2026!", "Admin", "admin@tds.in")
 
 	// 1. Create a user with legacy SHA-256 hash and verify rehash
 	legacyUser := "legacy_user"
@@ -133,9 +133,9 @@ func TestArgon2idParameterLimitsAndDoSResistance(t *testing.T) {
 func TestSessionValidationAndRevocation(t *testing.T) {
 	rbac := security.NewRBACManager()
 	tok := rbac.GetSetupToken()
-	_ = rbac.CompleteSetup(tok, "admin", "Admin@Sentinel2026!", "Admin", "admin@tds.in")
+	_ = rbac.CompleteSetup(tok, "admin", "TestOperator#Pass2026!", "Admin", "admin@tds.in")
 
-	sess, err := rbac.Authenticate("admin", "Admin@Sentinel2026!", 1*time.Second)
+	sess, err := rbac.Authenticate("admin", "TestOperator#Pass2026!", 1*time.Second)
 	if err != nil {
 		t.Fatalf("auth failed: %v", err)
 	}
