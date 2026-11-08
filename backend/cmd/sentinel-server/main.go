@@ -177,6 +177,7 @@ func main() {
 	firmwareEng := firmware.NewEngine(store, registry, logger, "./data/firmware")
 	recorderEng := recorder.NewEngine(store, logger)
 	rbacMgr := security.NewRBACManager()
+	rbacMgr.SetStore(store)
 
 	// 6. REST API Server
 	apiServer := api.NewServer(store, registry, configEng, discoveryEng, licenseMgr, logger, snapshotEng, streamHub, batchEng, firmwareEng, rbacMgr, recorderEng)

@@ -5,9 +5,11 @@ import (
 	"log"
 	"os"
 	"time"
+
+	"cctv-sentinel/pkg/security"
 )
 
-const CurrentSchemaVersion = 2
+const CurrentSchemaVersion = 3
 
 // Migration represents a versioned database migration
 type Migration struct {
@@ -68,6 +70,26 @@ func (s *Store) GetMigrations() []Migration {
 			Rollback: func(s *Store) error {
 				log.Printf("[MIGRATION] Rolling back schema v2: clearing encrypted credentials table")
 				s.EncryptedCredentials = make(map[string]string)
+				return nil
+			},
+		},
+		{
+			Version:     3,
+			Description: "Persistent desktop device registry and user accounts",
+			Apply: func(s *Store) error {
+				if s.DesktopDevices == nil {
+					s.DesktopDevices = make(map[string]security.DesktopDeviceRecord)
+				}
+				if s.Users == nil {
+					s.Users = make(map[string]security.UserAccount)
+				}
+				log.Printf("[MIGRATION] Schema v3 applied: initialized persistent desktop devices and user registries")
+				return nil
+			},
+			Rollback: func(s *Store) error {
+				log.Printf("[MIGRATION] Rolling back schema v3: clearing desktop devices and user tables")
+				s.DesktopDevices = make(map[string]security.DesktopDeviceRecord)
+				s.Users = make(map[string]security.UserAccount)
 				return nil
 			},
 		},

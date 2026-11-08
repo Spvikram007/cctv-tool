@@ -189,6 +189,7 @@ type Session struct {
 	IsGlobalAdmin bool      `json:"is_global_admin,omitempty"`
 	Scopes        []string  `json:"scopes,omitempty"`
 	CSRFToken     string    `json:"csrf_token,omitempty"`
+	DeviceID      string    `json:"device_id,omitempty"`
 	CreatedAt     time.Time `json:"created_at"`
 	ExpiresAt     time.Time `json:"expires_at"`
 }
@@ -209,9 +210,17 @@ func (s *Session) HasScope(scope string) bool {
 	return false
 }
 
+// UserStore defines persistent storage for user accounts
+type UserStore interface {
+	SaveUser(user UserAccount) error
+	ListUsers() []UserAccount
+	DeleteUser(username string) error
+}
+
 // RBACManager handles user authentication, role checks, session tokens, and first-run setup
 type RBACManager struct {
 	mu                 sync.RWMutex
+	store              UserStore
 	users              map[string]*UserAccount
 	sessions           map[string]*Session
 	argon2Config       *Argon2Params
@@ -262,6 +271,24 @@ func NewRBACManager() *RBACManager {
 	return mgr
 }
 
+// SetStore configures persistent user storage and loads existing accounts
+func (m *RBACManager) SetStore(store UserStore) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.store = store
+	if store != nil {
+		for _, u := range store.ListUsers() {
+			userCopy := u
+			m.users[u.Username] = &userCopy
+		}
+		if len(m.users) > 0 {
+			m.setupMode = false
+			m.setupToken = ""
+			_ = os.Remove(m.setupTokenFilePath)
+		}
+	}
+}
+
 // initSetupToken creates a cryptographically secure one-time token for first-run admin provisioning
 func (m *RBACManager) initSetupToken() {
 	tokBytes := make([]byte, 32)
@@ -274,9 +301,11 @@ func (m *RBACManager) initSetupToken() {
 	m.setupToken = fmt.Sprintf("sent-setup-%s", hex.EncodeToString(tokBytes))
 	m.setupTokenExpires = time.Now().UTC().Add(24 * time.Hour)
 
-	// Securely persist to local token file with restricted permissions (0600)
+	// Securely persist to local token file with restricted permissions (0600 on Unix, icacls on Windows)
 	if err := os.WriteFile(m.setupTokenFilePath, []byte(m.setupToken+"\n"), 0600); err != nil {
 		fmt.Printf("[SECURITY] Notice: could not write setup token file (%v)\n", err)
+	} else {
+		_ = RestrictFilePermissions(m.setupTokenFilePath)
 	}
 }
 
@@ -311,6 +340,7 @@ func (m *RBACManager) RegenerateSetupToken() (string, error) {
 	if err := os.WriteFile(m.setupTokenFilePath, []byte(m.setupToken+"\n"), 0600); err != nil {
 		return "", fmt.Errorf("failed to write setup token file: %w", err)
 	}
+	_ = RestrictFilePermissions(m.setupTokenFilePath)
 
 	return m.setupToken, nil
 }
@@ -387,6 +417,9 @@ func (m *RBACManager) CompleteSetup(token, username, password, fullName, email s
 	}
 
 	m.users[username] = u
+	if m.store != nil {
+		_ = m.store.SaveUser(*u)
+	}
 
 	// Permanently disable setup mode and erase token
 	m.setupMode = false
@@ -475,6 +508,15 @@ func (m *RBACManager) CreateUser(username, password, fullName string, role Role,
 
 // Authenticate verifies credentials with Argon2id and rehashes legacy passwords without holding global locks during computation
 func (m *RBACManager) Authenticate(username, password string, ttl time.Duration) (*Session, error) {
+	return m.authenticateInternal(username, password, "", ttl)
+}
+
+// AuthenticateDesktop verifies credentials and binds the resulting bearer session to a specific native desktop device ID
+func (m *RBACManager) AuthenticateDesktop(username, password, deviceID string, ttl time.Duration) (*Session, error) {
+	return m.authenticateInternal(username, password, deviceID, ttl)
+}
+
+func (m *RBACManager) authenticateInternal(username, password, deviceID string, ttl time.Duration) (*Session, error) {
 	// 1. Read user record under Read Lock
 	m.mu.RLock()
 	user, exists := m.users[username]
@@ -611,12 +653,31 @@ func (m *RBACManager) Authenticate(username, password string, ttl time.Duration)
 		IsGlobalAdmin: currentUser.IsGlobalAdmin,
 		Scopes:        append([]string(nil), currentUser.Scopes...),
 		CSRFToken:     csrfToken,
+		DeviceID:      deviceID,
 		CreatedAt:     now,
 		ExpiresAt:     now.Add(ttl),
 	}
 
 	m.sessions[token] = sess
 	return sess, nil
+}
+
+// RevokeDeviceSessions immediately terminates all active bearer sessions associated with a specific native client device ID
+func (m *RBACManager) RevokeDeviceSessions(deviceID string) int {
+	if strings.TrimSpace(deviceID) == "" {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	revokedCount := 0
+	for token, sess := range m.sessions {
+		if sess.DeviceID == deviceID {
+			delete(m.sessions, token)
+			revokedCount++
+		}
+	}
+	return revokedCount
 }
 
 // ValidateSession inspects a bearer session token

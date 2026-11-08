@@ -251,3 +251,41 @@ func TestCookieSecurity_ExtractionHelpers(t *testing.T) {
 		t.Errorf("Failed to extract __Host- CSRF token: got %s", tok)
 	}
 }
+
+func TestCookieSecurity_ProductionFailClosed(t *testing.T) {
+	// Test 1: Production with SENTINEL_SECURE_COOKIES=false must panic
+	t.Run("Production_DisableSecureCookies_MustPanic", func(t *testing.T) {
+		t.Setenv("SENTINEL_ENV", "production")
+		t.Setenv("SENTINEL_SECURE_COOKIES", "false")
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Fatalf("expected NewServer to panic when SENTINEL_SECURE_COOKIES=false in production")
+			}
+			msg := r.(string)
+			if !strings.Contains(msg, "FATAL SECURITY CONFIGURATION") || !strings.Contains(msg, "SENTINEL_SECURE_COOKIES") {
+				t.Errorf("unexpected panic message: %s", msg)
+			}
+		}()
+		_ = NewServer(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	})
+
+	// Test 2: Production with SENTINEL_COOKIE_HOST_PREFIX=false must panic
+	t.Run("Production_DisableHostPrefix_MustPanic", func(t *testing.T) {
+		t.Setenv("SENTINEL_ENV", "production")
+		t.Setenv("SENTINEL_SECURE_COOKIES", "true")
+		t.Setenv("SENTINEL_COOKIE_HOST_PREFIX", "false")
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Fatalf("expected NewServer to panic when SENTINEL_COOKIE_HOST_PREFIX=false in production")
+			}
+			msg := r.(string)
+			if !strings.Contains(msg, "FATAL SECURITY CONFIGURATION") || !strings.Contains(msg, "SENTINEL_COOKIE_HOST_PREFIX") {
+				t.Errorf("unexpected panic message: %s", msg)
+			}
+		}()
+		_ = NewServer(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	})
+}
+

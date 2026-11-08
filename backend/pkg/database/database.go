@@ -67,6 +67,8 @@ type Store struct {
 	Sites                map[string]Site                         `json:"sites"`
 	BatchJobs            map[string]BatchJob                     `json:"batch_jobs"`
 	Compatibility        []CompatibilityEntry                    `json:"compatibility"`
+	DesktopDevices       map[string]security.DesktopDeviceRecord `json:"desktop_devices"`
+	Users                map[string]security.UserAccount         `json:"users"`
 }
 
 func NewStore(filePath string) *Store {
@@ -96,6 +98,8 @@ func NewStoreWithVault(filePath string, vault *security.Vault) *Store {
 		Sites:                make(map[string]Site),
 		BatchJobs:            make(map[string]BatchJob),
 		Compatibility:        make([]CompatibilityEntry, 0),
+		DesktopDevices:       make(map[string]security.DesktopDeviceRecord),
+		Users:                make(map[string]security.UserAccount),
 	}
 
 	_ = s.load()
@@ -532,4 +536,108 @@ func (s *Store) GetCompatibility() []CompatibilityEntry {
 	res := make([]CompatibilityEntry, len(s.Compatibility))
 	copy(res, s.Compatibility)
 	return res
+}
+
+// Desktop Device Persistence (Schema v3)
+func (s *Store) UpsertDesktopDevice(dev security.DesktopDeviceRecord) error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.DesktopDevices == nil {
+		s.DesktopDevices = make(map[string]security.DesktopDeviceRecord)
+	}
+	s.DesktopDevices[dev.ID] = dev
+	return s.saveLocked()
+}
+
+func (s *Store) GetDesktopDevice(id string) (security.DesktopDeviceRecord, bool) {
+	if s == nil {
+		return security.DesktopDeviceRecord{}, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.DesktopDevices == nil {
+		return security.DesktopDeviceRecord{}, false
+	}
+	d, ok := s.DesktopDevices[id]
+	return d, ok
+}
+
+func (s *Store) ListDesktopDevices() []security.DesktopDeviceRecord {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	list := make([]security.DesktopDeviceRecord, 0, len(s.DesktopDevices))
+	for _, d := range s.DesktopDevices {
+		list = append(list, d)
+	}
+	return list
+}
+
+func (s *Store) DeleteDesktopDevice(id string) error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.DesktopDevices != nil {
+		delete(s.DesktopDevices, id)
+	}
+	return s.saveLocked()
+}
+
+// User Persistence (Schema v3)
+func (s *Store) SaveUser(user security.UserAccount) error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Users == nil {
+		s.Users = make(map[string]security.UserAccount)
+	}
+	s.Users[user.Username] = user
+	return s.saveLocked()
+}
+
+func (s *Store) GetUser(username string) (security.UserAccount, bool) {
+	if s == nil {
+		return security.UserAccount{}, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.Users == nil {
+		return security.UserAccount{}, false
+	}
+	u, ok := s.Users[username]
+	return u, ok
+}
+
+func (s *Store) ListUsers() []security.UserAccount {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	list := make([]security.UserAccount, 0, len(s.Users))
+	for _, u := range s.Users {
+		list = append(list, u)
+	}
+	return list
+}
+
+func (s *Store) DeleteUser(username string) error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Users != nil {
+		delete(s.Users, username)
+	}
+	return s.saveLocked()
 }

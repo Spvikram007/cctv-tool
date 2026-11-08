@@ -74,6 +74,15 @@ func NewServer(
 	rbacMgr *security.RBACManager,
 	recorderEngOpt ...*recorder.Engine,
 ) *Server {
+	// Fail-closed validation for production cookies: prevent silent or accidental security downgrade
+	if strings.ToLower(os.Getenv("SENTINEL_ENV")) == "production" {
+		if val := strings.ToLower(os.Getenv("SENTINEL_SECURE_COOKIES")); val == "false" || val == "0" {
+			panic("FATAL SECURITY CONFIGURATION: SENTINEL_SECURE_COOKIES cannot be disabled when SENTINEL_ENV=production")
+		}
+		if val := strings.ToLower(os.Getenv("SENTINEL_COOKIE_HOST_PREFIX")); val == "false" || val == "0" {
+			panic("FATAL SECURITY CONFIGURATION: SENTINEL_COOKIE_HOST_PREFIX cannot be disabled when SENTINEL_ENV=production")
+		}
+	}
 	if logger == nil {
 		logger = audit.NewLogger()
 	}
@@ -104,6 +113,9 @@ func NewServer(
 	if rbacMgr == nil {
 		rbacMgr = security.NewRBACManager()
 	}
+	if store != nil {
+		rbacMgr.SetStore(store)
+	}
 	var recorderEng *recorder.Engine
 	if len(recorderEngOpt) > 0 && recorderEngOpt[0] != nil {
 		recorderEng = recorderEngOpt[0]
@@ -114,7 +126,11 @@ func NewServer(
 	ptzEng := ptz.NewEngine(store, registry, logger)
 	eventMgr := events.NewEventManager(store, logger)
 	alarmEng := alarms.NewEngine(store, logger, snapshotEng, eventMgr)
-	desktopAuthMgr := security.NewDesktopAuthManager()
+	var deskStore security.DesktopDeviceStore
+	if store != nil {
+		deskStore = store
+	}
+	desktopAuthMgr := security.NewDesktopAuthManager(deskStore)
 
 	// Initial origin allowlist
 	allowedOrigins := make(map[string]bool)
@@ -678,29 +694,19 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/auth/csrf", s.handleSecurityCSRFToken)
 	s.mux.HandleFunc("/api/v1/security/csrf", s.handleSecurityCSRFToken)
 
-	// Native Desktop Client Authentication Routes (Challenge-Response Device Proof)
+	// Native Desktop Client Authentication Routes (Asymmetric Ed25519 Device Identity)
+	s.mux.HandleFunc("/api/v1/auth/desktop/enroll", s.handleDesktopEnroll)
+	s.mux.HandleFunc("/api/v1/security/desktop/enroll", s.handleDesktopEnroll)
 	s.mux.HandleFunc("/api/v1/auth/desktop/challenge", s.handleDesktopChallenge)
-	s.mux.HandleFunc("/api/v1/auth/desktop/login", s.handleDesktopLogin)
 	s.mux.HandleFunc("/api/v1/security/desktop/challenge", s.handleDesktopChallenge)
+	s.mux.HandleFunc("/api/v1/auth/desktop/login", s.handleDesktopLogin)
 	s.mux.HandleFunc("/api/v1/security/desktop/login", s.handleDesktopLogin)
-	s.mux.HandleFunc("/api/v1/auth/desktop/devices", s.requireAuth(security.PermUserManagement, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "POST" {
-			s.handleDesktopRegisterDevice(w, r)
-		} else if r.Method == "GET" {
-			s.handleDesktopListDevices(w, r)
-		} else {
-			writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
-		}
-	}))
-	s.mux.HandleFunc("/api/v1/security/desktop/devices", s.requireAuth(security.PermUserManagement, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "POST" {
-			s.handleDesktopRegisterDevice(w, r)
-		} else if r.Method == "GET" {
-			s.handleDesktopListDevices(w, r)
-		} else {
-			writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
-		}
-	}))
+
+	// Workstation Device Management Routes (Administrator Only)
+	s.mux.HandleFunc("/api/v1/auth/desktop/devices", s.requireAuth(security.PermUserManagement, s.handleDesktopListDevices))
+	s.mux.HandleFunc("/api/v1/security/desktop/devices", s.requireAuth(security.PermUserManagement, s.handleDesktopListDevices))
+	s.mux.HandleFunc("/api/v1/auth/desktop/devices/", s.requireAuth(security.PermUserManagement, s.handleDesktopDeviceActions))
+	s.mux.HandleFunc("/api/v1/security/desktop/devices/", s.requireAuth(security.PermUserManagement, s.handleDesktopDeviceActions))
 
 	// 1. System status
 	s.mux.HandleFunc("/api/v1/system/status", s.requireAuth(security.PermViewLive, func(w http.ResponseWriter, r *http.Request) {

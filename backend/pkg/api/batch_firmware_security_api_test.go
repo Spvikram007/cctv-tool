@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -74,14 +75,28 @@ func TestPhase5BatchFirmwareSecurityAPIE2E(t *testing.T) {
 		rbacMgr.RevokeSetupToken()
 	})
 
-	// 1. Test Native Desktop Authentication (Challenge-Response + RBAC)
-	dev, devKey, err := server.DesktopAuthManager().RegisterDevice("batch-test-client", "Batch Workstation")
+	// 1. Test Native Desktop Authentication (Asymmetric Ed25519 + RBAC)
+	pubKey, privKey, err := security.GenerateClientKeyPair()
 	if err != nil {
-		t.Fatalf("failed to register desktop device: %v", err)
+		t.Fatalf("failed to generate Ed25519 keypair: %v", err)
+	}
+	pubKeyB64 := base64.StdEncoding.EncodeToString(pubKey)
+
+	_, err = server.DesktopAuthManager().SubmitEnrollment(security.DesktopEnrollmentRequest{
+		ID:         "batch-test-client",
+		ClientName: "Batch Workstation",
+		PublicKey:  pubKeyB64,
+	})
+	if err != nil {
+		t.Fatalf("failed to enroll desktop device: %v", err)
+	}
+	_, err = server.DesktopAuthManager().ApproveDevice("batch-test-client", "admin")
+	if err != nil {
+		t.Fatalf("failed to approve desktop device: %v", err)
 	}
 
 	// 1a. Request Challenge
-	chPayload, _ := json.Marshal(map[string]string{"client_id": dev.ClientID})
+	chPayload, _ := json.Marshal(map[string]string{"device_id": "batch-test-client"})
 	reqCh, _ := http.NewRequest("POST", ts.URL+"/api/v1/security/desktop/challenge", bytes.NewReader(chPayload))
 	reqCh.Header.Set("Content-Type", "application/json")
 	respCh, err := client.Do(reqCh)
@@ -94,14 +109,14 @@ func TestPhase5BatchFirmwareSecurityAPIE2E(t *testing.T) {
 	_ = json.NewDecoder(respCh.Body).Decode(&chResp)
 	respCh.Body.Close()
 
-	// 1b. Compute Proof and Authenticate Desktop Session
-	proof := security.ComputeProofHelper(devKey, chResp.Challenge)
+	// 1b. Sign Challenge with Ed25519 private key and Authenticate Desktop Session
+	sig := security.SignChallenge(privKey, chResp.Challenge)
 	loginReq := map[string]string{
-		"client_id":    dev.ClientID,
-		"challenge":    chResp.Challenge,
-		"client_proof": proof,
-		"username":     "admin",
-		"password":     "TestOperator#Pass2026!",
+		"device_id": "batch-test-client",
+		"challenge": chResp.Challenge,
+		"signature": sig,
+		"username":  "admin",
+		"password":  "TestOperator#Pass2026!",
 	}
 	b, _ := json.Marshal(loginReq)
 	reqLogin, _ := http.NewRequest("POST", ts.URL+"/api/v1/security/desktop/login", bytes.NewReader(b))
