@@ -178,13 +178,13 @@ func ComputeDigestResponse(c *Challenge, username, password, method, uriStr stri
 }
 
 // GenerateCNonce generates a cryptographically random client nonce.
-// Fails securely: never substitutes deterministic or predictable nonces.
-func GenerateCNonce() string {
+// Fails securely: returns error if crypto/rand is unavailable; never panics.
+func GenerateCNonce() (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
-		panic(fmt.Sprintf("CRITICAL CRYPTOGRAPHIC FAILURE: crypto/rand unavailable for cnonce: %v", err))
+		return "", fmt.Errorf("cryptographic failure: crypto/rand unavailable for cnonce: %w", err)
 	}
-	return hex.EncodeToString(b)
+	return hex.EncodeToString(b), nil
 }
 
 // DigestTransport handles automatic challenge-response Digest and Basic HTTP authentication
@@ -222,7 +222,10 @@ func (t *DigestTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if cachedChallenge != nil {
 		reqClone := req.Clone(req.Context())
 		nc := atomic.AddUint32(&t.nonceCount, 1)
-		cnonce := GenerateCNonce()
+		cnonce, err := GenerateCNonce()
+		if err != nil {
+			return nil, fmt.Errorf("httpauth: preemptive digest cnonce generation failed: %w", err)
+		}
 		authHeader, err := ComputeDigestResponse(cachedChallenge, t.Username, t.Password, reqClone.Method, reqClone.URL.String(), nc, cnonce)
 		if err == nil {
 			reqClone.Header.Set("Authorization", authHeader)
@@ -287,7 +290,10 @@ func (t *DigestTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	nc := atomic.AddUint32(&t.nonceCount, 1)
 	t.mu.Unlock()
 
-	cnonce := GenerateCNonce()
+	cnonce, err := GenerateCNonce()
+	if err != nil {
+		return nil, fmt.Errorf("httpauth: digest challenge cnonce generation failed: %w", err)
+	}
 	digestHeader, err := ComputeDigestResponse(challenge, t.Username, t.Password, req.Method, req.URL.String(), nc, cnonce)
 	if err != nil {
 		return nil, err

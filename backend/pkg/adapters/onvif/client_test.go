@@ -25,7 +25,10 @@ func TestWSSecurityPasswordDigest(t *testing.T) {
 	}
 
 	cli := NewClient("192.168.1.100", 80, "admin", password)
-	securityXML := cli.GenerateWSSecurity()
+	securityXML, err := cli.GenerateWSSecurity()
+	if err != nil {
+		t.Fatalf("GenerateWSSecurity failed unexpectedly: %v", err)
+	}
 
 	if !strings.Contains(securityXML, "<wsse:Username>admin</wsse:Username>") {
 		t.Errorf("expected username admin in WS-Security header, got: %s", securityXML)
@@ -47,7 +50,10 @@ func TestClockSkewCompensation(t *testing.T) {
 	deviceAheadSkew := 1 * time.Hour
 	cli.clockSkew = deviceAheadSkew
 
-	secXML := cli.GenerateWSSecurity()
+	secXML, err := cli.GenerateWSSecurity()
+	if err != nil {
+		t.Fatalf("GenerateWSSecurity failed unexpectedly: %v", err)
+	}
 	createdTag := ExtractTag(secXML, "Created")
 	if createdTag == "" {
 		t.Fatalf("could not extract Created timestamp from WS-Security")
@@ -103,5 +109,20 @@ func TestExtractAttributes(t *testing.T) {
 	}
 	if tokens[0] != "Profile_Main" || tokens[1] != "Profile_Sub" {
 		t.Errorf("unexpected tokens parsed: %v", tokens)
+	}
+}
+
+func TestONVIFFailClosedAuthentication(t *testing.T) {
+	// Client without username
+	unauthCli := NewClient("192.168.1.100", 80, "", "")
+	_, err := unauthCli.GenerateWSSecurity()
+	if err == nil {
+		t.Errorf("GenerateWSSecurity must return an error when username is empty")
+	}
+
+	// SendSOAP with withAuth=true on unauthenticated client must fail closed
+	_, err = unauthCli.SendSOAP("http://192.168.1.100:80/onvif/device_service", "GetDeviceInformation", "<tds:GetDeviceInformation/>", true)
+	if err == nil {
+		t.Errorf("SendSOAP with withAuth=true must return error and NOT send unauthenticated request")
 	}
 }

@@ -56,3 +56,4 @@ test.describe('CCTV Sentinel Universal — Cookie Security & CSRF Protection', (
     expect(page.url()).toContain('127.0.0.1:5173');
   });
 });
+

@@ -122,3 +122,21 @@ func TestDigestTransportRoundTrip(t *testing.T) {
 	}
 }
 
+func TestGenerateCNonceSecure(t *testing.T) {
+	cnonce1, err := GenerateCNonce()
+	if err != nil {
+		t.Fatalf("GenerateCNonce failed: %v", err)
+	}
+	if len(cnonce1) != 32 { // 16 bytes hex-encoded = 32 hex chars
+		t.Errorf("expected 32 hex chars, got %d (%s)", len(cnonce1), cnonce1)
+	}
+
+	cnonce2, err := GenerateCNonce()
+	if err != nil {
+		t.Fatalf("GenerateCNonce failed: %v", err)
+	}
+	if cnonce1 == cnonce2 {
+		t.Errorf("consecutive nonces must be cryptographically distinct, got identical: %s", cnonce1)
+	}
+}
+

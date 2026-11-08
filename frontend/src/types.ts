@@ -366,10 +366,14 @@ export interface UserAccount {
 }
 
 export interface Session {
-  token: string;
-  user_id: string;
+  token?: string;
+  user_id?: string;
   username: string;
-  role: 'ADMIN' | 'TECHNICIAN' | 'VIEWER' | 'AUDITOR';
+  role: 'ADMIN' | 'TECHNICIAN' | 'VIEWER' | 'AUDITOR' | string;
+  tenant_id?: string;
+  site_id?: string;
+  is_global_admin?: boolean;
+  scopes?: string[];
   expires_at: string;
 }
 

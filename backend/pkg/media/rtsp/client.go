@@ -144,10 +144,12 @@ func (c *Client) sendRequest(method, reqURI string, extraHeaders map[string]stri
 	// Add Authorization header if challenge is cached
 	if c.authChallenge != nil && c.Username != "" {
 		nc := atomic.AddUint32(&c.nonceCount, 1)
-		cnonce := httpauth.GenerateCNonce()
-		authHdr, err := httpauth.ComputeDigestResponse(c.authChallenge, c.Username, c.Password, method, reqURI, nc, cnonce)
+		cnonce, err := httpauth.GenerateCNonce()
 		if err == nil {
-			req.WriteString(fmt.Sprintf("Authorization: %s\r\n", authHdr))
+			authHdr, err := httpauth.ComputeDigestResponse(c.authChallenge, c.Username, c.Password, method, reqURI, nc, cnonce)
+			if err == nil {
+				req.WriteString(fmt.Sprintf("Authorization: %s\r\n", authHdr))
+			}
 		}
 	}
 

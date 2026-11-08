@@ -156,3 +156,4 @@ The implementation has been thoroughly verified across multiple automated test s
 - Untrusted proxy clients attempting to spoof `X-Forwarded-Proto: https` are ignored.
 - Missing and untrusted Origin headers return 403 Forbidden with structured error codes.
 - Constant-time comparison prevents timing side-channel attacks on CSRF tokens.
+

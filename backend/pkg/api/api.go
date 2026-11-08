@@ -2032,7 +2032,21 @@ func (s *Server) handleSecurityLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	origin := r.Header.Get("Origin")
-	if origin != "" && !s.isOriginAllowed(origin) {
+	clientType := r.Header.Get("X-Client-Type")
+
+	// Login Origin Policy:
+	// 1. Native desktop and CLI clients (X-Client-Type: desktop) are exempt from requiring Origin.
+	// 2. Browser login requests MUST supply an Origin header matching trusted origins to prevent Login CSRF.
+	if clientType != "desktop" {
+		if origin == "" {
+			writeError(w, r, http.StatusForbidden, "CSRF_MISSING_ORIGIN", "Origin header required for browser login")
+			return
+		}
+		if !s.isOriginAllowed(origin) {
+			writeError(w, r, http.StatusForbidden, "CSRF_UNTRUSTED_ORIGIN", "Cross-origin login rejected from untrusted origin")
+			return
+		}
+	} else if origin != "" && !s.isOriginAllowed(origin) {
 		writeError(w, r, http.StatusForbidden, "CSRF_UNTRUSTED_ORIGIN", "Cross-origin login rejected from untrusted origin")
 		return
 	}

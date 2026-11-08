@@ -33,35 +33,40 @@ export const Calculators: React.FC = () => {
   const [capViewers, setCapViewers] = useState(4);
   const [capResult, setCapResult] = useState<CapacityBandwidthCalculation | null>(null);
   const [capLoading, setCapLoading] = useState(false);
+  const [calcError, setCalcError] = useState<string | null>(null);
 
   const handleSubnetCalc = async () => {
+    setCalcError(null);
     try {
       const res = await api.calcSubnet(cidr);
       setSubnetResult(res);
     } catch (err: any) {
-      alert(err.message);
+      setCalcError(err.message);
     }
   };
 
   const handleHDDCalc = async () => {
+    setCalcError(null);
     try {
       const res = await api.calcHDD(hddCams, resolution, codec, days);
       setHddResult(res);
     } catch (err: any) {
-      alert(err.message);
+      setCalcError(err.message);
     }
   };
 
   const handleBandwidthCalc = async () => {
+    setCalcError(null);
     try {
       const res = await api.calcBandwidth(bwCams, mainKbps, subKbps);
       setBwResult(res);
     } catch (err: any) {
-      alert(err.message);
+      setCalcError(err.message);
     }
   };
 
   const handleCapacityCalc = async () => {
+    setCalcError(null);
     setCapLoading(true);
     try {
       const res = await api.calcCapacity({
@@ -75,7 +80,7 @@ export const Calculators: React.FC = () => {
       });
       setCapResult(res);
     } catch (err: any) {
-      alert(err.message);
+      setCalcError(err.message);
     } finally {
       setCapLoading(false);
     }
@@ -133,6 +138,18 @@ export const Calculators: React.FC = () => {
           </button>
         </div>
       </div>
+
+      {calcError && (
+        <div className="p-3 bg-rose-950/40 border border-rose-800/80 rounded-xl text-xs font-mono text-rose-300 flex items-center justify-between">
+          <span>{calcError}</span>
+          <button
+            onClick={() => setCalcError(null)}
+            className="text-slate-400 hover:text-white px-2 py-0.5 rounded text-[11px]"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {/* Unified Capacity & Bandwidth Calculator View */}
       {activeTab === 'capacity' && (

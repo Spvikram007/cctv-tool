@@ -66,15 +66,15 @@ func NewClient(targetIP string, port int, username, password string) *Client {
 }
 
 // GenerateWSSecurity builds OASIS WS-Security UsernameToken header with clock skew correction
-func (c *Client) GenerateWSSecurity() string {
+func (c *Client) GenerateWSSecurity() (string, error) {
 	if c.Username == "" {
-		return ""
+		return "", fmt.Errorf("cannot generate WS-Security: username is not configured")
 	}
 
 	// 1. Generate 16 bytes cryptographically secure random nonce (fails securely if rand unavailable)
 	nonceRaw := make([]byte, 16)
 	if _, err := rand.Read(nonceRaw); err != nil {
-		return ""
+		return "", fmt.Errorf("cryptographic failure: crypto/rand unavailable for WS-Security nonce: %w", err)
 	}
 	nonceB64 := base64.StdEncoding.EncodeToString(nonceRaw)
 
@@ -100,7 +100,7 @@ func (c *Client) GenerateWSSecurity() string {
 			<wsse:Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">%s</wsse:Nonce>
 			<wsu:Created>%s</wsu:Created>
 		</wsse:UsernameToken>
-	</wsse:Security>`, c.Username, passwordDigest, nonceB64, createdStr)
+	</wsse:Security>`, c.Username, passwordDigest, nonceB64, createdStr), nil
 }
 
 // SendSOAP sends a SOAP 1.2 envelope with optional WS-Security header
@@ -111,7 +111,11 @@ func (c *Client) SendSOAP(serviceURL, action, body string, withAuth bool) (strin
 
 	authHeader := ""
 	if withAuth {
-		authHeader = c.GenerateWSSecurity()
+		var err error
+		authHeader, err = c.GenerateWSSecurity()
+		if err != nil {
+			return "", fmt.Errorf("failed to generate WS-Security authentication header: %w", err)
+		}
 	}
 
 	envelope := fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>

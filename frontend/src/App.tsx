@@ -1,8 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import { api } from './services/api';
-import { Device, License, AuditLogEntry } from './types';
+import { Device, License, AuditLogEntry, Session } from './types';
 import { Navbar } from './components/Navbar';
 import { Sidebar, NavTab } from './components/Sidebar';
+import { AuthModal } from './components/AuthModal';
 import { Dashboard } from './pages/Dashboard';
 import { Discovery } from './pages/Discovery';
 import { Devices } from './pages/Devices';
@@ -28,11 +29,31 @@ export const App: React.FC = () => {
   const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([]);
   const [darkMode, setDarkMode] = useState(true);
 
+  // Authentication State
+  const [session, setSession] = useState<Session | null>(null);
+  const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
+
   useEffect(() => {
-    loadAllData();
-    const interval = setInterval(loadAllData, 10000);
+    // Initial setup and session check
+    api.getSetupStatus()
+      .then((setup) => {
+        if (setup.setup_required) {
+          setIsAuthModalOpen(true);
+        } else {
+          loadAllData();
+        }
+      })
+      .catch(() => {
+        loadAllData();
+      });
+
+    const interval = setInterval(() => {
+      if (session) {
+        loadAllData();
+      }
+    }, 10000);
     return () => clearInterval(interval);
-  }, []);
+  }, [session]);
 
   const loadAllData = async () => {
     try {
@@ -51,9 +72,22 @@ export const App: React.FC = () => {
       if (devs.length > 0 && !selectedDevice) {
         setSelectedDevice(devs[0]);
       }
-    } catch (err) {
-      console.warn('Backend connection notice:', err);
+    } catch (err: any) {
+      if (err.message && err.message.includes('Authentication required')) {
+        // Unauthenticated visitor: clear session without popping up intrusive blocking modals
+        setSession(null);
+      } else {
+        console.warn('Backend connection notice:', err);
+      }
     }
+  };
+
+  const handleLogout = async () => {
+    await api.logout();
+    setSession(null);
+    setDevices([]);
+    setSelectedDevice(null);
+    setIsAuthModalOpen(true);
   };
 
   return (
@@ -62,8 +96,22 @@ export const App: React.FC = () => {
       <Navbar
         license={license}
         status={status}
+        session={session}
         darkMode={darkMode}
         setDarkMode={setDarkMode}
+        onOpenAuth={() => setIsAuthModalOpen(true)}
+        onLogout={handleLogout}
+      />
+
+      {/* Auth & Setup Modal */}
+      <AuthModal
+        isOpen={isAuthModalOpen}
+        onClose={() => setIsAuthModalOpen(false)}
+        onAuthenticated={(newSession) => {
+          setSession(newSession);
+          setIsAuthModalOpen(false);
+          loadAllData();
+        }}
       />
 
       <div className="flex-1 flex overflow-hidden">

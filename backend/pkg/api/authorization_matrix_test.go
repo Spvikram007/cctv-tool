@@ -126,10 +126,41 @@ func TestAuthMatrix_CookieSessionAndRevocation(t *testing.T) {
 	setupToken := rbacMgr.GetSetupToken()
 	_ = rbacMgr.CompleteSetup(setupToken, "admin_user", "AdminSec@Sentinel2026!", "Admin User", "admin@sentinel.io")
 
-	// Authenticate via /api/v1/security/login
 	loginBody := `{"username":"admin_user","password":"AdminSec@Sentinel2026!"}`
+
+	// 1. Browser login without Origin must fail closed with 403 CSRF_MISSING_ORIGIN
+	loginNoOrigin := httptest.NewRequest("POST", "/api/v1/security/login", strings.NewReader(loginBody))
+	loginNoOrigin.Header.Set("Content-Type", "application/json")
+	recNoOrigin := httptest.NewRecorder()
+	handler.ServeHTTP(recNoOrigin, loginNoOrigin)
+	if recNoOrigin.Code != http.StatusForbidden || !strings.Contains(recNoOrigin.Body.String(), "CSRF_MISSING_ORIGIN") {
+		t.Fatalf("expected 403 CSRF_MISSING_ORIGIN for browser login without Origin, got %d: %s", recNoOrigin.Code, recNoOrigin.Body.String())
+	}
+
+	// 2. Browser login with untrusted Origin must fail with 403 CSRF_UNTRUSTED_ORIGIN
+	loginUntrusted := httptest.NewRequest("POST", "/api/v1/security/login", strings.NewReader(loginBody))
+	loginUntrusted.Header.Set("Content-Type", "application/json")
+	loginUntrusted.Header.Set("Origin", "http://attacker-site.com")
+	recUntrusted := httptest.NewRecorder()
+	handler.ServeHTTP(recUntrusted, loginUntrusted)
+	if recUntrusted.Code != http.StatusForbidden || !strings.Contains(recUntrusted.Body.String(), "CSRF_UNTRUSTED_ORIGIN") {
+		t.Fatalf("expected 403 CSRF_UNTRUSTED_ORIGIN for untrusted Origin, got %d: %s", recUntrusted.Code, recUntrusted.Body.String())
+	}
+
+	// 3. Desktop client (X-Client-Type: desktop) without Origin succeeds
+	loginDesktop := httptest.NewRequest("POST", "/api/v1/security/login", strings.NewReader(loginBody))
+	loginDesktop.Header.Set("Content-Type", "application/json")
+	loginDesktop.Header.Set("X-Client-Type", "desktop")
+	recDesktop := httptest.NewRecorder()
+	handler.ServeHTTP(recDesktop, loginDesktop)
+	if recDesktop.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for desktop login without Origin, got %d: %s", recDesktop.Code, recDesktop.Body.String())
+	}
+
+	// 4. Authenticate via /api/v1/security/login with trusted Origin
 	loginReq := httptest.NewRequest("POST", "/api/v1/security/login", strings.NewReader(loginBody))
 	loginReq.Header.Set("Content-Type", "application/json")
+	loginReq.Header.Set("Origin", "http://localhost:5173")
 	loginRec := httptest.NewRecorder()
 	handler.ServeHTTP(loginRec, loginReq)
 
