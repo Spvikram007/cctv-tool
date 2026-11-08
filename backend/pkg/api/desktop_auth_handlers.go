@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -17,6 +18,15 @@ func (s *Server) handleDesktopEnroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 1. Enforce strict request body size limit (64 KB)
+	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
+
+	// 2. IP-based rate limiting on enrollment submissions
+	if s.rateLimiter != nil && !s.rateLimiter.Allow(r.RemoteAddr) {
+		writeError(w, r, http.StatusTooManyRequests, "RATE_LIMIT_EXCEEDED", "Too many enrollment requests; please wait before retrying")
+		return
+	}
+
 	var req security.DesktopEnrollmentRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "Malformed desktop enrollment payload")
@@ -25,8 +35,28 @@ func (s *Server) handleDesktopEnroll(w http.ResponseWriter, r *http.Request) {
 
 	rec, err := s.desktopAuthMgr.SubmitEnrollment(req)
 	if err != nil {
-		if err == security.ErrDeviceAlreadyActive {
+		if errors.Is(err, security.ErrDeviceAlreadyActive) {
 			writeError(w, r, http.StatusConflict, "DEVICE_ALREADY_ACTIVE", err.Error())
+			return
+		}
+		if errors.Is(err, security.ErrDevicePendingApproval) {
+			writeError(w, r, http.StatusConflict, "DEVICE_PENDING_APPROVAL", err.Error())
+			return
+		}
+		if errors.Is(err, security.ErrPersistenceFailed) {
+			writeError(w, r, http.StatusInternalServerError, "PERSISTENCE_FAILED", "Failed to persist device enrollment record to durable storage")
+			return
+		}
+		if errors.Is(err, security.ErrInvalidDeviceID) {
+			writeError(w, r, http.StatusBadRequest, "INVALID_DEVICE_ID", err.Error())
+			return
+		}
+		if errors.Is(err, security.ErrMetadataTooLong) {
+			writeError(w, r, http.StatusBadRequest, "METADATA_TOO_LONG", err.Error())
+			return
+		}
+		if errors.Is(err, security.ErrInvalidPublicKey) {
+			writeError(w, r, http.StatusBadRequest, "INVALID_PUBLIC_KEY", err.Error())
 			return
 		}
 		writeError(w, r, http.StatusBadRequest, "ENROLLMENT_FAILED", err.Error())
@@ -235,8 +265,26 @@ func (s *Server) handleDesktopDeviceActions(w http.ResponseWriter, r *http.Reque
 
 	switch action {
 	case "approve":
-		dev, err := s.desktopAuthMgr.ApproveDevice(deviceID, adminUser)
+		var approveReq struct {
+			Fingerprint         string `json:"fingerprint"`
+			ExpectedFingerprint string `json:"expected_fingerprint"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&approveReq)
+		expectedFp := strings.TrimSpace(approveReq.Fingerprint)
+		if expectedFp == "" {
+			expectedFp = strings.TrimSpace(approveReq.ExpectedFingerprint)
+		}
+
+		dev, err := s.desktopAuthMgr.ApproveDevice(deviceID, adminUser, expectedFp)
 		if err != nil {
+			if errors.Is(err, security.ErrFingerprintMismatch) {
+				writeError(w, r, http.StatusConflict, "FINGERPRINT_MISMATCH", err.Error())
+				return
+			}
+			if errors.Is(err, security.ErrPersistenceFailed) {
+				writeError(w, r, http.StatusInternalServerError, "PERSISTENCE_FAILED", "Failed to durably persist device approval")
+				return
+			}
 			writeError(w, r, http.StatusBadRequest, "APPROVE_FAILED", err.Error())
 			return
 		}
@@ -248,9 +296,29 @@ func (s *Server) handleDesktopDeviceActions(w http.ResponseWriter, r *http.Reque
 			"message": "Device approved successfully",
 		})
 
+	case "cancel":
+		if err := s.desktopAuthMgr.CancelPendingEnrollment(deviceID); err != nil {
+			if errors.Is(err, security.ErrPersistenceFailed) {
+				writeError(w, r, http.StatusInternalServerError, "PERSISTENCE_FAILED", "Failed to delete pending enrollment from durable storage")
+				return
+			}
+			writeError(w, r, http.StatusBadRequest, "CANCEL_FAILED", err.Error())
+			return
+		}
+		s.logger.Log(adminUser, "SYSTEM", r.RemoteAddr, "DESKTOP_CANCEL", "SECURITY", "SUCCESS",
+			fmt.Sprintf("Cancelled pending enrollment for device_id=%s", deviceID), "")
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"message": "Pending device enrollment cancelled successfully",
+		})
+
 	case "reject":
 		dev, err := s.desktopAuthMgr.RejectDevice(deviceID, adminUser)
 		if err != nil {
+			if errors.Is(err, security.ErrPersistenceFailed) {
+				writeError(w, r, http.StatusInternalServerError, "PERSISTENCE_FAILED", "Failed to durably persist device rejection")
+				return
+			}
 			writeError(w, r, http.StatusBadRequest, "REJECT_FAILED", err.Error())
 			return
 		}
@@ -265,6 +333,10 @@ func (s *Server) handleDesktopDeviceActions(w http.ResponseWriter, r *http.Reque
 	case "revoke":
 		dev, err := s.desktopAuthMgr.RevokeDevice(deviceID, adminUser)
 		if err != nil {
+			if errors.Is(err, security.ErrPersistenceFailed) {
+				writeError(w, r, http.StatusInternalServerError, "PERSISTENCE_FAILED", "Failed to durably persist device revocation")
+				return
+			}
 			writeError(w, r, http.StatusBadRequest, "REVOKE_FAILED", err.Error())
 			return
 		}
@@ -289,6 +361,10 @@ func (s *Server) handleDesktopDeviceActions(w http.ResponseWriter, r *http.Reque
 		}
 		dev, err := s.desktopAuthMgr.RotateDeviceKey(deviceID, rotReq.PublicKey, adminUser)
 		if err != nil {
+			if errors.Is(err, security.ErrPersistenceFailed) {
+				writeError(w, r, http.StatusInternalServerError, "PERSISTENCE_FAILED", "Failed to durably persist key rotation")
+				return
+			}
 			writeError(w, r, http.StatusBadRequest, "ROTATE_KEY_FAILED", err.Error())
 			return
 		}

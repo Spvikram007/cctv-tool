@@ -350,3 +350,101 @@ func TestConcurrentDiscoveryUpserts(t *testing.T) {
 		t.Errorf("Expected %d devices in store, got %d", expectedCount, len(devs))
 	}
 }
+
+// TestDatabasePersistence_FailClosedOnCorruption proves that database loading fails closed
+// when the primary store is corrupted and no valid backup exists.
+func TestDatabasePersistence_FailClosedOnCorruption(t *testing.T) {
+	tmpDir := t.TempDir()
+	storeFile := filepath.Join(tmpDir, "corrupt_store.json")
+
+	// Write garbage bytes
+	_ = os.WriteFile(storeFile, []byte("{ this is not valid json : [[ corrupt"), 0644)
+
+	// LoadStoreWithVault must fail closed
+	store, err := LoadStoreWithVault(storeFile, nil)
+	if err == nil {
+		t.Fatalf("expected error from LoadStoreWithVault on corrupted database, got nil")
+	}
+
+	// Verify health check returns error
+	if store.IsHealthy() {
+		t.Errorf("expected store.IsHealthy() to be false")
+	}
+	if err := store.HealthCheck(); err == nil {
+		t.Errorf("expected store.HealthCheck() to return an error")
+	}
+
+	// Verify forensic copy was created
+	files, _ := os.ReadDir(tmpDir)
+	foundForensic := false
+	for _, f := range files {
+		if filepath.Ext(f.Name()) != ".json" && len(f.Name()) > len("corrupt_store.json.corrupted") {
+			foundForensic = true
+			break
+		}
+	}
+	if !foundForensic {
+		t.Errorf("expected forensic copy of corrupted database to be preserved")
+	}
+}
+
+// TestDatabasePersistence_RecoveryFromBackup proves that corrupted database recovers cleanly from .bak
+func TestDatabasePersistence_RecoveryFromBackup(t *testing.T) {
+	tmpDir := t.TempDir()
+	storeFile := filepath.Join(tmpDir, "backup_recovery_store.json")
+
+	store := NewStoreWithVault(storeFile, nil)
+	store.UpsertDevice(models.Device{
+		ID:   "dev-survivor-1",
+		Name: "Survivor Camera",
+	})
+	if err := store.Save(); err != nil {
+		t.Fatalf("save failed: %v", err)
+	}
+
+	// Corrupt primary file
+	_ = os.WriteFile(storeFile, []byte("{CORRUPTED JUNK DATA"), 0644)
+
+	// Reload store: must recover from .bak
+	recoveredStore, err := LoadStoreWithVault(storeFile, nil)
+	if err != nil {
+		t.Fatalf("recovery from backup failed: %v", err)
+	}
+
+	if !recoveredStore.IsHealthy() {
+		t.Fatalf("recovered store is not healthy")
+	}
+
+	dev, found := recoveredStore.GetDevice("dev-survivor-1")
+	if !found || dev.Name != "Survivor Camera" {
+		t.Fatalf("device data not recovered from backup: %+v", dev)
+	}
+}
+
+// TestDatabasePersistence_FilePermissions verifies Windows ACL / Unix permissions on store and backup
+func TestDatabasePersistence_FilePermissions(t *testing.T) {
+	tmpDir := t.TempDir()
+	storeFile := filepath.Join(tmpDir, "secure_store.json")
+
+	store := NewStoreWithVault(storeFile, nil)
+	store.UpsertDevice(models.Device{
+		ID:   "dev-perm-1",
+		Name: "Permission Test Cam",
+	})
+	if err := store.Save(); err != nil {
+		t.Fatalf("save failed: %v", err)
+	}
+
+	// Verify primary file ACL permissions
+	if err := security.VerifyFilePermissions(storeFile); err != nil {
+		t.Errorf("primary database permissions verification failed: %v", err)
+	}
+
+	// Verify backup file ACL permissions
+	bakFile := storeFile + ".bak"
+	if _, err := os.Stat(bakFile); err == nil {
+		if err := security.VerifyFilePermissions(bakFile); err != nil {
+			t.Errorf("backup database permissions verification failed: %v", err)
+		}
+	}
+}

@@ -22,6 +22,7 @@ var (
 	ErrForbidden          = errors.New("security: role lacks required permission for this operation")
 	ErrUserNotFound       = errors.New("security: user account not found")
 	ErrUserDisabled       = errors.New("security: user account is deactivated")
+	ErrUserExists         = errors.New("security: user already exists")
 	ErrSessionExpired     = errors.New("security: session token expired; re-authentication required")
 	ErrSetupDisabled      = errors.New("security: initial admin setup is disabled; system is already provisioned")
 	ErrSetupTokenExpired  = errors.New("security: initial setup token has expired")
@@ -152,8 +153,8 @@ type UserAccount struct {
 	FullName      string    `json:"full_name"`
 	Role          Role      `json:"role"`
 	Email         string    `json:"email"`
-	PasswordHash  string    `json:"-"` // Argon2id or legacy salted hash
-	Salt          string    `json:"-"`
+	PasswordHash  string    `json:"password_hash,omitempty"` // Persisted to database; stripped from API responses
+	Salt          string    `json:"salt,omitempty"`
 	TenantID      string    `json:"tenant_id,omitempty"`
 	SiteID        string    `json:"site_id,omitempty"`
 	IsGlobalAdmin bool      `json:"is_global_admin,omitempty"`
@@ -302,10 +303,8 @@ func (m *RBACManager) initSetupToken() {
 	m.setupTokenExpires = time.Now().UTC().Add(24 * time.Hour)
 
 	// Securely persist to local token file with restricted permissions (0600 on Unix, icacls on Windows)
-	if err := os.WriteFile(m.setupTokenFilePath, []byte(m.setupToken+"\n"), 0600); err != nil {
+	if err := WriteSecureFile(m.setupTokenFilePath, []byte(m.setupToken+"\n")); err != nil {
 		fmt.Printf("[SECURITY] Notice: could not write setup token file (%v)\n", err)
-	} else {
-		_ = RestrictFilePermissions(m.setupTokenFilePath)
 	}
 }
 
@@ -337,10 +336,9 @@ func (m *RBACManager) RegenerateSetupToken() (string, error) {
 	m.setupToken = fmt.Sprintf("sent-setup-%s", hex.EncodeToString(tokBytes))
 	m.setupTokenExpires = time.Now().UTC().Add(24 * time.Hour)
 
-	if err := os.WriteFile(m.setupTokenFilePath, []byte(m.setupToken+"\n"), 0600); err != nil {
+	if err := WriteSecureFile(m.setupTokenFilePath, []byte(m.setupToken+"\n")); err != nil {
 		return "", fmt.Errorf("failed to write setup token file: %w", err)
 	}
-	_ = RestrictFilePermissions(m.setupTokenFilePath)
 
 	return m.setupToken, nil
 }
@@ -416,12 +414,15 @@ func (m *RBACManager) CompleteSetup(token, username, password, fullName, email s
 		CreatedAt:     time.Now().UTC(),
 	}
 
-	m.users[username] = u
+	// 1. Persist administrator account to durable storage BEFORE modifying in-memory state or destroying setup token
 	if m.store != nil {
-		_ = m.store.SaveUser(*u)
+		if err := m.store.SaveUser(*u); err != nil {
+			return fmt.Errorf("%w: failed to persist administrator account: %v", ErrPersistenceFailed, err)
+		}
 	}
 
-	// Permanently disable setup mode and erase token
+	// 2. Only after durable persistence succeeds, update in-memory state and destroy setup token
+	m.users[username] = u
 	m.setupMode = false
 	m.setupToken = ""
 	_ = os.Remove(m.setupTokenFilePath)
@@ -456,28 +457,29 @@ func legacyHashPassword(password, salt string) string {
 	return hex.EncodeToString(h[:])
 }
 
-// CreateUser registers a new operator with Argon2id password hashing
+// CreateUser registers a new operator with Argon2id password hashing and durable store persistence
 func (m *RBACManager) CreateUser(username, password, fullName string, role Role, email, tenantID, siteID string) error {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return errors.New("username cannot be empty")
+	}
 	if err := ValidatePasswordStrength(password); err != nil {
 		return err
 	}
 
 	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	if _, exists := m.users[username]; exists {
-		m.mu.Unlock()
-		return fmt.Errorf("user %s already exists", username)
+		return fmt.Errorf("%w: user %s already exists", ErrUserExists, username)
 	}
 
-	saltLength := m.argon2Config.SaltLength
-	argonConfig := *m.argon2Config
-	m.mu.Unlock()
-
-	saltBytes := make([]byte, saltLength)
+	saltBytes := make([]byte, m.argon2Config.SaltLength)
 	if _, err := rand.Read(saltBytes); err != nil {
 		return fmt.Errorf("failed to generate cryptographic salt: %w", err)
 	}
 
-	argonHash := HashPasswordArgon2id(password, saltBytes, &argonConfig)
+	argonHash := HashPasswordArgon2id(password, saltBytes, m.argon2Config)
 
 	u := &UserAccount{
 		Username:     username,
@@ -492,8 +494,13 @@ func (m *RBACManager) CreateUser(username, password, fullName string, role Role,
 		CreatedAt:    time.Now().UTC(),
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	// Persist to durable store first before registering in memory
+	if m.store != nil {
+		if err := m.store.SaveUser(*u); err != nil {
+			return fmt.Errorf("%w: failed to persist user account: %v", ErrPersistenceFailed, err)
+		}
+	}
+
 	m.users[username] = u
 
 	// Disable setup mode if an admin was created
@@ -776,28 +783,29 @@ func (m *RBACManager) InjectUserWithHashForTest(username, hash, salt string, rol
 	}
 }
 
-// CreateGlobalAdminUser registers an explicit global super-administrator
+// CreateGlobalAdminUser registers an explicit global super-administrator with durable persistence
 func (m *RBACManager) CreateGlobalAdminUser(username, password, fullName, email string) error {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return errors.New("username cannot be empty")
+	}
 	if err := ValidatePasswordStrength(password); err != nil {
 		return err
 	}
 
 	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	if _, exists := m.users[username]; exists {
-		m.mu.Unlock()
-		return fmt.Errorf("user %s already exists", username)
+		return fmt.Errorf("%w: user %s already exists", ErrUserExists, username)
 	}
 
-	saltLength := m.argon2Config.SaltLength
-	argonConfig := *m.argon2Config
-	m.mu.Unlock()
-
-	saltBytes := make([]byte, saltLength)
+	saltBytes := make([]byte, m.argon2Config.SaltLength)
 	if _, err := rand.Read(saltBytes); err != nil {
 		return fmt.Errorf("failed to generate cryptographic salt: %w", err)
 	}
 
-	argonHash := HashPasswordArgon2id(password, saltBytes, &argonConfig)
+	argonHash := HashPasswordArgon2id(password, saltBytes, m.argon2Config)
 
 	u := &UserAccount{
 		Username:      username,
@@ -814,9 +822,50 @@ func (m *RBACManager) CreateGlobalAdminUser(username, password, fullName, email 
 		CreatedAt:     time.Now().UTC(),
 	}
 
+	if m.store != nil {
+		if err := m.store.SaveUser(*u); err != nil {
+			return fmt.Errorf("%w: failed to persist global admin user: %v", ErrPersistenceFailed, err)
+		}
+	}
+
+	m.users[username] = u
+	m.setupMode = false
+	m.setupToken = ""
+	_ = os.Remove(m.setupTokenFilePath)
+
+	return nil
+}
+
+// GetUser retrieves a safe projection of the user account by username
+func (m *RBACManager) GetUser(username string) (UserAccount, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	u, ok := m.users[username]
+	if !ok {
+		return UserAccount{}, false
+	}
+	safeCopy := *u
+	safeCopy.PasswordHash = ""
+	safeCopy.Salt = ""
+	return safeCopy, true
+}
+
+// DeleteUser removes a user account from durable storage and memory
+func (m *RBACManager) DeleteUser(username string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.users[username] = u
+
+	if _, exists := m.users[username]; !exists {
+		return errors.New("user not found")
+	}
+
+	if m.store != nil {
+		if err := m.store.DeleteUser(username); err != nil {
+			return fmt.Errorf("%w: failed to delete user from store: %v", ErrPersistenceFailed, err)
+		}
+	}
+
+	delete(m.users, username)
 	return nil
 }
 

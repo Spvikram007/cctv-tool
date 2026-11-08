@@ -107,11 +107,11 @@ func (s *Store) RunMigrations() error {
 		if m.Version > s.SchemaVersion {
 			log.Printf("[MIGRATION] Applying migration v%d: %s", m.Version, m.Description)
 
-			// Create a safety backup before migration
+			// Create a safety backup before migration with hardened file permissions
 			if s.filePath != "" {
 				backupPath := fmt.Sprintf("%s.pre-v%d-%d.bak", s.filePath, m.Version, time.Now().Unix())
 				if data, err := os.ReadFile(s.filePath); err == nil {
-					_ = os.WriteFile(backupPath, data, 0644)
+					_ = security.WriteSecureFile(backupPath, data)
 				}
 			}
 

@@ -60,7 +60,10 @@ func main() {
 	}
 
 	dbFile := "sentinel_store.json"
-	store := database.NewStoreWithVault(dbFile, vault)
+	store, err := database.LoadStoreWithVault(dbFile, vault)
+	if err != nil {
+		log.Fatalf("[DATABASE] Fatal startup error: database persistence initialization failed: %v", err)
+	}
 	logger := audit.NewLogger()
 	licenseMgr := licensing.NewManager()
 

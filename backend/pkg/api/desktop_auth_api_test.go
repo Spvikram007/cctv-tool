@@ -345,3 +345,166 @@ func TestDesktopAuth_AdminDeviceList(t *testing.T) {
 		t.Errorf("expected fingerprint in list response: %s", listBody)
 	}
 }
+
+// TestDesktopAuth_OversizedEnrollmentPayloadRejected verifies that oversized payloads are rejected
+func TestDesktopAuth_OversizedEnrollmentPayloadRejected(t *testing.T) {
+	_, handler, _, _ := setupDesktopAPITestServer(t)
+
+	// Construct body > 64 KB
+	hugePayload := map[string]string{
+		"device_id":   "ws-huge-1",
+		"client_name": strings.Repeat("A", 70*1024),
+		"public_key":  "dGVzdA==",
+	}
+	body, _ := json.Marshal(hugePayload)
+
+	req := httptest.NewRequest("POST", "/api/v1/auth/desktop/enroll", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest && rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 400 or 413 for oversized payload, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestDesktopAuth_DuplicatePendingEnrollmentReturns409 verifies 409 Conflict on duplicate pending enrollment
+func TestDesktopAuth_DuplicatePendingEnrollmentReturns409(t *testing.T) {
+	_, handler, _, _ := setupDesktopAPITestServer(t)
+
+	pub1, _, _ := security.GenerateClientKeyPair()
+	pub2, _, _ := security.GenerateClientKeyPair()
+
+	payload1, _ := json.Marshal(map[string]string{
+		"device_id":  "ws-dup-check",
+		"public_key": base64.StdEncoding.EncodeToString(pub1),
+	})
+	req1 := httptest.NewRequest("POST", "/api/v1/auth/desktop/enroll", bytes.NewReader(payload1))
+	req1.Header.Set("Content-Type", "application/json")
+	rec1 := httptest.NewRecorder()
+	handler.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusCreated {
+		t.Fatalf("initial enrollment failed: %d", rec1.Code)
+	}
+
+	// Resubmission must return 409 Conflict
+	payload2, _ := json.Marshal(map[string]string{
+		"device_id":  "ws-dup-check",
+		"public_key": base64.StdEncoding.EncodeToString(pub2),
+	})
+	req2 := httptest.NewRequest("POST", "/api/v1/auth/desktop/enroll", bytes.NewReader(payload2))
+	req2.Header.Set("Content-Type", "application/json")
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for duplicate pending enrollment, got %d: %s", rec2.Code, rec2.Body.String())
+	}
+	if !strings.Contains(rec2.Body.String(), "DEVICE_PENDING_APPROVAL") {
+		t.Errorf("expected code DEVICE_PENDING_APPROVAL in response: %s", rec2.Body.String())
+	}
+}
+
+// TestDesktopAuth_ApprovalFingerprintBinding verifies that administrator approval strictly verifies fingerprints
+func TestDesktopAuth_ApprovalFingerprintBinding(t *testing.T) {
+	_, handler, rbacMgr, _ := setupDesktopAPITestServer(t)
+
+	// Admin setup
+	setupTok := rbacMgr.GetSetupToken()
+	_ = rbacMgr.CompleteSetup(setupTok, "admin_user", "AdminOperator#Pass2026!", "Administrator", "admin@sentinel.io")
+	adminSess, _ := rbacMgr.Authenticate("admin_user", "AdminOperator#Pass2026!", 1*time.Hour)
+
+	pub, _, _ := security.GenerateClientKeyPair()
+	fp := security.ComputeFingerprint(pub)
+
+	enrollPayload, _ := json.Marshal(map[string]string{
+		"device_id":  "ws-fp-api-check",
+		"public_key": base64.StdEncoding.EncodeToString(pub),
+	})
+	reqEnroll := httptest.NewRequest("POST", "/api/v1/auth/desktop/enroll", bytes.NewReader(enrollPayload))
+	reqEnroll.Header.Set("Content-Type", "application/json")
+	recEnroll := httptest.NewRecorder()
+	handler.ServeHTTP(recEnroll, reqEnroll)
+	if recEnroll.Code != http.StatusCreated {
+		t.Fatalf("enrollment failed: %d", recEnroll.Code)
+	}
+
+	// 1. Approval with mismatched fingerprint returns 409 Conflict
+	badFpPayload, _ := json.Marshal(map[string]string{
+		"fingerprint": "SHA256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+	})
+	reqBadApprove := httptest.NewRequest("POST", "/api/v1/auth/desktop/devices/ws-fp-api-check/approve", bytes.NewReader(badFpPayload))
+	reqBadApprove.Header.Set("Authorization", "Bearer "+adminSess.Token)
+	reqBadApprove.Header.Set("Content-Type", "application/json")
+	recBadApprove := httptest.NewRecorder()
+	handler.ServeHTTP(recBadApprove, reqBadApprove)
+
+	if recBadApprove.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict on fingerprint mismatch, got %d: %s", recBadApprove.Code, recBadApprove.Body.String())
+	}
+	if !strings.Contains(recBadApprove.Body.String(), "FINGERPRINT_MISMATCH") {
+		t.Errorf("expected FINGERPRINT_MISMATCH error code: %s", recBadApprove.Body.String())
+	}
+
+	// 2. Approval with matching fingerprint succeeds with 200 OK
+	goodFpPayload, _ := json.Marshal(map[string]string{
+		"fingerprint": fp,
+	})
+	reqGoodApprove := httptest.NewRequest("POST", "/api/v1/auth/desktop/devices/ws-fp-api-check/approve", bytes.NewReader(goodFpPayload))
+	reqGoodApprove.Header.Set("Authorization", "Bearer "+adminSess.Token)
+	reqGoodApprove.Header.Set("Content-Type", "application/json")
+	recGoodApprove := httptest.NewRecorder()
+	handler.ServeHTTP(recGoodApprove, reqGoodApprove)
+
+	if recGoodApprove.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on matching fingerprint approval, got %d: %s", recGoodApprove.Code, recGoodApprove.Body.String())
+	}
+}
+
+// TestDesktopAuth_CancelPendingEnrollment verifies cancelling a pending enrollment allows clean re-enrollment
+func TestDesktopAuth_CancelPendingEnrollment(t *testing.T) {
+	_, handler, rbacMgr, _ := setupDesktopAPITestServer(t)
+
+	setupTok := rbacMgr.GetSetupToken()
+	_ = rbacMgr.CompleteSetup(setupTok, "admin_user", "AdminOperator#Pass2026!", "Administrator", "admin@sentinel.io")
+	adminSess, _ := rbacMgr.Authenticate("admin_user", "AdminOperator#Pass2026!", 1*time.Hour)
+
+	pub1, _, _ := security.GenerateClientKeyPair()
+	pub2, _, _ := security.GenerateClientKeyPair()
+
+	payload1, _ := json.Marshal(map[string]string{
+		"device_id":  "ws-cancel-check",
+		"public_key": base64.StdEncoding.EncodeToString(pub1),
+	})
+	req1 := httptest.NewRequest("POST", "/api/v1/auth/desktop/enroll", bytes.NewReader(payload1))
+	req1.Header.Set("Content-Type", "application/json")
+	rec1 := httptest.NewRecorder()
+	handler.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusCreated {
+		t.Fatalf("initial enrollment failed: %d", rec1.Code)
+	}
+
+	// Cancel enrollment
+	reqCancel := httptest.NewRequest("POST", "/api/v1/auth/desktop/devices/ws-cancel-check/cancel", nil)
+	reqCancel.Header.Set("Authorization", "Bearer "+adminSess.Token)
+	recCancel := httptest.NewRecorder()
+	handler.ServeHTTP(recCancel, reqCancel)
+
+	if recCancel.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for cancel, got %d: %s", recCancel.Code, recCancel.Body.String())
+	}
+
+	// Re-enrollment with new key must now succeed
+	payload2, _ := json.Marshal(map[string]string{
+		"device_id":  "ws-cancel-check",
+		"public_key": base64.StdEncoding.EncodeToString(pub2),
+	})
+	req2 := httptest.NewRequest("POST", "/api/v1/auth/desktop/enroll", bytes.NewReader(payload2))
+	req2.Header.Set("Content-Type", "application/json")
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusCreated {
+		t.Fatalf("re-enrollment failed after cancel: %d: %s", rec2.Code, rec2.Body.String())
+	}
+}

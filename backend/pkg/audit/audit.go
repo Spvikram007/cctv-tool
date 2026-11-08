@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"cctv-sentinel/pkg/models"
+	"cctv-sentinel/pkg/security"
 )
 
 type secretReplacer struct {
@@ -149,8 +150,10 @@ func (l *Logger) loadOrGenerateKey() error {
 			l.checkpointKey = make([]byte, 32)
 			copy(l.checkpointKey, data[:32])
 			l.keyRing[l.currentKeyID] = l.checkpointKey
+			_ = security.RestrictFilePermissions(l.keyFilePath)
 			return nil
 		}
+		_ = security.RestrictFilePermissions(l.keyFilePath)
 	}
 
 	// Keyfile does not exist - generate fresh key from OS cryptographic random source
@@ -180,8 +183,8 @@ func (l *Logger) persistKeys() error {
 		return err
 	}
 
-	// Persist with restrictive 0600 file permissions
-	return os.WriteFile(l.keyFilePath, data, 0600)
+	// Persist with hardened Windows ACL / Unix 0600 file permissions
+	return security.WriteSecureFile(l.keyFilePath, data)
 }
 
 // RotateCheckpointKey generates a new active HMAC key while preserving prior keys for checkpoint verification

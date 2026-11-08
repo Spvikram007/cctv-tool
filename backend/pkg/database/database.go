@@ -56,6 +56,8 @@ type Store struct {
 	mu                   sync.RWMutex
 	filePath             string
 	vault                *security.Vault
+	loadErr              error
+	permissionsHardened  bool
 	SchemaVersion        int                                     `json:"schema_version"`
 	Devices              map[string]models.Device                `json:"devices"`
 	EncryptedCredentials map[string]string                       `json:"encrypted_credentials"` // device_id -> AES-256-GCM ciphertext
@@ -75,7 +77,8 @@ func NewStore(filePath string) *Store {
 	return NewStoreWithVault(filePath, nil)
 }
 
-func NewStoreWithVault(filePath string, vault *security.Vault) *Store {
+// LoadStoreWithVault creates and loads a Store from filePath, propagating any load or migration error
+func LoadStoreWithVault(filePath string, vault *security.Vault) (*Store, error) {
 	if vault == nil {
 		var keyDir string
 		if filePath != "" {
@@ -102,9 +105,38 @@ func NewStoreWithVault(filePath string, vault *security.Vault) *Store {
 		Users:                make(map[string]security.UserAccount),
 	}
 
-	_ = s.load()
+	if err := s.load(); err != nil {
+		s.loadErr = err
+		return s, err
+	}
 	s.seedCompatibilityDatabase()
+	return s, nil
+}
+
+func NewStoreWithVault(filePath string, vault *security.Vault) *Store {
+	s, err := LoadStoreWithVault(filePath, vault)
+	if err != nil {
+		log.Printf("[DATABASE] Non-fatal NewStoreWithVault load notice: %v", err)
+	}
 	return s
+}
+
+// HealthCheck verifies that the store successfully loaded and is in a ready state
+func (s *Store) HealthCheck() error {
+	if s == nil {
+		return fmt.Errorf("database store is uninitialized (nil)")
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.loadErr != nil {
+		return fmt.Errorf("database load error: %w", s.loadErr)
+	}
+	return nil
+}
+
+// IsHealthy returns true if the database store loaded without error
+func (s *Store) IsHealthy() bool {
+	return s.HealthCheck() == nil
 }
 
 func (s *Store) SetVault(vault *security.Vault) {
@@ -151,9 +183,9 @@ func (s *Store) load() error {
 		// Corruption detected in primary file!
 		log.Printf("[DATABASE] Warning: Corrupted database detected at %s: %v", s.filePath, unmarshalErr)
 
-		// 1. Preserve corrupted copy for investigation (never delete user data)
+		// 1. Preserve corrupted copy with hardened file permissions for forensic investigation
 		corruptCopy := fmt.Sprintf("%s.corrupted.%d", s.filePath, time.Now().Unix())
-		_ = os.WriteFile(corruptCopy, data, 0644)
+		_ = security.WriteSecureFile(corruptCopy, data)
 		log.Printf("[DATABASE] Preserved forensic copy of corrupted database at %s", corruptCopy)
 
 		// 2. Recover from safe .bak file if available
@@ -162,18 +194,22 @@ func (s *Store) load() error {
 		if bakErr == nil {
 			if err := json.Unmarshal(bakData, s); err == nil {
 				log.Printf("[DATABASE] Successfully recovered database from backup: %s", bakFile)
-				// Restore valid backup as primary file
-				_ = os.WriteFile(s.filePath, bakData, 0644)
-				_ = s.RunMigrations()
+				// Restore valid backup as primary file with hardened permissions
+				_ = security.WriteSecureFile(s.filePath, bakData)
+				if err := s.RunMigrations(); err != nil {
+					return fmt.Errorf("database recovered from backup but migration failed: %w", err)
+				}
 				return nil
 			}
 		}
 
-		return fmt.Errorf("database corrupted and no valid backup available: %w", unmarshalErr)
+		return fmt.Errorf("database corrupted at %s and no valid backup available: %w", s.filePath, unmarshalErr)
 	}
 
-	// Run schema migrations if needed
-	_ = s.RunMigrations()
+	// Run schema migrations and propagate any migration errors
+	if err := s.RunMigrations(); err != nil {
+		return fmt.Errorf("database schema migration failed: %w", err)
+	}
 	return nil
 }
 
@@ -181,9 +217,14 @@ func (s *Store) Save() error {
 	if s.filePath == "" {
 		return nil
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.saveLocked()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.saveLocked(); err != nil {
+		return err
+	}
+	_ = security.RestrictFilePermissions(s.filePath)
+	_ = security.RestrictFilePermissions(s.filePath + ".bak")
+	return nil
 }
 
 func (s *Store) saveLocked() error {
@@ -192,28 +233,47 @@ func (s *Store) saveLocked() error {
 	}
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to serialize database json: %w", err)
 	}
 
 	tmpFile := s.filePath + ".tmp"
-	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
+	if err := os.WriteFile(tmpFile, data, 0600); err != nil {
 		return fmt.Errorf("failed to write temporary database file: %w", err)
 	}
 
 	// Update .bak before replacing primary file
 	bakFile := s.filePath + ".bak"
+	var origData []byte
 	if _, err := os.Stat(s.filePath); err == nil {
-		if origData, err := os.ReadFile(s.filePath); err == nil && len(origData) > 0 {
-			_ = os.WriteFile(bakFile, origData, 0644)
+		if origData, err = os.ReadFile(s.filePath); err == nil && len(origData) > 0 {
+			_ = os.WriteFile(bakFile, origData, 0600)
 		}
 	}
 
-	// Atomic replace
-	_ = os.Remove(s.filePath)
+	// Atomic replace:
+	// On Windows, os.Rename fails if target exists.
+	// We safely remove the primary file only after tmpFile is fully written and flushed,
+	// and if rename fails, we restore the primary file from origData/bakFile.
+	if err := os.Remove(s.filePath); err != nil && !os.IsNotExist(err) {
+		_ = os.Remove(tmpFile)
+		return fmt.Errorf("failed to remove existing database for replacement: %w", err)
+	}
+
 	if err := os.Rename(tmpFile, s.filePath); err != nil {
+		if len(origData) > 0 {
+			_ = os.WriteFile(s.filePath, origData, 0600)
+		}
 		return fmt.Errorf("atomic database rename failed: %w", err)
 	}
 
+	// Strictly harden permissions on primary database and backup files upon first creation
+	if !s.permissionsHardened {
+		_ = security.RestrictFilePermissions(s.filePath)
+		if len(origData) > 0 {
+			_ = security.RestrictFilePermissions(bakFile)
+		}
+		s.permissionsHardened = true
+	}
 	return nil
 }
 

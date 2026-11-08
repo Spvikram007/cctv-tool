@@ -15,16 +15,21 @@ import (
 )
 
 var (
-	ErrDeviceNotFound      = errors.New("desktop_auth: native client device not registered")
-	ErrDeviceDeactivated   = errors.New("desktop_auth: native client device is revoked or deactivated")
-	ErrDeviceAlreadyExists = errors.New("desktop_auth: native client device ID already registered")
-	ErrDeviceAlreadyActive = errors.New("desktop_auth: active device already exists; cannot overwrite active device")
-	ErrDeviceNotApproved   = errors.New("desktop_auth: device enrollment pending administrator approval")
-	ErrEnrollmentExpired   = errors.New("desktop_auth: device enrollment request has expired")
-	ErrInvalidDeviceProof  = errors.New("desktop_auth: cryptographic proof failed; invalid Ed25519 device signature")
-	ErrInvalidPublicKey    = errors.New("desktop_auth: invalid Ed25519 public key (must be 32 bytes)")
-	ErrChallengeExpired    = errors.New("desktop_auth: authentication challenge has expired")
-	ErrChallengeNotFound   = errors.New("desktop_auth: challenge not found or already consumed")
+	ErrDeviceNotFound        = errors.New("desktop_auth: native client device not registered")
+	ErrDeviceDeactivated     = errors.New("desktop_auth: native client device is revoked or deactivated")
+	ErrDeviceAlreadyExists   = errors.New("desktop_auth: native client device ID already registered")
+	ErrDeviceAlreadyActive   = errors.New("desktop_auth: active device already exists; cannot overwrite active device")
+	ErrDevicePendingApproval = errors.New("desktop_auth: device enrollment already pending administrator approval")
+	ErrFingerprintMismatch   = errors.New("desktop_auth: reviewed public key fingerprint does not match approved record")
+	ErrDeviceNotApproved     = errors.New("desktop_auth: device enrollment pending administrator approval")
+	ErrEnrollmentExpired     = errors.New("desktop_auth: device enrollment request has expired")
+	ErrInvalidDeviceProof    = errors.New("desktop_auth: cryptographic proof failed; invalid Ed25519 device signature")
+	ErrInvalidPublicKey      = errors.New("desktop_auth: invalid Ed25519 public key (must be exactly 32 bytes)")
+	ErrInvalidDeviceID       = errors.New("desktop_auth: invalid device ID format or length (3-64 alphanumeric/hyphen/underscore chars)")
+	ErrMetadataTooLong       = errors.New("desktop_auth: client metadata exceeds maximum allowed length of 128 characters")
+	ErrChallengeExpired      = errors.New("desktop_auth: authentication challenge has expired")
+	ErrChallengeNotFound     = errors.New("desktop_auth: challenge not found or already consumed")
+	ErrPersistenceFailed     = errors.New("desktop_auth: failed to persist device record to durable storage")
 )
 
 // DesktopApprovalStatus defines the lifecycle states of a native client device
@@ -119,9 +124,26 @@ func NewDesktopAuthManager(store DesktopDeviceStore) *DesktopAuthManager {
 	return mgr
 }
 
+// isValidDeviceID validates identifier characters and lengths (prevents traversal and injection)
+func isValidDeviceID(id string) bool {
+	if len(id) < 3 || len(id) > 64 {
+		return false
+	}
+	for _, ch := range id {
+		if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.') {
+			return false
+		}
+	}
+	return true
+}
+
 // DecodeEd25519PublicKey decodes a public key from base64 or hex
 func DecodeEd25519PublicKey(pubKeyStr string) (ed25519.PublicKey, error) {
 	pubKeyStr = strings.TrimSpace(pubKeyStr)
+	if pubKeyStr == "" {
+		return nil, ErrInvalidPublicKey
+	}
+
 	// Try base64 standard
 	b, err := base64.StdEncoding.DecodeString(pubKeyStr)
 	if err == nil && len(b) == ed25519.PublicKeySize {
@@ -146,7 +168,8 @@ func ComputeFingerprint(pubKey ed25519.PublicKey) string {
 	return fmt.Sprintf("SHA256:%s", hex.EncodeToString(sum[:]))
 }
 
-// SubmitEnrollment submits a native workstation's locally generated public key for administrator approval
+// SubmitEnrollment submits a native workstation's locally generated public key for administrator approval.
+// Fail-Closed: Durably persists the record before registering in memory.
 func (m *DesktopAuthManager) SubmitEnrollment(req DesktopEnrollmentRequest) (*DesktopDeviceRecord, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -158,8 +181,12 @@ func (m *DesktopAuthManager) SubmitEnrollment(req DesktopEnrollmentRequest) (*De
 	if id == "" {
 		id = strings.TrimSpace(req.ClientID)
 	}
-	if id == "" {
-		return nil, errors.New("desktop_auth: device ID cannot be empty")
+	if id == "" || !isValidDeviceID(id) {
+		return nil, ErrInvalidDeviceID
+	}
+
+	if len(req.ClientName) > 128 || len(req.OS) > 128 || len(req.HostName) > 128 {
+		return nil, ErrMetadataTooLong
 	}
 
 	pubKeyBytes, err := DecodeEd25519PublicKey(req.PublicKey)
@@ -170,11 +197,17 @@ func (m *DesktopAuthManager) SubmitEnrollment(req DesktopEnrollmentRequest) (*De
 	fingerprint := ComputeFingerprint(pubKeyBytes)
 	pubKeyBase64 := base64.StdEncoding.EncodeToString(pubKeyBytes)
 
-	// Check if already registered
+	// Overwrite Protection
 	if existing, exists := m.devices[id]; exists {
-		// Active, approved devices cannot be silently overwritten
+		// 1. Active approved devices cannot be overwritten
 		if existing.Status == string(StatusActive) && existing.ApprovalStatus == string(ApprovalApproved) {
 			return nil, ErrDeviceAlreadyActive
+		}
+		// 2. Pending enrollments cannot be overwritten unless expired
+		if existing.ApprovalStatus == string(ApprovalPending) {
+			if existing.ExpiresAt != nil && time.Now().UTC().Before(*existing.ExpiresAt) {
+				return nil, ErrDevicePendingApproval
+			}
 		}
 	}
 
@@ -186,7 +219,7 @@ func (m *DesktopAuthManager) SubmitEnrollment(req DesktopEnrollmentRequest) (*De
 	now := time.Now().UTC()
 	expiresAt := now.Add(24 * time.Hour) // Pending enrollment expires in 24 hours
 
-	rec := &DesktopDeviceRecord{
+	rec := DesktopDeviceRecord{
 		ID:             id,
 		ClientName:     clientName,
 		OS:             req.OS,
@@ -199,19 +232,23 @@ func (m *DesktopAuthManager) SubmitEnrollment(req DesktopEnrollmentRequest) (*De
 		ExpiresAt:      &expiresAt,
 		CreatedAt:      now,
 		LastSeenAt:     now,
-		Active:         false, // Not active until approved
+		Active:         false, // Inactive until approved
 	}
 
-	m.devices[id] = rec
+	// Fail-closed persistence: Persist BEFORE mutating in-memory state
 	if m.store != nil {
-		_ = m.store.UpsertDesktopDevice(*rec)
+		if err := m.store.UpsertDesktopDevice(rec); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrPersistenceFailed, err)
+		}
 	}
 
-	return rec, nil
+	m.devices[id] = &rec
+	return &rec, nil
 }
 
-// ApproveDevice approves a pending workstation enrollment (Administrator only)
-func (m *DesktopAuthManager) ApproveDevice(id, adminUser string) (*DesktopDeviceRecord, error) {
+// ApproveDevice approves a pending workstation enrollment (Administrator only).
+// Fail-Closed: Verifies reviewed fingerprint and persists BEFORE updating in-memory state.
+func (m *DesktopAuthManager) ApproveDevice(id, adminUser string, expectedFingerprintOpt ...string) (*DesktopDeviceRecord, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -225,20 +262,34 @@ func (m *DesktopAuthManager) ApproveDevice(id, adminUser string) (*DesktopDevice
 		return nil, ErrEnrollmentExpired
 	}
 
-	dev.ApprovalStatus = string(ApprovalApproved)
-	dev.Status = string(StatusActive)
-	dev.Active = true
-	dev.ApprovedBy = adminUser
-	dev.ApprovedAt = &now
-
-	if m.store != nil {
-		_ = m.store.UpsertDesktopDevice(*dev)
+	// Verify exact fingerprint match if specified by reviewing administrator
+	if len(expectedFingerprintOpt) > 0 && strings.TrimSpace(expectedFingerprintOpt[0]) != "" {
+		expected := strings.TrimSpace(expectedFingerprintOpt[0])
+		if subtle.ConstantTimeCompare([]byte(dev.KeyFingerprint), []byte(expected)) != 1 {
+			return nil, ErrFingerprintMismatch
+		}
 	}
 
+	updated := *dev
+	updated.ApprovalStatus = string(ApprovalApproved)
+	updated.Status = string(StatusActive)
+	updated.Active = true
+	updated.ApprovedBy = adminUser
+	updated.ApprovedAt = &now
+
+	// Fail-closed persistence: Persist before in-memory mutation
+	if m.store != nil {
+		if err := m.store.UpsertDesktopDevice(updated); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrPersistenceFailed, err)
+		}
+	}
+
+	*dev = updated
 	return dev, nil
 }
 
-// RejectDevice rejects a pending workstation enrollment
+// RejectDevice rejects a pending workstation enrollment.
+// Fail-Closed: Persists rejection state before updating in-memory state.
 func (m *DesktopAuthManager) RejectDevice(id, adminUser string) (*DesktopDeviceRecord, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -248,18 +299,23 @@ func (m *DesktopAuthManager) RejectDevice(id, adminUser string) (*DesktopDeviceR
 		return nil, ErrDeviceNotFound
 	}
 
-	dev.ApprovalStatus = string(ApprovalRejected)
-	dev.Status = string(StatusRevoked)
-	dev.Active = false
+	updated := *dev
+	updated.ApprovalStatus = string(ApprovalRejected)
+	updated.Status = string(StatusRevoked)
+	updated.Active = false
 
 	if m.store != nil {
-		_ = m.store.UpsertDesktopDevice(*dev)
+		if err := m.store.UpsertDesktopDevice(updated); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrPersistenceFailed, err)
+		}
 	}
 
+	*dev = updated
 	return dev, nil
 }
 
-// RevokeDevice permanently revokes an active workstation device identity
+// RevokeDevice permanently revokes an active workstation device identity.
+// Fail-Closed: Persists revocation state before updating in-memory state.
 func (m *DesktopAuthManager) RevokeDevice(id, adminUser string) (*DesktopDeviceRecord, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -269,18 +325,46 @@ func (m *DesktopAuthManager) RevokeDevice(id, adminUser string) (*DesktopDeviceR
 		return nil, ErrDeviceNotFound
 	}
 
-	dev.Status = string(StatusRevoked)
-	dev.ApprovalStatus = string(ApprovalRejected)
-	dev.Active = false
+	updated := *dev
+	updated.Status = string(StatusRevoked)
+	updated.ApprovalStatus = string(ApprovalRejected)
+	updated.Active = false
 
 	if m.store != nil {
-		_ = m.store.UpsertDesktopDevice(*dev)
+		if err := m.store.UpsertDesktopDevice(updated); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrPersistenceFailed, err)
+		}
 	}
 
+	*dev = updated
 	return dev, nil
 }
 
-// RotateDeviceKey rotates the public key of an approved device
+// CancelPendingEnrollment cancels a pending device enrollment, allowing re-enrollment
+func (m *DesktopAuthManager) CancelPendingEnrollment(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	dev, exists := m.devices[id]
+	if !exists {
+		return ErrDeviceNotFound
+	}
+	if dev.ApprovalStatus != string(ApprovalPending) {
+		return errors.New("desktop_auth: only pending enrollments can be cancelled")
+	}
+
+	if m.store != nil {
+		if err := m.store.DeleteDesktopDevice(id); err != nil {
+			return fmt.Errorf("%w: %v", ErrPersistenceFailed, err)
+		}
+	}
+
+	delete(m.devices, id)
+	return nil
+}
+
+// RotateDeviceKey rotates the public key of an approved device.
+// Fail-Closed: Persists new key before updating in-memory state.
 func (m *DesktopAuthManager) RotateDeviceKey(id, newPublicKeyStr, adminUser string) (*DesktopDeviceRecord, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -298,15 +382,19 @@ func (m *DesktopAuthManager) RotateDeviceKey(id, newPublicKeyStr, adminUser stri
 		return nil, err
 	}
 
-	dev.PublicKey = base64.StdEncoding.EncodeToString(pubKeyBytes)
-	dev.KeyFingerprint = ComputeFingerprint(pubKeyBytes)
-	dev.KeyVersion++
-	dev.LastSeenAt = time.Now().UTC()
+	updated := *dev
+	updated.PublicKey = base64.StdEncoding.EncodeToString(pubKeyBytes)
+	updated.KeyFingerprint = ComputeFingerprint(pubKeyBytes)
+	updated.KeyVersion++
+	updated.LastSeenAt = time.Now().UTC()
 
 	if m.store != nil {
-		_ = m.store.UpsertDesktopDevice(*dev)
+		if err := m.store.UpsertDesktopDevice(updated); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrPersistenceFailed, err)
+		}
 	}
 
+	*dev = updated
 	return dev, nil
 }
 
@@ -381,7 +469,9 @@ func (m *DesktopAuthManager) IssueChallenge(id string) (*ChallengeRecord, error)
 }
 
 // VerifyProof verifies the Ed25519 signature of the challenge.
-// CRITICAL: The challenge is ATOMICALLY CONSUMED on any verification attempt (whether it succeeds or fails).
+// CRITICAL:
+// 1. The challenge is ATOMICALLY CONSUMED on any verification attempt (whether it succeeds or fails).
+// 2. If durable persistence of LastSeenAt fails, authentication fails closed and the consumed challenge cannot be replayed.
 func (m *DesktopAuthManager) VerifyProof(id, challenge, signatureStr string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -437,11 +527,16 @@ func (m *DesktopAuthManager) VerifyProof(id, challenge, signatureStr string) err
 		return ErrInvalidDeviceProof
 	}
 
-	dev.LastSeenAt = time.Now().UTC()
+	// Fail-closed persistence of activity timestamp
+	updated := *dev
+	updated.LastSeenAt = time.Now().UTC()
 	if m.store != nil {
-		_ = m.store.UpsertDesktopDevice(*dev)
+		if err := m.store.UpsertDesktopDevice(updated); err != nil {
+			return fmt.Errorf("%w: %v", ErrPersistenceFailed, err)
+		}
 	}
 
+	*dev = updated
 	return nil
 }
 

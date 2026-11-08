@@ -2,6 +2,7 @@ package security_test
 
 import (
 	"encoding/base64"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -197,6 +198,260 @@ func TestDesktopAuthManager_AsymmetricLifecycle(t *testing.T) {
 	}
 	if loaded.Status != string(security.StatusRevoked) {
 		t.Errorf("expected reloaded status REVOKED, got %s", loaded.Status)
+	}
+}
+
+// faultyDeviceStore simulates durable persistence failures
+type faultyDeviceStore struct {
+	mu          sync.RWMutex
+	devices     map[string]security.DesktopDeviceRecord
+	failUpsert  bool
+	failDelete  bool
+}
+
+func newFaultyDeviceStore() *faultyDeviceStore {
+	return &faultyDeviceStore{
+		devices: make(map[string]security.DesktopDeviceRecord),
+	}
+}
+
+func (s *faultyDeviceStore) UpsertDesktopDevice(dev security.DesktopDeviceRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failUpsert {
+		return errors.New("simulated disk I/O persistence failure: write error")
+	}
+	s.devices[dev.ID] = dev
+	return nil
+}
+
+func (s *faultyDeviceStore) GetDesktopDevice(id string) (security.DesktopDeviceRecord, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	d, ok := s.devices[id]
+	return d, ok
+}
+
+func (s *faultyDeviceStore) ListDesktopDevices() []security.DesktopDeviceRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	list := make([]security.DesktopDeviceRecord, 0, len(s.devices))
+	for _, d := range s.devices {
+		list = append(list, d)
+	}
+	return list
+}
+
+func (s *faultyDeviceStore) DeleteDesktopDevice(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failDelete {
+		return errors.New("simulated disk I/O persistence failure: delete error")
+	}
+	delete(s.devices, id)
+	return nil
+}
+
+// TestDesktopAuthManager_FaultInjection_AllMutationsFailClosed tests that every mutation method
+// fails closed without mutating in-memory state when durable persistence fails.
+func TestDesktopAuthManager_FaultInjection_AllMutationsFailClosed(t *testing.T) {
+	store := newFaultyDeviceStore()
+	mgr := security.NewDesktopAuthManager(store)
+
+	pub, priv, err := security.GenerateClientKeyPair()
+	if err != nil {
+		t.Fatalf("failed keypair gen: %v", err)
+	}
+	pubB64 := base64.StdEncoding.EncodeToString(pub)
+
+	// 1. SubmitEnrollment fail-closed on persistence failure
+	store.failUpsert = true
+	_, err = mgr.SubmitEnrollment(security.DesktopEnrollmentRequest{
+		ID:        "ws-fault-1",
+		PublicKey: pubB64,
+	})
+	if !errors.Is(err, security.ErrPersistenceFailed) {
+		t.Fatalf("expected ErrPersistenceFailed on SubmitEnrollment, got %v", err)
+	}
+	// Verify memory state: device must NOT exist in memory
+	if _, err := mgr.GetDevice("ws-fault-1"); err != security.ErrDeviceNotFound {
+		t.Fatalf("phantom device found in memory after failed SubmitEnrollment: %v", err)
+	}
+
+	// Now allow enrollment to succeed
+	store.failUpsert = false
+	rec, err := mgr.SubmitEnrollment(security.DesktopEnrollmentRequest{
+		ID:        "ws-fault-1",
+		PublicKey: pubB64,
+	})
+	if err != nil {
+		t.Fatalf("enrollment failed: %v", err)
+	}
+	if rec.ApprovalStatus != string(security.ApprovalPending) {
+		t.Fatalf("expected status PENDING, got %s", rec.ApprovalStatus)
+	}
+
+	// 2. ApproveDevice fail-closed on persistence failure
+	store.failUpsert = true
+	_, err = mgr.ApproveDevice("ws-fault-1", "admin")
+	if !errors.Is(err, security.ErrPersistenceFailed) {
+		t.Fatalf("expected ErrPersistenceFailed on ApproveDevice, got %v", err)
+	}
+	// Memory state must still be PENDING (not approved, not active)
+	cur, _ := mgr.GetDevice("ws-fault-1")
+	if cur.ApprovalStatus != string(security.ApprovalPending) || cur.Active {
+		t.Fatalf("in-memory state corrupted after failed ApproveDevice: %+v", cur)
+	}
+
+	// Now allow approval to succeed
+	store.failUpsert = false
+	_, err = mgr.ApproveDevice("ws-fault-1", "admin")
+	if err != nil {
+		t.Fatalf("approve failed: %v", err)
+	}
+
+	// 3. RotateDeviceKey fail-closed on persistence failure
+	newPub, _, _ := security.GenerateClientKeyPair()
+	newPubB64 := base64.StdEncoding.EncodeToString(newPub)
+	store.failUpsert = true
+	_, err = mgr.RotateDeviceKey("ws-fault-1", newPubB64, "admin")
+	if !errors.Is(err, security.ErrPersistenceFailed) {
+		t.Fatalf("expected ErrPersistenceFailed on RotateDeviceKey, got %v", err)
+	}
+	cur, _ = mgr.GetDevice("ws-fault-1")
+	if cur.KeyVersion != 1 || cur.PublicKey != pubB64 {
+		t.Fatalf("in-memory key mutated after failed RotateDeviceKey: %+v", cur)
+	}
+
+	// 4. VerifyProof fail-closed on LastSeenAt persistence failure
+	chRec, err := mgr.IssueChallenge("ws-fault-1")
+	if err != nil {
+		t.Fatalf("failed to issue challenge: %v", err)
+	}
+	sig := security.SignChallenge(priv, chRec.Challenge)
+	// Persistence fails when writing LastSeenAt
+	store.failUpsert = true
+	err = mgr.VerifyProof("ws-fault-1", chRec.Challenge, sig)
+	if !errors.Is(err, security.ErrPersistenceFailed) {
+		t.Fatalf("expected ErrPersistenceFailed on VerifyProof when store fails, got %v", err)
+	}
+	// Challenge must still have been consumed atomically
+	store.failUpsert = false
+	err = mgr.VerifyProof("ws-fault-1", chRec.Challenge, sig)
+	if err != security.ErrChallengeNotFound {
+		t.Fatalf("expected ErrChallengeNotFound on replay of consumed challenge, got %v", err)
+	}
+
+	// 5. RejectDevice fail-closed on persistence failure
+	store.failUpsert = true
+	_, err = mgr.RejectDevice("ws-fault-1", "admin")
+	if !errors.Is(err, security.ErrPersistenceFailed) {
+		t.Fatalf("expected ErrPersistenceFailed on RejectDevice, got %v", err)
+	}
+	cur, _ = mgr.GetDevice("ws-fault-1")
+	if cur.ApprovalStatus != string(security.ApprovalApproved) {
+		t.Fatalf("in-memory state mutated after failed RejectDevice: %+v", cur)
+	}
+
+	// 6. RevokeDevice fail-closed on persistence failure
+	store.failUpsert = true
+	_, err = mgr.RevokeDevice("ws-fault-1", "admin")
+	if !errors.Is(err, security.ErrPersistenceFailed) {
+		t.Fatalf("expected ErrPersistenceFailed on RevokeDevice, got %v", err)
+	}
+	cur, _ = mgr.GetDevice("ws-fault-1")
+	if cur.Status != string(security.StatusActive) || !cur.Active {
+		t.Fatalf("in-memory state mutated after failed RevokeDevice: %+v", cur)
+	}
+
+	// 7. CancelPendingEnrollment fail-closed on persistence failure
+	store.failUpsert = false
+	pubPending, _, _ := security.GenerateClientKeyPair()
+	_, _ = mgr.SubmitEnrollment(security.DesktopEnrollmentRequest{
+		ID:        "ws-fault-pending",
+		PublicKey: base64.StdEncoding.EncodeToString(pubPending),
+	})
+	store.failDelete = true
+	err = mgr.CancelPendingEnrollment("ws-fault-pending")
+	if !errors.Is(err, security.ErrPersistenceFailed) {
+		t.Fatalf("expected ErrPersistenceFailed on CancelPendingEnrollment, got %v", err)
+	}
+	if _, err := mgr.GetDevice("ws-fault-pending"); err != nil {
+		t.Fatalf("pending enrollment deleted from memory despite persistence failure")
+	}
+}
+
+// TestDesktopAuthManager_PendingEnrollmentOverwriteProtectionAndCancel tests pending device lifecycle
+func TestDesktopAuthManager_PendingEnrollmentOverwriteProtectionAndCancel(t *testing.T) {
+	store := newMockDeviceStore()
+	mgr := security.NewDesktopAuthManager(store)
+
+	pub1, _, _ := security.GenerateClientKeyPair()
+	pub2, _, _ := security.GenerateClientKeyPair()
+
+	// 1. Submit pending enrollment
+	_, err := mgr.SubmitEnrollment(security.DesktopEnrollmentRequest{
+		ID:        "ws-pending-1",
+		PublicKey: base64.StdEncoding.EncodeToString(pub1),
+	})
+	if err != nil {
+		t.Fatalf("initial enrollment failed: %v", err)
+	}
+
+	// 2. Resubmission of pending device must be rejected with ErrDevicePendingApproval
+	_, err = mgr.SubmitEnrollment(security.DesktopEnrollmentRequest{
+		ID:        "ws-pending-1",
+		PublicKey: base64.StdEncoding.EncodeToString(pub2),
+	})
+	if err != security.ErrDevicePendingApproval {
+		t.Fatalf("expected ErrDevicePendingApproval on duplicate pending enrollment, got %v", err)
+	}
+
+	// 3. Cancel pending enrollment
+	if err := mgr.CancelPendingEnrollment("ws-pending-1"); err != nil {
+		t.Fatalf("cancel pending enrollment failed: %v", err)
+	}
+
+	// 4. After cancellation, re-enrollment succeeds
+	rec, err := mgr.SubmitEnrollment(security.DesktopEnrollmentRequest{
+		ID:        "ws-pending-1",
+		PublicKey: base64.StdEncoding.EncodeToString(pub2),
+	})
+	if err != nil {
+		t.Fatalf("re-enrollment failed after cancellation: %v", err)
+	}
+	if rec.KeyFingerprint != security.ComputeFingerprint(pub2) {
+		t.Fatalf("re-enrolled device does not match new key fingerprint")
+	}
+}
+
+// TestDesktopAuthManager_ApproveFingerprintVerification verifies strict fingerprint binding during approval
+func TestDesktopAuthManager_ApproveFingerprintVerification(t *testing.T) {
+	mgr := security.NewDesktopAuthManager(newMockDeviceStore())
+	pub, _, _ := security.GenerateClientKeyPair()
+	fp := security.ComputeFingerprint(pub)
+
+	_, err := mgr.SubmitEnrollment(security.DesktopEnrollmentRequest{
+		ID:        "ws-fp-check",
+		PublicKey: base64.StdEncoding.EncodeToString(pub),
+	})
+	if err != nil {
+		t.Fatalf("failed enrollment: %v", err)
+	}
+
+	// Approval with mismatched fingerprint must fail
+	_, err = mgr.ApproveDevice("ws-fp-check", "admin", "SHA256:0000000000000000000000000000000000000000000000000000000000000000")
+	if err != security.ErrFingerprintMismatch {
+		t.Fatalf("expected ErrFingerprintMismatch, got %v", err)
+	}
+
+	// Approval with matching fingerprint succeeds
+	approved, err := mgr.ApproveDevice("ws-fp-check", "admin", fp)
+	if err != nil {
+		t.Fatalf("expected approval to succeed with matching fingerprint, got %v", err)
+	}
+	if approved.KeyFingerprint != fp || approved.ApprovalStatus != string(security.ApprovalApproved) {
+		t.Fatalf("unexpected state after approval: %+v", approved)
 	}
 }
 

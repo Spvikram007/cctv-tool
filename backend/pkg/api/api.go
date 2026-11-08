@@ -651,7 +651,7 @@ func (s *Server) registerRoutes() {
 		checks := make(map[string]string)
 		isReady := true
 
-		if s.store != nil {
+		if s.store != nil && s.store.HealthCheck() == nil {
 			checks["database"] = "READY"
 		} else {
 			checks["database"] = "UNAVAILABLE"

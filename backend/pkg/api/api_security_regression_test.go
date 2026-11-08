@@ -327,3 +327,31 @@ func TestSecurityAuditKeyRotationAndSignedExport(t *testing.T) {
 		t.Errorf("expected application/json Content-Type, got %s", expRec.Header().Get("Content-Type"))
 	}
 }
+
+// 7. Database Startup Integrity & Readiness Probe Lockdown
+func TestSecurityReadinessProbe_DatabasePersistenceFailsClosed(t *testing.T) {
+	_, handler, _, _ := setupSecurityTestServer(t)
+
+	// 1. Ready probe on healthy server returns 200 OK
+	reqReady := httptest.NewRequest("GET", "/api/v1/readyz", nil)
+	recReady := httptest.NewRecorder()
+	handler.ServeHTTP(recReady, reqReady)
+	if recReady.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for readyz on healthy system, got %d", recReady.Code)
+	}
+
+	// 2. Ready probe with nil store returns 503 Service Unavailable
+	brokenServer := api.NewServer(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	reqBroken := httptest.NewRequest("GET", "/api/v1/readyz", nil)
+	recBroken := httptest.NewRecorder()
+	brokenServer.Handler().ServeHTTP(recBroken, reqBroken)
+
+	if recBroken.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 Service Unavailable when database persistence is missing/unhealthy, got %d", recBroken.Code)
+	}
+	var resp map[string]interface{}
+	_ = json.NewDecoder(recBroken.Body).Decode(&resp)
+	if resp["ready"] != false {
+		t.Errorf("expected ready=false in response: %+v", resp)
+	}
+}
