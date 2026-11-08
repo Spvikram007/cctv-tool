@@ -51,3 +51,4 @@ return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].String(), port))
 
 ### Redirect Target Validation
 HTTP redirects (`CheckRedirect` hook) are recursively evaluated against the SSRF validation policy. If a remote device or proxy issues a `301/302` redirect pointing to a cloud metadata service or localhost, the redirect is immediately aborted with `ErrSSRFRedirectBlocked`.
+

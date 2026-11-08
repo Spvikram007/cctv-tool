@@ -55,3 +55,4 @@ When an alarm with severity `CRITICAL` or `HIGH` is triggered:
 - **In-Memory Ring Buffer:** 1,000 active events cached with instantaneous O(1) ingestion.
 - **Deduplication Throughput:** Tested up to 10,000 synthetic events/sec without thread contention.
 - **Audit Logging:** Every state transition (Acknowledge, Assign, Resolve) writes a signed entry to the HMAC-SHA256 audit chain.
+

@@ -43,3 +43,4 @@ Fixed focal-length cameras must never accept PTZ commands or pretend to move. CC
    - Out-of-bounds speed requests are clamped to max safe thresholds to prevent physical motor gear stripping.
 3. **Emergency Stop Precedence:**
    - The `/ptz/stop` command bypasses pending action queues and delivers an immediate zero-velocity motor brake to all axes.
+

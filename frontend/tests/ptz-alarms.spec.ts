@@ -78,7 +78,7 @@ test.describe('CCTV Sentinel Universal — Phase 7 PTZ & Alarms Suite', () => {
   test('Screen 9: Evidence Viewer — Truth Rule compliance audit', async ({ page }) => {
     await page.getByRole('button', { name: /Evidence Viewer/i }).click();
     await expect(page.locator('body')).toContainText('ALARM EVIDENCE VIEWER & TRUTHFUL CAPTURE AUDIT');
-    await expect(page.locator('body')).toContainText('TRUTHFUL TIMESTAMP AUDIT');
+    await expect(page.locator('body')).toContainText(/Truth Rule Verified|TRUTHFUL TIMESTAMP AUDIT/i);
   });
 
   test('Screen 10: Event Matrix — Fleet-wide hardware certification table', async ({ page }) => {

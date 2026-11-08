@@ -180,20 +180,48 @@ func getSession(r *http.Request) *security.Session {
 	return nil
 }
 
-func checkTenantAccess(sess *security.Session, tenantID, siteID string) bool {
+const (
+	DefaultTenantID = "default"
+	DefaultSiteID   = "hq"
+)
+
+// isSuperAdmin returns true only if the session belongs to a genuine global administrator
+func isSuperAdmin(sess *security.Session) bool {
 	if sess == nil {
 		return false
 	}
-	// Super-admins in "default" or empty tenant have global fleet access
-	if sess.Role == security.RoleAdmin && (sess.TenantID == "" || sess.TenantID == "default") {
+	return sess.Role == security.RoleAdmin && (sess.TenantID == "" || sess.TenantID == DefaultTenantID || sess.TenantID == "system")
+}
+
+// checkTenantAccess strictly enforces tenant and site isolation boundaries
+func checkTenantAccess(sess *security.Session, resourceTenantID, resourceSiteID string) bool {
+	if sess == nil {
+		return false
+	}
+
+	// 1. Genuine global super-admin has fleet-wide access across all tenants and legacy devices
+	if isSuperAdmin(sess) {
 		return true
 	}
-	if sess.TenantID != "" && sess.TenantID != "default" && tenantID != "" && sess.TenantID != tenantID {
+
+	// 2. Tenant isolation: A missing resource TenantID does NOT grant access to tenant-scoped users
+	if resourceTenantID == "" {
+		// Legacy unassigned device: blocked for tenant-scoped operators until claimed/migrated
 		return false
 	}
-	if sess.SiteID != "" && sess.SiteID != "default" && siteID != "" && sess.SiteID != siteID {
+
+	// Mismatched tenant access is strictly rejected
+	if sess.TenantID != resourceTenantID {
 		return false
 	}
+
+	// 3. Site isolation: A missing resource SiteID does NOT grant access to site-restricted users
+	if sess.SiteID != "" && sess.SiteID != DefaultSiteID && sess.SiteID != "all" {
+		if resourceSiteID == "" || resourceSiteID != sess.SiteID {
+			return false
+		}
+	}
+
 	return true
 }
 
@@ -213,10 +241,11 @@ func (s *Server) requireAuth(perm security.Permission, handler http.HandlerFunc)
 			token = strings.TrimPrefix(authHeader, "Bearer ")
 		} else if strings.HasPrefix(authHeader, "bearer ") {
 			token = strings.TrimPrefix(authHeader, "bearer ")
-		} else {
-			token = r.URL.Query().Get("token")
+		} else if cookie, err := r.Cookie("sentinel_session"); err == nil && cookie.Value != "" {
+			token = cookie.Value
 		}
 
+		// Security: Do NOT accept authentication credentials through URL query parameters
 		if token == "" {
 			writeError(w, r, http.StatusUnauthorized, "UNAUTHORIZED", "Authentication required: missing Bearer session token")
 			return
@@ -398,7 +427,14 @@ func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTechnicianReport(w http.ResponseWriter, r *http.Request) {
-	devs := s.store.ListDevices()
+	sess := getSession(r)
+	allDevs := s.store.ListDevices()
+	devs := make([]models.Device, 0, len(allDevs))
+	for _, d := range allDevs {
+		if checkTenantAccess(sess, d.TenantID, d.SiteID) {
+			devs = append(devs, d)
+		}
+	}
 	lic := s.licenseMgr.GetLicense()
 	logs := s.logger.GetEntries()
 
@@ -534,6 +570,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/auth/setup", s.handleAuthSetup)
 	s.mux.HandleFunc("/api/v1/auth/login", s.handleSecurityLogin)
 	s.mux.HandleFunc("/api/v1/security/login", s.handleSecurityLogin)
+	s.mux.HandleFunc("/api/v1/auth/logout", s.handleSecurityLogout)
+	s.mux.HandleFunc("/api/v1/security/logout", s.handleSecurityLogout)
 
 	// 1. System status
 	s.mux.HandleFunc("/api/v1/system/status", s.requireAuth(security.PermViewLive, func(w http.ResponseWriter, r *http.Request) {
@@ -702,8 +740,16 @@ func (s *Server) registerRoutes() {
 
 	// 9. Sites
 	s.mux.HandleFunc("/api/v1/sites", s.requireAuth(security.PermViewLive, func(w http.ResponseWriter, r *http.Request) {
+		sess := getSession(r)
 		if r.Method == "GET" {
-			writeJSON(w, http.StatusOK, s.store.ListSites())
+			sites := s.store.ListSites()
+			filtered := make([]database.Site, 0, len(sites))
+			for _, st := range sites {
+				if isSuperAdmin(sess) || sess == nil || sess.SiteID == "" || sess.SiteID == DefaultSiteID || sess.SiteID == "all" || st.ID == sess.SiteID {
+					filtered = append(filtered, st)
+				}
+			}
+			writeJSON(w, http.StatusOK, filtered)
 			return
 		}
 		if r.Method == "POST" {
@@ -818,6 +864,45 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 		s.handleDevicePTZ(w, r, &dev, parts)
 		return
 	}
+	if sub == "migrate" {
+		if r.Method != "POST" {
+			writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
+			return
+		}
+		if !isSuperAdmin(sess) {
+			writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Migrating device tenant/site ownership requires global administrator privileges")
+			return
+		}
+		var req struct {
+			TargetTenant string `json:"target_tenant"`
+			TargetSite   string `json:"target_site"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeSimpleError(w, r, http.StatusBadRequest, "Invalid migration payload")
+			return
+		}
+		if req.TargetTenant == "" {
+			req.TargetTenant = DefaultTenantID
+		}
+		if req.TargetSite == "" {
+			req.TargetSite = DefaultSiteID
+		}
+		oldTenant := dev.TenantID
+		oldSite := dev.SiteID
+		dev.TenantID = req.TargetTenant
+		dev.SiteID = req.TargetSite
+		s.store.UpsertDevice(dev)
+		s.logger.Log(sess.Username, dev.ID, dev.IP, "MIGRATE_DEVICE", "SECURITY", "SUCCESS",
+			fmt.Sprintf("Migrated device %s from [tenant=%s, site=%s] to [tenant=%s, site=%s]", dev.ID, oldTenant, oldSite, dev.TenantID, dev.SiteID), "")
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success":       true,
+			"device_id":     dev.ID,
+			"target_tenant": dev.TenantID,
+			"target_site":   dev.SiteID,
+			"message":       "Device ownership successfully migrated",
+		})
+		return
+	}
 	if sub == "reboot" {
 		if r.Method != "POST" {
 			writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
@@ -825,6 +910,18 @@ func (s *Server) handleDeviceSubroutes(w http.ResponseWriter, r *http.Request) {
 		}
 		if !s.checkPermission(r, security.PermReboot) {
 			writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Device reboot requires REBOOT permission")
+			return
+		}
+	}
+	if sub == "config" {
+		if !s.checkPermission(r, security.PermDeviceConfig) {
+			writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Configuration operations require DEVICE_CONFIG permission")
+			return
+		}
+	}
+	if sub == "auth" && r.Method == "POST" {
+		if !s.checkPermission(r, security.PermDeviceConfig) {
+			writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Device credential configuration requires DEVICE_CONFIG permission")
 			return
 		}
 	}
@@ -1480,8 +1577,23 @@ func (s *Server) handleBatchPreview(w http.ResponseWriter, r *http.Request) {
 		writeSimpleError(w, r, http.StatusBadRequest, "Invalid batch preview payload: "+err.Error())
 		return
 	}
-	if req.Operator == "" {
+	sess := getSession(r)
+	if sess != nil && sess.Username != "" {
+		req.Operator = sess.Username
+	} else if req.Operator == "" {
 		req.Operator = "Technician"
+	}
+
+	for _, devID := range req.TargetIDs {
+		dev, ok := s.store.GetDevice(devID)
+		if !ok {
+			writeError(w, r, http.StatusNotFound, "NOT_FOUND", fmt.Sprintf("Target device %s not found", devID))
+			return
+		}
+		if !checkTenantAccess(sess, dev.TenantID, dev.SiteID) {
+			writeError(w, r, http.StatusForbidden, "CROSS_TENANT_ACCESS_DENIED", fmt.Sprintf("Access denied: device %s belongs to an isolated tenant or site", devID))
+			return
+		}
 	}
 
 	preview, err := s.batchEng.GenerateBatchPreview(req.Action, req.TargetIDs, req.Payload, req.Operator)
@@ -1570,6 +1682,19 @@ func (s *Server) handleBatchCompare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	sess := getSession(r)
+	for _, id := range req.TargetIDs {
+		dev, ok := s.store.GetDevice(id)
+		if !ok {
+			writeError(w, r, http.StatusNotFound, "NOT_FOUND", fmt.Sprintf("Target device %s not found", id))
+			return
+		}
+		if !checkTenantAccess(sess, dev.TenantID, dev.SiteID) {
+			writeError(w, r, http.StatusForbidden, "CROSS_TENANT_ACCESS_DENIED", fmt.Sprintf("Access denied: device %s belongs to an isolated tenant or site", id))
+			return
+		}
+	}
+
 	comparison := make([]map[string]interface{}, 0, len(req.TargetIDs))
 	for _, id := range req.TargetIDs {
 		dev, ok := s.store.GetDevice(id)
@@ -1597,7 +1722,14 @@ func (s *Server) handleBatchCompare(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleBatchExport(w http.ResponseWriter, r *http.Request) {
-	devs := s.store.ListDevices()
+	sess := getSession(r)
+	allDevs := s.store.ListDevices()
+	devs := make([]models.Device, 0, len(allDevs))
+	for _, d := range allDevs {
+		if checkTenantAccess(sess, d.TenantID, d.SiteID) {
+			devs = append(devs, d)
+		}
+	}
 	rawJSON, err := json.Marshal(devs)
 	if err != nil {
 		writeError(w, r, http.StatusInternalServerError, "MARSHAL_ERROR", err.Error())
@@ -1632,6 +1764,16 @@ func (s *Server) handleBatchImport(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeSimpleError(w, r, http.StatusBadRequest, "Invalid import payload")
 		return
+	}
+
+	sess := getSession(r)
+	if !isSuperAdmin(sess) && sess != nil {
+		for _, d := range req.Inventory {
+			if d.TenantID != "" && d.TenantID != sess.TenantID {
+				writeError(w, r, http.StatusForbidden, "CROSS_TENANT_ACCESS_DENIED", "Cross-tenant import forbidden: non-admin cannot import devices belonging to other tenants")
+				return
+			}
+		}
 	}
 
 	sig := req.DigitalSignature
@@ -1722,6 +1864,17 @@ func (s *Server) handleFirmwareCheckCompatibility(w http.ResponseWriter, r *http
 		}
 	}
 
+	dev, ok := s.store.GetDevice(deviceID)
+	if !ok {
+		writeError(w, r, http.StatusNotFound, "NOT_FOUND", "Device not found")
+		return
+	}
+	sess := getSession(r)
+	if !checkTenantAccess(sess, dev.TenantID, dev.SiteID) {
+		writeError(w, r, http.StatusForbidden, "CROSS_TENANT_ACCESS_DENIED", "Access denied: target device belongs to an isolated tenant or site")
+		return
+	}
+
 	elig, err := s.firmwareEng.CheckEligibility(deviceID, pkgID)
 	if err != nil {
 		writeSimpleError(w, r, http.StatusBadRequest, err.Error())
@@ -1750,6 +1903,20 @@ func (s *Server) handleFirmwarePreview(w http.ResponseWriter, r *http.Request) {
 	pkgID := req.PackageID
 	if pkgID == "" {
 		pkgID = req.FirmwareID
+	}
+
+	dev, ok := s.store.GetDevice(req.DeviceID)
+	if !ok {
+		writeError(w, r, http.StatusNotFound, "NOT_FOUND", "Device not found")
+		return
+	}
+	sess := getSession(r)
+	if !checkTenantAccess(sess, dev.TenantID, dev.SiteID) {
+		writeError(w, r, http.StatusForbidden, "CROSS_TENANT_ACCESS_DENIED", "Access denied: target device belongs to an isolated tenant or site")
+		return
+	}
+	if sess != nil && sess.Username != "" {
+		req.Operator = sess.Username
 	}
 
 	preview, err := s.firmwareEng.StageFirmwarePreview(req.DeviceID, pkgID, req.Operator)
@@ -1816,11 +1983,65 @@ func (s *Server) handleSecurityLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	http.SetCookie(w, &http.Cookie{
+		Name:     "sentinel_session",
+		Value:    sess.Token,
+		Path:     "/",
+		Expires:  sess.ExpiresAt,
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+		Secure:   r.TLS != nil,
+	})
+
 	s.logger.Log(req.Username, "SYSTEM", r.RemoteAddr, "LOGIN", "SECURITY", "SUCCESS", fmt.Sprintf("Operator authenticated (Role: %s)", sess.Role), "")
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success":     true,
 		"session":     sess,
 		"permissions": security.RolePermissions[sess.Role],
+	})
+}
+
+func (s *Server) handleSecurityLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		writeSimpleError(w, r, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	token := ""
+	authHeader := r.Header.Get("Authorization")
+	if strings.HasPrefix(authHeader, "Bearer ") {
+		token = strings.TrimPrefix(authHeader, "Bearer ")
+	} else if strings.HasPrefix(authHeader, "bearer ") {
+		token = strings.TrimPrefix(authHeader, "bearer ")
+	} else if cookie, err := r.Cookie("sentinel_session"); err == nil && cookie.Value != "" {
+		token = cookie.Value
+	}
+
+	sess := getSession(r)
+	userName := "Unknown"
+	if sess != nil {
+		userName = sess.Username
+	}
+
+	if token != "" {
+		s.rbacMgr.RevokeSession(token)
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     "sentinel_session",
+		Value:    "",
+		Path:     "/",
+		Expires:  time.Unix(0, 0),
+		MaxAge:   -1,
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+		Secure:   r.TLS != nil,
+	})
+
+	s.logger.Log(userName, "SYSTEM", r.RemoteAddr, "LOGOUT", "SECURITY", "SUCCESS", "Session terminated and revoked server-side", "")
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Session terminated successfully",
 	})
 }
 
@@ -1886,9 +2107,13 @@ func (s *Server) handleRecordersList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	sess := getSession(r)
 	devs := s.store.ListDevices()
 	profiles := make([]*recorder.RecorderProfile, 0)
 	for _, d := range devs {
+		if !checkTenantAccess(sess, d.TenantID, d.SiteID) {
+			continue
+		}
 		modelUpper := strings.ToUpper(d.Model)
 		catUpper := strings.ToUpper(string(d.Category))
 		if catUpper == "XVR" || catUpper == "DVR" || catUpper == "NVR" || catUpper == "HVR" || catUpper == "HYBRID_RECORDER" ||
@@ -1913,12 +2138,14 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 	deviceID := parts[0]
 
 	dev, ok := s.store.GetDevice(deviceID)
-	if ok {
-		sess := getSession(r)
-		if !checkTenantAccess(sess, dev.TenantID, dev.SiteID) {
-			writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Access denied: recorder belongs to an isolated tenant or site")
-			return
-		}
+	if !ok {
+		writeSimpleError(w, r, http.StatusNotFound, "Recorder not found")
+		return
+	}
+	sess := getSession(r)
+	if !checkTenantAccess(sess, dev.TenantID, dev.SiteID) {
+		writeError(w, r, http.StatusForbidden, "CROSS_TENANT_ACCESS_DENIED", "Access denied: recorder belongs to an isolated tenant or site")
+		return
 	}
 
 	// Route: GET /api/v1/recorders/:id
@@ -2144,6 +2371,10 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 			action := parts[3]
 			switch action {
 			case "analog-format":
+				if !s.checkPermission(r, security.PermRecorderManage) {
+					writeError(w, r, http.StatusForbidden, "INSUFFICIENT_PERMISSIONS", "Analog format configuration requires RECORDER_MANAGE permission")
+					return
+				}
 				var req struct {
 					SignalFormat recorder.AnalogFormat `json:"signal_format"`
 				}
@@ -2157,6 +2388,10 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 				return
 
 			case "coaxial-control":
+				if !s.checkPermission(r, security.PermPTZControl) {
+					writeError(w, r, http.StatusForbidden, "INSUFFICIENT_PERMISSIONS", "Coaxial UTC control requires PTZ_CONTROL permission")
+					return
+				}
 				var req struct {
 					Command string `json:"command"`
 				}
@@ -2169,6 +2404,10 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 				return
 
 			case "register-ip":
+				if !s.checkPermission(r, security.PermRecorderManage) {
+					writeError(w, r, http.StatusForbidden, "INSUFFICIENT_PERMISSIONS", "IP camera registration requires RECORDER_MANAGE permission")
+					return
+				}
 				var req recorder.IPRegistrationReq
 				_ = json.NewDecoder(r.Body).Decode(&req)
 				req.ChannelID = chID
@@ -2190,6 +2429,10 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 					writeJSON(w, http.StatusOK, sched)
 					return
 				}
+				if !s.checkPermission(r, security.PermRecorderManage) {
+					writeError(w, r, http.StatusForbidden, "INSUFFICIENT_PERMISSIONS", "Updating recording schedules requires RECORDER_MANAGE permission")
+					return
+				}
 				var sched recorder.RecordingSchedule
 				_ = json.NewDecoder(r.Body).Decode(&sched)
 				sched.ChannelID = chID
@@ -2208,6 +2451,10 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 			subAction := parts[2]
 			switch subAction {
 			case "search":
+				if !s.checkPermission(r, security.PermPlaybackView) {
+					writeError(w, r, http.StatusForbidden, "INSUFFICIENT_PERMISSIONS", "Searching recordings requires PLAYBACK_VIEW permission")
+					return
+				}
 				chID, _ := strconv.Atoi(r.URL.Query().Get("channel_id"))
 				if chID <= 0 {
 					chID = 1
@@ -2234,6 +2481,10 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 				return
 
 			case "playback-session":
+				if !s.checkPermission(r, security.PermPlaybackView) {
+					writeError(w, r, http.StatusForbidden, "INSUFFICIENT_PERMISSIONS", "Creating playback sessions requires PLAYBACK_VIEW permission")
+					return
+				}
 				var req struct {
 					ChannelID int       `json:"channel_id"`
 					StartTime time.Time `json:"start_time"`
@@ -2258,6 +2509,10 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 				return
 
 			case "export":
+				if !s.checkPermission(r, security.PermPlaybackExport) {
+					writeError(w, r, http.StatusForbidden, "INSUFFICIENT_PERMISSIONS", "Exporting recordings requires PLAYBACK_EXPORT permission")
+					return
+				}
 				var req struct {
 					ChannelID int    `json:"channel_id"`
 					SegmentID string `json:"segment_id"`
@@ -2329,6 +2584,10 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 		}
 
 	case "playback":
+		if !s.checkPermission(r, security.PermPlaybackView) {
+			writeError(w, r, http.StatusForbidden, "INSUFFICIENT_PERMISSIONS", "Viewing playback frames requires PLAYBACK_VIEW permission")
+			return
+		}
 		// Stream playback frame endpoint
 		if len(parts) >= 4 {
 			// Return genuine verified JPEG test frame for playback scrubber
@@ -2355,6 +2614,12 @@ func (s *Server) handleRecorderSubroutes(w http.ResponseWriter, r *http.Request)
 // -----------------------------------------------------------------------------
 
 func (s *Server) handleDevicePTZ(w http.ResponseWriter, r *http.Request, dev *models.Device, parts []string) {
+	sess := getSession(r)
+	operator := "Technician"
+	if sess != nil && sess.Username != "" {
+		operator = sess.Username
+	}
+
 	// Route: GET /api/v1/devices/{id}/ptz or /api/v1/devices/{id}/ptz/capabilities
 	if (r.Method == "GET" && len(parts) == 2) || (len(parts) >= 3 && parts[2] == "capabilities") {
 		caps, err := s.ptzEng.GetCapabilities(dev.ID)
@@ -2370,6 +2635,10 @@ func (s *Server) handleDevicePTZ(w http.ResponseWriter, r *http.Request, dev *mo
 		subAction := parts[2]
 		switch subAction {
 		case "move":
+			if !s.checkPermission(r, security.PermPTZControl) {
+				writeError(w, r, http.StatusForbidden, "INSUFFICIENT_PERMISSIONS", "PTZ movement requires PTZ_CONTROL permission")
+				return
+			}
 			var req ptz.MoveRequest
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				writeSimpleError(w, r, http.StatusBadRequest, "Invalid move request payload: "+err.Error())
@@ -2377,17 +2646,17 @@ func (s *Server) handleDevicePTZ(w http.ResponseWriter, r *http.Request, dev *mo
 			}
 			switch req.MovementType {
 			case ptz.MovementRelative:
-				if err := s.ptzEng.RelativeMove(dev.ID, req.Pan, req.Tilt, req.Zoom, req.Speed, "Technician"); err != nil {
+				if err := s.ptzEng.RelativeMove(dev.ID, req.Pan, req.Tilt, req.Zoom, req.Speed, operator); err != nil {
 					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 					return
 				}
 			case ptz.MovementAbsolute:
-				if err := s.ptzEng.AbsoluteMove(dev.ID, req.Pan, req.Tilt, req.Zoom, req.Speed, "Technician"); err != nil {
+				if err := s.ptzEng.AbsoluteMove(dev.ID, req.Pan, req.Tilt, req.Zoom, req.Speed, operator); err != nil {
 					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 					return
 				}
 			default:
-				if err := s.ptzEng.ContinuousMove(dev.ID, req.Pan, req.Tilt, req.Zoom, req.Speed, req.TimeoutSec, "Technician"); err != nil {
+				if err := s.ptzEng.ContinuousMove(dev.ID, req.Pan, req.Tilt, req.Zoom, req.Speed, req.TimeoutSec, operator); err != nil {
 					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 					return
 				}
@@ -2396,7 +2665,11 @@ func (s *Server) handleDevicePTZ(w http.ResponseWriter, r *http.Request, dev *mo
 			return
 
 		case "stop":
-			if err := s.ptzEng.Stop(dev.ID, "Technician"); err != nil {
+			if !s.checkPermission(r, security.PermPTZControl) {
+				writeError(w, r, http.StatusForbidden, "INSUFFICIENT_PERMISSIONS", "PTZ stop requires PTZ_CONTROL permission")
+				return
+			}
+			if err := s.ptzEng.Stop(dev.ID, operator); err != nil {
 				writeSimpleError(w, r, http.StatusInternalServerError, err.Error())
 				return
 			}
@@ -2404,12 +2677,16 @@ func (s *Server) handleDevicePTZ(w http.ResponseWriter, r *http.Request, dev *mo
 			return
 
 		case "focus-iris":
+			if !s.checkPermission(r, security.PermPTZControl) {
+				writeError(w, r, http.StatusForbidden, "INSUFFICIENT_PERMISSIONS", "PTZ focus/iris control requires PTZ_CONTROL permission")
+				return
+			}
 			var req ptz.FocusIrisRequest
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				writeSimpleError(w, r, http.StatusBadRequest, "Invalid focus/iris request: "+err.Error())
 				return
 			}
-			if err := s.ptzEng.FocusIris(dev.ID, req, "Technician"); err != nil {
+			if err := s.ptzEng.FocusIris(dev.ID, req, operator); err != nil {
 				writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 				return
 			}
@@ -2429,12 +2706,16 @@ func (s *Server) handleDevicePTZ(w http.ResponseWriter, r *http.Request, dev *mo
 
 			// Subroute: POST /api/v1/devices/{id}/ptz/presets/{presetId}/goto
 			if len(parts) >= 5 && parts[4] == "goto" {
+				if !s.checkPermission(r, security.PermPTZControl) {
+					writeError(w, r, http.StatusForbidden, "INSUFFICIENT_PERMISSIONS", "Navigating to PTZ presets requires PTZ_CONTROL permission")
+					return
+				}
 				pID, _ := strconv.Atoi(parts[3])
 				var speedReq struct {
 					Speed float64 `json:"speed"`
 				}
 				_ = json.NewDecoder(r.Body).Decode(&speedReq)
-				if err := s.ptzEng.GotoPreset(dev.ID, pID, speedReq.Speed, "Technician"); err != nil {
+				if err := s.ptzEng.GotoPreset(dev.ID, pID, speedReq.Speed, operator); err != nil {
 					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 					return
 				}
@@ -2444,12 +2725,16 @@ func (s *Server) handleDevicePTZ(w http.ResponseWriter, r *http.Request, dev *mo
 
 			// Subroute: PUT /api/v1/devices/{id}/ptz/presets/{presetId} (Rename)
 			if r.Method == "PUT" && len(parts) >= 4 {
+				if !s.checkPermission(r, security.PermPTZManage) {
+					writeError(w, r, http.StatusForbidden, "INSUFFICIENT_PERMISSIONS", "Renaming PTZ presets requires PTZ_MANAGE permission")
+					return
+				}
 				pID, _ := strconv.Atoi(parts[3])
 				var renameReq struct {
 					Name string `json:"name"`
 				}
 				_ = json.NewDecoder(r.Body).Decode(&renameReq)
-				renamed, err := s.ptzEng.RenamePreset(dev.ID, pID, renameReq.Name, "Technician")
+				renamed, err := s.ptzEng.RenamePreset(dev.ID, pID, renameReq.Name, operator)
 				if err != nil {
 					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 					return
@@ -2460,8 +2745,12 @@ func (s *Server) handleDevicePTZ(w http.ResponseWriter, r *http.Request, dev *mo
 
 			// Subroute: DELETE /api/v1/devices/{id}/ptz/presets/{presetId}
 			if r.Method == "DELETE" && len(parts) >= 4 {
+				if !s.checkPermission(r, security.PermPTZManage) {
+					writeError(w, r, http.StatusForbidden, "INSUFFICIENT_PERMISSIONS", "Deleting PTZ presets requires PTZ_MANAGE permission")
+					return
+				}
 				pID, _ := strconv.Atoi(parts[3])
-				if err := s.ptzEng.DeletePreset(dev.ID, pID, "Technician"); err != nil {
+				if err := s.ptzEng.DeletePreset(dev.ID, pID, operator); err != nil {
 					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 					return
 				}
@@ -2471,12 +2760,16 @@ func (s *Server) handleDevicePTZ(w http.ResponseWriter, r *http.Request, dev *mo
 
 			// Create preset: POST /api/v1/devices/{id}/ptz/presets
 			if r.Method == "POST" {
+				if !s.checkPermission(r, security.PermPTZManage) {
+					writeError(w, r, http.StatusForbidden, "INSUFFICIENT_PERMISSIONS", "Creating PTZ presets requires PTZ_MANAGE permission")
+					return
+				}
 				var createReq struct {
 					ID   int    `json:"id"`
 					Name string `json:"name"`
 				}
 				_ = json.NewDecoder(r.Body).Decode(&createReq)
-				p, err := s.ptzEng.CreatePreset(dev.ID, createReq.ID, createReq.Name, "Technician")
+				p, err := s.ptzEng.CreatePreset(dev.ID, createReq.ID, createReq.Name, operator)
 				if err != nil {
 					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 					return
@@ -2498,8 +2791,12 @@ func (s *Server) handleDevicePTZ(w http.ResponseWriter, r *http.Request, dev *mo
 
 			// Subroute: POST /api/v1/devices/{id}/ptz/patrols/{tourId}/run
 			if len(parts) >= 5 && parts[4] == "run" {
+				if !s.checkPermission(r, security.PermPTZControl) {
+					writeError(w, r, http.StatusForbidden, "INSUFFICIENT_PERMISSIONS", "Running PTZ patrol tours requires PTZ_CONTROL permission")
+					return
+				}
 				tID, _ := strconv.Atoi(parts[3])
-				if err := s.ptzEng.RunPatrol(dev.ID, tID, "Technician"); err != nil {
+				if err := s.ptzEng.RunPatrol(dev.ID, tID, operator); err != nil {
 					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 					return
 				}
@@ -2509,8 +2806,12 @@ func (s *Server) handleDevicePTZ(w http.ResponseWriter, r *http.Request, dev *mo
 
 			// Subroute: POST /api/v1/devices/{id}/ptz/patrols/{tourId}/stop
 			if len(parts) >= 5 && parts[4] == "stop" {
+				if !s.checkPermission(r, security.PermPTZControl) {
+					writeError(w, r, http.StatusForbidden, "INSUFFICIENT_PERMISSIONS", "Stopping PTZ patrol tours requires PTZ_CONTROL permission")
+					return
+				}
 				tID, _ := strconv.Atoi(parts[3])
-				if err := s.ptzEng.StopPatrol(dev.ID, tID, "Technician"); err != nil {
+				if err := s.ptzEng.StopPatrol(dev.ID, tID, operator); err != nil {
 					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 					return
 				}
@@ -2520,12 +2821,16 @@ func (s *Server) handleDevicePTZ(w http.ResponseWriter, r *http.Request, dev *mo
 
 			// Create patrol: POST /api/v1/devices/{id}/ptz/patrols
 			if r.Method == "POST" {
+				if !s.checkPermission(r, security.PermPTZManage) {
+					writeError(w, r, http.StatusForbidden, "INSUFFICIENT_PERMISSIONS", "Creating PTZ patrol tours requires PTZ_MANAGE permission")
+					return
+				}
 				var tour ptz.PatrolTour
 				if err := json.NewDecoder(r.Body).Decode(&tour); err != nil {
 					writeSimpleError(w, r, http.StatusBadRequest, "Invalid patrol tour payload")
 					return
 				}
-				created, err := s.ptzEng.CreatePatrol(dev.ID, tour, "Technician")
+				created, err := s.ptzEng.CreatePatrol(dev.ID, tour, operator)
 				if err != nil {
 					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 					return
@@ -2540,14 +2845,23 @@ func (s *Server) handleDevicePTZ(w http.ResponseWriter, r *http.Request, dev *mo
 			}
 			_ = json.NewDecoder(r.Body).Decode(&req)
 			if req.Action == "set" {
-				if err := s.ptzEng.SetHome(dev.ID, "Technician"); err != nil {
+				if !s.checkPermission(r, security.PermPTZManage) {
+					writeError(w, r, http.StatusForbidden, "INSUFFICIENT_PERMISSIONS", "Setting PTZ home position requires PTZ_MANAGE permission")
+					return
+				}
+				if err := s.ptzEng.SetHome(dev.ID, operator); err != nil {
 					writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 					return
 				}
 				writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "message": "Home position calibrated"})
 				return
 			}
-			if err := s.ptzEng.GotoHome(dev.ID, "Technician"); err != nil {
+			// goto home requires PTZ_CONTROL
+			if !s.checkPermission(r, security.PermPTZControl) {
+				writeError(w, r, http.StatusForbidden, "INSUFFICIENT_PERMISSIONS", "Navigating to PTZ home position requires PTZ_CONTROL permission")
+				return
+			}
+			if err := s.ptzEng.GotoHome(dev.ID, operator); err != nil {
 				writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 				return
 			}
@@ -2555,11 +2869,15 @@ func (s *Server) handleDevicePTZ(w http.ResponseWriter, r *http.Request, dev *mo
 			return
 
 		case "autoscan":
+			if !s.checkPermission(r, security.PermPTZControl) {
+				writeError(w, r, http.StatusForbidden, "INSUFFICIENT_PERMISSIONS", "PTZ auto-scan requires PTZ_CONTROL permission")
+				return
+			}
 			var req struct {
 				Enabled bool `json:"enabled"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&req)
-			if err := s.ptzEng.AutoScan(dev.ID, req.Enabled, "Technician"); err != nil {
+			if err := s.ptzEng.AutoScan(dev.ID, req.Enabled, operator); err != nil {
 				writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 				return
 			}
@@ -2573,15 +2891,27 @@ func (s *Server) handleDevicePTZ(w http.ResponseWriter, r *http.Request, dev *mo
 	_ = json.NewDecoder(r.Body).Decode(&action)
 	action.DeviceID = dev.ID
 
+	if action.Command == "SET_PRESET" {
+		if !s.checkPermission(r, security.PermPTZManage) {
+			writeError(w, r, http.StatusForbidden, "INSUFFICIENT_PERMISSIONS", "Setting PTZ presets requires PTZ_MANAGE permission")
+			return
+		}
+	} else {
+		if !s.checkPermission(r, security.PermPTZControl) {
+			writeError(w, r, http.StatusForbidden, "INSUFFICIENT_PERMISSIONS", "PTZ control requires PTZ_CONTROL permission")
+			return
+		}
+	}
+
 	switch action.Command {
 	case "STOP":
-		_ = s.ptzEng.Stop(dev.ID, "Technician")
+		_ = s.ptzEng.Stop(dev.ID, operator)
 	case "GOTO_PRESET":
-		_ = s.ptzEng.GotoPreset(dev.ID, action.PresetID, action.Speed, "Technician")
+		_ = s.ptzEng.GotoPreset(dev.ID, action.PresetID, action.Speed, operator)
 	case "SET_PRESET":
-		_, _ = s.ptzEng.CreatePreset(dev.ID, action.PresetID, fmt.Sprintf("Preset %d", action.PresetID), "Technician")
+		_, _ = s.ptzEng.CreatePreset(dev.ID, action.PresetID, fmt.Sprintf("Preset %d", action.PresetID), operator)
 	default:
-		if err := s.ptzEng.ContinuousMove(dev.ID, action.Pan, action.Tilt, action.Zoom, action.Speed, 0, "Technician"); err != nil {
+		if err := s.ptzEng.ContinuousMove(dev.ID, action.Pan, action.Tilt, action.Zoom, action.Speed, 0, operator); err != nil {
 			writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -2594,12 +2924,25 @@ func (s *Server) handleDevicePTZ(w http.ResponseWriter, r *http.Request, dev *mo
 // -----------------------------------------------------------------------------
 
 func (s *Server) handleEventsListSubscriptions(w http.ResponseWriter, r *http.Request) {
+	sess := getSession(r)
 	if r.Method == "GET" {
 		subs := s.eventMgr.GetSubscriptions()
-		writeJSON(w, http.StatusOK, subs)
+		filtered := make([]*events.EventSubscription, 0, len(subs))
+		for _, sub := range subs {
+			if dev, ok := s.store.GetDevice(sub.DeviceID); ok {
+				if checkTenantAccess(sess, dev.TenantID, dev.SiteID) {
+					filtered = append(filtered, sub)
+				}
+			}
+		}
+		writeJSON(w, http.StatusOK, filtered)
 		return
 	}
 	if r.Method == "POST" {
+		if !s.checkPermission(r, security.PermEventManage) {
+			writeError(w, r, http.StatusForbidden, "INSUFFICIENT_PERMISSIONS", "Creating event subscriptions requires EVENT_MANAGE permission")
+			return
+		}
 		var req struct {
 			DeviceID string                      `json:"device_id"`
 			Protocol events.SubscriptionProtocol `json:"protocol"`
@@ -2611,7 +2954,20 @@ func (s *Server) handleEventsListSubscriptions(w http.ResponseWriter, r *http.Re
 		if req.Protocol == "" {
 			req.Protocol = events.ProtoONVIFPullPoint
 		}
-		sub, err := s.eventMgr.CreateSubscription(req.DeviceID, req.Protocol, "Technician")
+		dev, ok := s.store.GetDevice(req.DeviceID)
+		if !ok {
+			writeSimpleError(w, r, http.StatusNotFound, "Target device not found")
+			return
+		}
+		if !checkTenantAccess(sess, dev.TenantID, dev.SiteID) {
+			writeError(w, r, http.StatusForbidden, "CROSS_TENANT_ACCESS_DENIED", "Access denied: target device belongs to an isolated tenant or site")
+			return
+		}
+		operator := "Technician"
+		if sess != nil && sess.Username != "" {
+			operator = sess.Username
+		}
+		sub, err := s.eventMgr.CreateSubscription(req.DeviceID, req.Protocol, operator)
 		if err != nil {
 			writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 			return
@@ -2629,7 +2985,27 @@ func (s *Server) handleEventsCancelSubscription(w http.ResponseWriter, r *http.R
 		return
 	}
 	if r.Method == "DELETE" || r.Method == "POST" {
-		if err := s.eventMgr.CancelSubscription(subID, "Technician"); err != nil {
+		if !s.checkPermission(r, security.PermEventManage) {
+			writeError(w, r, http.StatusForbidden, "INSUFFICIENT_PERMISSIONS", "Cancelling event subscriptions requires EVENT_MANAGE permission")
+			return
+		}
+		sess := getSession(r)
+		for _, sub := range s.eventMgr.GetSubscriptions() {
+			if sub.ID == subID {
+				if dev, ok := s.store.GetDevice(sub.DeviceID); ok {
+					if !checkTenantAccess(sess, dev.TenantID, dev.SiteID) {
+						writeError(w, r, http.StatusForbidden, "CROSS_TENANT_ACCESS_DENIED", "Access denied: subscription belongs to an isolated device")
+						return
+					}
+				}
+				break
+			}
+		}
+		operator := "Technician"
+		if sess != nil && sess.Username != "" {
+			operator = sess.Username
+		}
+		if err := s.eventMgr.CancelSubscription(subID, operator); err != nil {
 			writeSimpleError(w, r, http.StatusNotFound, err.Error())
 			return
 		}
@@ -2644,8 +3020,18 @@ func (s *Server) handleEventsLive(w http.ResponseWriter, r *http.Request) {
 	if limit <= 0 {
 		limit = 50
 	}
+	sess := getSession(r)
 	eventsList := s.eventMgr.GetRecentEvents(limit)
-	writeJSON(w, http.StatusOK, eventsList)
+	filtered := make([]events.SurveillanceEvent, 0, len(eventsList))
+	for _, ev := range eventsList {
+		if dev, ok := s.store.GetDevice(ev.DeviceID); ok {
+			if !checkTenantAccess(sess, dev.TenantID, dev.SiteID) {
+				continue
+			}
+		}
+		filtered = append(filtered, ev)
+	}
+	writeJSON(w, http.StatusOK, filtered)
 }
 
 // -----------------------------------------------------------------------------
@@ -2668,8 +3054,18 @@ func (s *Server) handleAlarms(w http.ResponseWriter, r *http.Request) {
 		filter.Limit = l
 	}
 
+	sess := getSession(r)
 	results := s.alarmEng.FilterAlarms(filter)
-	writeJSON(w, http.StatusOK, results)
+	filtered := make([]*alarms.Alarm, 0, len(results))
+	for _, alm := range results {
+		if dev, ok := s.store.GetDevice(alm.DeviceID); ok {
+			if !checkTenantAccess(sess, dev.TenantID, dev.SiteID) {
+				continue
+			}
+		}
+		filtered = append(filtered, alm)
+	}
+	writeJSON(w, http.StatusOK, filtered)
 }
 
 func (s *Server) handleAlarmsStats(w http.ResponseWriter, r *http.Request) {
@@ -2683,12 +3079,21 @@ func (s *Server) handleAlarmsRules(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == "POST" {
+		if !s.checkPermission(r, security.PermEventManage) {
+			writeError(w, r, http.StatusForbidden, "INSUFFICIENT_PERMISSIONS", "Alarm rule configuration requires EVENT_MANAGE permission")
+			return
+		}
 		var rule alarms.AlarmRule
 		if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
 			writeSimpleError(w, r, http.StatusBadRequest, "Invalid alarm rule payload")
 			return
 		}
-		upserted := s.alarmEng.UpsertRule(&rule, "Technician")
+		sess := getSession(r)
+		operator := "Technician"
+		if sess != nil && sess.Username != "" {
+			operator = sess.Username
+		}
+		upserted := s.alarmEng.UpsertRule(&rule, operator)
 		writeJSON(w, http.StatusOK, upserted)
 		return
 	}
@@ -2702,7 +3107,16 @@ func (s *Server) handleAlarmsRulesDelete(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if r.Method == "DELETE" {
-		if err := s.alarmEng.DeleteRule(ruleID, "Technician"); err != nil {
+		if !s.checkPermission(r, security.PermEventManage) {
+			writeError(w, r, http.StatusForbidden, "INSUFFICIENT_PERMISSIONS", "Deleting alarm rules requires EVENT_MANAGE permission")
+			return
+		}
+		sess := getSession(r)
+		operator := "Technician"
+		if sess != nil && sess.Username != "" {
+			operator = sess.Username
+		}
+		if err := s.alarmEng.DeleteRule(ruleID, operator); err != nil {
 			writeSimpleError(w, r, http.StatusNotFound, err.Error())
 			return
 		}
@@ -2713,6 +3127,10 @@ func (s *Server) handleAlarmsRulesDelete(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *Server) handleAlarmsExport(w http.ResponseWriter, r *http.Request) {
+	if !s.checkPermission(r, security.PermAlarmExport) && !s.checkPermission(r, security.PermPlaybackExport) {
+		writeError(w, r, http.StatusForbidden, "INSUFFICIENT_PERMISSIONS", "Exporting alarm ledger requires ALARM_EXPORT or PLAYBACK_EXPORT permission")
+		return
+	}
 	format := strings.ToLower(r.URL.Query().Get("format"))
 	filter := alarms.AlarmFilter{}
 
@@ -2795,12 +3213,21 @@ func (s *Server) handleAlarmSubroutes(w http.ResponseWriter, r *http.Request) {
 
 	alarmID := parts[0]
 
-	if len(parts) == 1 {
-		alm, ok := s.alarmEng.GetAlarm(alarmID)
-		if !ok {
-			writeSimpleError(w, r, http.StatusNotFound, "Alarm not found")
+	alm, ok := s.alarmEng.GetAlarm(alarmID)
+	if !ok {
+		writeSimpleError(w, r, http.StatusNotFound, "Alarm not found")
+		return
+	}
+
+	sess := getSession(r)
+	if dev, devOk := s.store.GetDevice(alm.DeviceID); devOk {
+		if !checkTenantAccess(sess, dev.TenantID, dev.SiteID) {
+			writeError(w, r, http.StatusForbidden, "CROSS_TENANT_ACCESS_DENIED", "Access denied: alarm belongs to a device on an isolated tenant or site")
 			return
 		}
+	}
+
+	if len(parts) == 1 {
 		writeJSON(w, http.StatusOK, alm)
 		return
 	}
@@ -2808,13 +3235,19 @@ func (s *Server) handleAlarmSubroutes(w http.ResponseWriter, r *http.Request) {
 	action := parts[1]
 	if action == "acknowledge" || action == "assign" || action == "resolve" || action == "dismiss" {
 		if !s.checkPermission(r, security.PermAlarmManage) {
-			writeError(w, r, http.StatusForbidden, "FORBIDDEN", "Alarm triage operations require ALARM_MANAGE permission")
+			writeError(w, r, http.StatusForbidden, "INSUFFICIENT_PERMISSIONS", "Alarm triage operations require ALARM_MANAGE permission")
 			return
 		}
 	}
+
+	operator := "Technician"
+	if sess != nil && sess.Username != "" {
+		operator = sess.Username
+	}
+
 	switch action {
 	case "acknowledge":
-		ack, err := s.alarmEng.Acknowledge(alarmID, "Technician")
+		ack, err := s.alarmEng.Acknowledge(alarmID, operator)
 		if err != nil {
 			writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 			return
@@ -2830,7 +3263,7 @@ func (s *Server) handleAlarmSubroutes(w http.ResponseWriter, r *http.Request) {
 		if req.Technician == "" {
 			req.Technician = "Lead_Technician"
 		}
-		assigned, err := s.alarmEng.Assign(alarmID, req.Technician, "Technician")
+		assigned, err := s.alarmEng.Assign(alarmID, req.Technician, operator)
 		if err != nil {
 			writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 			return
@@ -2846,7 +3279,7 @@ func (s *Server) handleAlarmSubroutes(w http.ResponseWriter, r *http.Request) {
 		if req.Notes == "" {
 			req.Notes = "Resolved by surveillance technician"
 		}
-		resolved, err := s.alarmEng.Resolve(alarmID, req.Notes, "Technician")
+		resolved, err := s.alarmEng.Resolve(alarmID, req.Notes, operator)
 		if err != nil {
 			writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 			return
@@ -2862,7 +3295,7 @@ func (s *Server) handleAlarmSubroutes(w http.ResponseWriter, r *http.Request) {
 		if req.Reason == "" {
 			req.Reason = "False positive alarm / test drill"
 		}
-		dismissed, err := s.alarmEng.Dismiss(alarmID, req.Reason, "Technician")
+		dismissed, err := s.alarmEng.Dismiss(alarmID, req.Reason, operator)
 		if err != nil {
 			writeSimpleError(w, r, http.StatusBadRequest, err.Error())
 			return

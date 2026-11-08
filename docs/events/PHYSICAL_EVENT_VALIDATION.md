@@ -55,3 +55,4 @@ Event subscriptions run in isolated goroutines. If a network interruption occurs
 ### 3.2 Duplicate Event Suppression
 High-frequency cameras (e.g. foliage in wind triggering motion every 50 ms) are throttled via sliding window deduplication:
 - Events with identical `(DeviceID, Category, Source)` within a 5-second window increment the repeat counter without creating redundant alarm tickets.
+

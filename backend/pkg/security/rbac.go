@@ -57,6 +57,7 @@ const (
 	PermPTZManage       Permission = "PTZ_MANAGE"
 	PermEventManage     Permission = "EVENT_MANAGE"
 	PermAlarmManage     Permission = "ALARM_MANAGE"
+	PermAlarmExport     Permission = "ALARM_EXPORT"
 )
 
 // RolePermissions maps roles to granted enterprise capabilities
@@ -77,6 +78,7 @@ var RolePermissions = map[Role][]Permission{
 		PermPTZManage,
 		PermEventManage,
 		PermAlarmManage,
+		PermAlarmExport,
 	},
 	RoleTechnician: {
 		PermViewLive,
@@ -91,6 +93,7 @@ var RolePermissions = map[Role][]Permission{
 		PermPTZManage,
 		PermEventManage,
 		PermAlarmManage,
+		PermAlarmExport,
 	},
 	RoleAuditor: {
 		PermViewLive,
@@ -98,6 +101,7 @@ var RolePermissions = map[Role][]Permission{
 		PermPlaybackView,
 		PermPlaybackExport,
 		PermAlarmManage,
+		PermAlarmExport,
 	},
 	RoleViewer: {
 		PermViewLive,

@@ -29,6 +29,7 @@ async function request<T>(endpoint: string, options?: RequestInit): Promise<T> {
 
   const res = await fetch(`${BASE_URL}${endpoint}`, {
     ...options,
+    credentials: 'include',
     headers,
   });
   if (!res.ok) {
@@ -212,9 +213,22 @@ export const api = {
     }
     return res;
   },
-  logout: () => {
+  logout: async () => {
+    try {
+      await request<any>('/security/logout', { method: 'POST' });
+    } catch {
+      // ignore network errors during session termination
+    }
     localStorage.removeItem('sentinel_token');
   },
+  migrateDevice: (deviceId: string, targetTenant: string, targetSite: string) =>
+    request<{ success: boolean; device_id: string; target_tenant: string; target_site: string; message: string }>(
+      `/devices/${deviceId}/migrate`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ target_tenant: targetTenant, target_site: targetSite })
+      }
+    ),
   getUsers: () => request<UserAccount[]>('/security/users'),
   createUser: (user: { username: string; password: string; role: string; site_id?: string }) =>
     request<UserAccount>('/security/users', { method: 'POST', body: JSON.stringify(user) }),

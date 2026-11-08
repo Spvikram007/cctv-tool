@@ -90,3 +90,44 @@ Inspection of the physical device's embedded JavaScript firmware (`player.js`) v
 ### Preset Coordinate Memory
 - Valid coordinate memory slots: **1 to 128** (excluding reserved factory calibration indices 77, 91–98, 111–117).
 - Speed range: 1 to 8 (stepper motor step rate).
+
+---
+
+## 4. Physical Motor Actuation Status: PENDING OPERATOR TEST APPROVAL
+
+> [!IMPORTANT]
+> **COMPLIANCE & TRUTH NOTICE:**
+> Physical network connectivity to HTTP port 80 and RTSP port 554 has been verified live on the physical LAN (`192.168.31.104`). However, **robotic physical motor actuation (pan, tilt, zoom motor rotation) has NOT been physically executed or observed by an operator, and is strictly classified as PENDING OPERATOR TEST APPROVAL.**
+>
+> Neither software test scripts nor mock responses constitute physical confirmation of robotic motor actuation. Physical movement must be visually verified and signed off by a physical site technician.
+
+### 4.1 Manual Operator Physical Verification Procedure
+
+Before approving physical PTZ motor deployment in production, the technician must execute this 5-step on-site validation checklist:
+
+1. **Physical Visual Line-of-Sight Check:**
+   - Position an operator in direct visual line-of-sight of the Vatilon H43 dome/turret assembly.
+   - Verify camera physical clearance from walls, conduit, and mounting brackets (360° unobstructed clearance).
+
+2. **Credential Authentication:**
+   - Enter device administrator credentials into the CCTV Sentinel Universal portal or test harness.
+   - Ensure digest authentication challenge succeeds (`mod=session&cmd=get_auth_info`).
+
+3. **Continuous Pan & Tilt Actuation:**
+   - Issue Continuous Pan Right command at speed 3 for 2.0 seconds.
+   - **Operator Observation:** Confirm physical turret rotates clockwise smoothly without motor grinding or gear skipping.
+   - Issue Continuous Tilt Up command at speed 3 for 1.5 seconds.
+   - **Operator Observation:** Confirm optical assembly tilts vertically upward.
+
+4. **Preset Calibration & Return:**
+   - Save current orientation as Preset Slot #1 ("North Gate Guard").
+   - Pan camera 90° away to Preset Slot #2 ("Parking Bay").
+   - Issue `GOTO_PRESET 1`.
+   - **Operator Observation:** Confirm camera automatically navigates back to the exact initial angular coordinates within $\pm 0.5^\circ$ repeatability tolerance.
+
+5. **Stop & Home Safety Lockout:**
+   - Issue emergency `STOP` command during active rotation.
+   - **Operator Observation:** Confirm motor braking engages immediately (< 100 ms).
+   - Issue `HOME` calibration command and verify camera returns to default zero-index origin.
+   - Sign off the commissioning certificate in the technician audit log.
+

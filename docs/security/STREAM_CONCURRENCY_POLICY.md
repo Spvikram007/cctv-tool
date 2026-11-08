@@ -50,3 +50,4 @@ FFmpeg logs device connection URLs, RTSP authentication headers, and network pac
 Before any RTSP socket is opened or FFmpeg process is spawned:
 - The destination IP of the target camera is checked against the SSRF blocking engine (`security.IsBlockedIP`).
 - Connections to loopback (`127.0.0.1`), metadata services (`169.254.169.254`), and non-routable addresses are blocked with `ERR_SSRF_BLOCKED`.
+

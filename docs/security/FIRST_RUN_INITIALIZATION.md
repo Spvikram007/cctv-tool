@@ -72,3 +72,4 @@ To prevent maliciously configured Argon2 parameter payloads from starving server
 
 ### Concurrency Isolation
 Argon2id computations are performed outside the global mutex write lock in `Authenticate()`. Multiple login requests do not serialize or block other concurrent API transactions.
+

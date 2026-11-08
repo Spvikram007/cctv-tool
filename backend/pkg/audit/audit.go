@@ -52,6 +52,10 @@ var secretReplacers = []secretReplacer{
 		re:   regexp.MustCompile(`(?i)((?:api_key|token|auth_token)["']?\s*[:=]\s*["']?)[^"',\s&]+(["']?)`),
 		repl: `${1}[REDACTED]${2}`,
 	},
+	{
+		re:   regexp.MustCompile(`(?i)(str-tok-[A-Za-z0-9]+|sent-setup-[A-Za-z0-9]+|sent-sess-[A-Za-z0-9]+)`),
+		repl: `[REDACTED_TOKEN]`,
+	},
 }
 
 // RedactSecrets removes sensitive data like passwords or tokens from strings

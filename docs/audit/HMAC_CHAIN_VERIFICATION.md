@@ -74,3 +74,4 @@ Validated via unit and regression test suite `backend/pkg/audit/audit_test.go`:
 - `TestAuditHashChainAndTamperDetection`: Confirms SHA-256 chain integrity and rejection of altered records.
 - `TestHMACCheckpointsAndKeyRotation`: Confirms periodic checkpoint validation across key rotation events.
 - `TestExportedLedgerCryptographicVerification`: Confirms signature validity and instant detection of single-byte payload tampering.
+
