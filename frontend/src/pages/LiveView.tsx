@@ -663,8 +663,11 @@ export const LiveView: React.FC<LiveViewProps> = ({ devices, selectedDevice }) =
 
       {/* Camera Authentication & Credentials Prompt Modal */}
       {authTargetDev && (
-        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="bg-[#161b22] border border-[#30363d] rounded-xl max-w-md w-full p-6 space-y-4 font-mono shadow-2xl">
+        <div
+          onClick={(e) => { if (e.target === e.currentTarget) setAuthTargetDev(null); }}
+          className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4 overflow-y-auto"
+        >
+          <div className="bg-[#161b22] border border-[#30363d] rounded-xl max-w-md w-full p-6 space-y-4 font-mono shadow-2xl max-h-[90vh] overflow-y-auto">
             <div className="flex items-center justify-between border-b border-[#30363d] pb-3">
               <div className="flex items-center space-x-2 text-emerald-400 font-bold text-sm">
                 <KeyRound className="w-5 h-5" />

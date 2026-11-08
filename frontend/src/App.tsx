@@ -34,7 +34,7 @@ export const App: React.FC = () => {
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
 
   useEffect(() => {
-    // Restore authenticated session from HttpOnly cookie if present
+    // Restore authenticated session from HttpOnly cookie on initial mount
     const restoreSession = async () => {
       try {
         const res = await api.getCurrentSession();
@@ -46,14 +46,14 @@ export const App: React.FC = () => {
       }
     };
     restoreSession();
-
-    // Initial data load
     loadAllData();
+  }, []); // Run once on initial mount
 
+  // Periodic polling every 10s only when authenticated
+  useEffect(() => {
+    if (!session) return;
     const interval = setInterval(() => {
-      if (session) {
-        loadAllData();
-      }
+      loadAllData();
     }, 10000);
     return () => clearInterval(interval);
   }, [session]);
@@ -94,7 +94,7 @@ export const App: React.FC = () => {
   };
 
   return (
-    <div className={`min-h-screen ${darkMode ? 'dark bg-[#0d1117] text-slate-100' : 'bg-slate-50 text-slate-900'} flex flex-col font-sans transition-colors duration-200`}>
+    <div className={`h-screen overflow-hidden ${darkMode ? 'dark bg-[#0d1117] text-slate-100' : 'bg-slate-50 text-slate-900'} flex flex-col font-sans transition-colors duration-200`}>
       {/* Top Navbar */}
       <Navbar
         license={license}
@@ -117,7 +117,7 @@ export const App: React.FC = () => {
         }}
       />
 
-      <div className="flex-1 flex overflow-hidden">
+      <div className="flex-1 flex overflow-hidden min-h-0">
         {/* Sidebar */}
         <Sidebar
           activeTab={activeTab}
@@ -126,7 +126,7 @@ export const App: React.FC = () => {
         />
 
         {/* Main Workspace Body */}
-        <main className="flex-1 overflow-y-auto p-6 bg-[#090d13]">
+        <main className="flex-1 overflow-y-auto p-6 bg-[#090d13] min-h-0">
           {activeTab === 'dashboard' && (
             <Dashboard
               devices={devices}
